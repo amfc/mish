@@ -57,6 +57,12 @@ pub struct PredictionEngine {
     suppress: bool,
     /// Latest SRTT estimate (ms), for adaptive gating.
     srtt_ms: f64,
+    /// Underline tentative (unconfirmed) predictions so they read as speculative
+    /// (mosh's prediction "flagging").
+    flagging: bool,
+    /// After a misprediction, briefly suppress the overlay until the next clean
+    /// server update, to avoid flicker (mosh's glitch trigger).
+    glitch: bool,
     cols: u16,
     rows: u16,
 }
@@ -73,6 +79,8 @@ impl PredictionEngine {
             utf8: Vec::new(),
             suppress: false,
             srtt_ms: 0.0,
+            flagging: true,
+            glitch: false,
             cols: 0,
             rows: 0,
         }
@@ -83,8 +91,16 @@ impl PredictionEngine {
         self.srtt_ms = srtt_ms;
     }
 
+    /// Toggle underlining of tentative predictions (default on).
+    pub fn set_flagging(&mut self, on: bool) {
+        self.flagging = on;
+    }
+
     /// Whether predictions should currently be displayed.
     fn showing(&self) -> bool {
+        if self.glitch {
+            return false; // suppressed after a recent misprediction
+        }
         match self.mode {
             PredictMode::Never => false,
             PredictMode::Always => true,
@@ -284,8 +300,12 @@ impl PredictionEngine {
         });
         if mispredict {
             self.reset();
+            self.glitch = true; // suppress overlay until the next clean update
             return;
         }
+
+        // A clean update clears any glitch suppression.
+        self.glitch = false;
 
         // Drop confirmed-correct predictions (the real screen now shows them).
         self.cells.retain(|p| p.input_index > ack);
@@ -304,7 +324,12 @@ impl PredictionEngine {
             if p.input_index > server.echo_ack {
                 if let (true, true) = (p.row < s.rows, p.col < s.cols) {
                     let idx = p.row as usize * s.cols as usize + p.col as usize;
-                    s.cells[idx] = p.cell.clone();
+                    let mut cell = p.cell.clone();
+                    // Underline tentative predictions so they read as speculative.
+                    if self.flagging {
+                        cell.flags |= crate::screen::F_UNDERLINE;
+                    }
+                    s.cells[idx] = cell;
                 }
             }
         }
@@ -422,6 +447,46 @@ mod tests {
         // Laggy link: now the prediction is shown.
         p.set_srtt(120.0);
         assert_eq!(p.predicted_screen(&base).cell(0, 0).unwrap().c, 'x');
+    }
+
+    #[test]
+    fn tentative_predictions_are_underlined() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 2, 0);
+        p.new_user_bytes(b"x", &base, 1);
+        let shown = p.predicted_screen(&base);
+        assert_ne!(
+            shown.cell(0, 0).unwrap().flags & crate::screen::F_UNDERLINE,
+            0,
+            "tentative prediction underlined"
+        );
+        p.set_flagging(false);
+        assert_eq!(
+            p.predicted_screen(&base).cell(0, 0).unwrap().flags & crate::screen::F_UNDERLINE,
+            0,
+            "underline disabled"
+        );
+    }
+
+    #[test]
+    fn glitch_suppresses_then_clears() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 2, 0);
+        p.new_user_bytes(b"x", &base, 1);
+        // Misprediction: the server applied input 1 but shows 'Z'.
+        let mut bad = screen_with_ack(20, 2, 1);
+        bad.cells[0].c = 'Z';
+        p.new_server_screen(&bad);
+        // Glitch active: a fresh prediction is suppressed (server shown instead).
+        p.new_user_bytes(b"y", &bad, 2);
+        assert_eq!(p.predicted_screen(&bad).cell(0, 0).unwrap().c, 'Z');
+        // The server confirms 'y' (input 2) → no contradiction → glitch clears.
+        let mut good = screen_with_ack(20, 2, 2);
+        good.cells[0].c = 'y';
+        p.new_server_screen(&good);
+        // Predictions display again.
+        p.new_user_bytes(b"z", &good, 3);
+        assert_eq!(p.predicted_screen(&good).cell(0, 0).unwrap().c, 'z');
     }
 
     #[test]
