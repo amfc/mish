@@ -236,7 +236,48 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
         frame.cursor_visible = new.cursor_visible;
     }
 
+    // Terminal modes: bracketed paste, mouse reporting, cursor style.
+    emit_modes(&mut frame, old, new, initialized);
+
     frame.out
+}
+
+/// Emit DECSET/DECRST + DECSCUSR for the modes that changed (or all, on a full
+/// repaint), so the client's real terminal matches the server's.
+fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: bool) {
+    use crate::screen::{MOUSE_CLICK, MOUSE_DRAG, MOUSE_MOTION, MOUSE_SGR};
+
+    let set = |frame: &mut FrameState, code: u32, on: bool| {
+        frame.push(&format!("\x1b[?{code}{}", if on { 'h' } else { 'l' }));
+    };
+
+    if !initialized || old.bracketed_paste != new.bracketed_paste {
+        set(frame, 2004, new.bracketed_paste);
+    }
+    for (bit, code) in [
+        (MOUSE_CLICK, 1000),
+        (MOUSE_DRAG, 1002),
+        (MOUSE_MOTION, 1003),
+        (MOUSE_SGR, 1006),
+    ] {
+        if !initialized || (old.mouse_mode & bit) != (new.mouse_mode & bit) {
+            set(frame, code, new.mouse_mode & bit != 0);
+        }
+    }
+
+    if !initialized
+        || old.cursor_shape != new.cursor_shape
+        || old.cursor_blink != new.cursor_blink
+    {
+        // DECSCUSR: 1/2 block, 3/4 underline, 5/6 beam (odd = blink).
+        let base = match new.cursor_shape {
+            crate::screen::CURSOR_UNDERLINE => 3,
+            crate::screen::CURSOR_BEAM => 5,
+            _ => 1,
+        };
+        let n = base + if new.cursor_blink { 0 } else { 1 };
+        frame.push(&format!("\x1b[{n} q"));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

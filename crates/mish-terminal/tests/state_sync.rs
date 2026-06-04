@@ -65,6 +65,10 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
                 cursor_visible: cv,
                 title,
                 echo_ack,
+                bracketed_paste: false,
+                mouse_mode: 0,
+                cursor_shape: 0,
+                cursor_blink: false,
             })
     })
 }

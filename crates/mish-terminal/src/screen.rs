@@ -46,6 +46,17 @@ pub const F_STRIKEOUT: u16 = 1 << 6;
 pub const F_WIDE: u16 = 1 << 7;
 pub const F_WIDE_SPACER: u16 = 1 << 8;
 
+// Mouse-reporting modes (bitfield on `Screen::mouse_mode`).
+pub const MOUSE_CLICK: u8 = 1 << 0; // DECSET 1000
+pub const MOUSE_DRAG: u8 = 1 << 1; // DECSET 1002
+pub const MOUSE_MOTION: u8 = 1 << 2; // DECSET 1003
+pub const MOUSE_SGR: u8 = 1 << 3; // DECSET 1006
+
+// Cursor shapes (`Screen::cursor_shape`).
+pub const CURSOR_BLOCK: u8 = 0;
+pub const CURSOR_UNDERLINE: u8 = 1;
+pub const CURSOR_BEAM: u8 = 2;
+
 /// A single screen cell: one base character, its rendering attributes, and any
 /// zero-width combining marks attached to it (e.g. `e` + U+0301 = `é`).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -85,6 +96,14 @@ pub struct Screen {
     /// this screen was produced (mosh's "echo ack"). The client uses it to
     /// validate or cull speculative local predictions. Server→client only.
     pub echo_ack: u64,
+    /// Bracketed-paste mode (DECSET 2004) is active.
+    pub bracketed_paste: bool,
+    /// Mouse-reporting modes (`MOUSE_*` bitfield).
+    pub mouse_mode: u8,
+    /// Cursor shape (`CURSOR_*`).
+    pub cursor_shape: u8,
+    /// Cursor blink.
+    pub cursor_blink: bool,
 }
 
 impl Screen {
@@ -99,6 +118,10 @@ impl Screen {
             cursor_visible: true,
             title: String::new(),
             echo_ack: 0,
+            bracketed_paste: false,
+            mouse_mode: 0,
+            cursor_shape: 0,
+            cursor_blink: false,
         }
     }
 
@@ -160,6 +183,10 @@ impl SyncState for Screen {
             cursor_visible: true,
             title: String::new(),
             echo_ack: 0,
+            bracketed_paste: false,
+            mouse_mode: 0,
+            cursor_shape: 0,
+            cursor_blink: false,
         }
     }
 

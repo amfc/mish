@@ -196,6 +196,32 @@ fn no_op_sequence_yields_empty_diff() {
     );
 }
 
+/// Terminal modes (bracketed paste, mouse reporting, cursor style) are captured
+/// and round-trip through the diff.
+#[test]
+fn terminal_modes_captured_and_diffed() {
+    use mish_terminal::screen;
+    let mut e = Emulator::new(10, 2);
+    // Enable bracketed paste, SGR mouse + any-motion, and a steady beam cursor.
+    e.feed(b"\x1b[?2004h\x1b[?1006h\x1b[?1003h\x1b[6 q");
+    let s = e.snapshot();
+    assert!(s.bracketed_paste);
+    assert_ne!(s.mouse_mode & screen::MOUSE_SGR, 0);
+    assert_ne!(s.mouse_mode & screen::MOUSE_MOTION, 0);
+    assert_eq!(s.cursor_shape, screen::CURSOR_BEAM);
+    assert!(!s.cursor_blink, "steady cursor");
+
+    // Round-trip via the diff.
+    let blank = Screen::blank(10, 2);
+    let mut e2 = Emulator::new(10, 2);
+    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
+    let s2 = e2.snapshot();
+    assert_eq!(s2.bracketed_paste, s.bracketed_paste);
+    assert_eq!(s2.mouse_mode, s.mouse_mode);
+    assert_eq!(s2.cursor_shape, s.cursor_shape);
+    assert_eq!(s2.cursor_blink, s.cursor_blink);
+}
+
 /// Combining marks are captured on the base cell and survive the new_frame diff.
 #[test]
 fn combining_marks_captured_and_diffed() {

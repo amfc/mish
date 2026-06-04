@@ -13,7 +13,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell as ATermCell, Flags};
 use alacritty_terminal::term::{Config, TermMode};
-use alacritty_terminal::vte::ansi::{Color as ATermColor, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color as ATermColor, CursorShape, NamedColor, Processor};
 use alacritty_terminal::{term::test::TermSize, Term};
 
 use crate::screen::{self, Cell, Color, Screen};
@@ -89,15 +89,40 @@ impl Emulator {
         }
 
         let cursor = grid.cursor.point;
+        let mode = *self.term.mode();
+        let mut mouse_mode = 0u8;
+        if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            mouse_mode |= screen::MOUSE_CLICK;
+        }
+        if mode.contains(TermMode::MOUSE_DRAG) {
+            mouse_mode |= screen::MOUSE_DRAG;
+        }
+        if mode.contains(TermMode::MOUSE_MOTION) {
+            mouse_mode |= screen::MOUSE_MOTION;
+        }
+        if mode.contains(TermMode::SGR_MOUSE) {
+            mouse_mode |= screen::MOUSE_SGR;
+        }
+        let style = self.term.cursor_style();
+        let cursor_shape = match style.shape {
+            CursorShape::Underline => screen::CURSOR_UNDERLINE,
+            CursorShape::Beam => screen::CURSOR_BEAM,
+            _ => screen::CURSOR_BLOCK, // Block / HollowBlock / Hidden
+        };
+
         Screen {
             cols: cols as u16,
             rows: rows as u16,
             cells,
             cursor_row: cursor.line.0.max(0) as u16,
             cursor_col: cursor.column.0 as u16,
-            cursor_visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
+            cursor_visible: mode.contains(TermMode::SHOW_CURSOR),
             title: self.listener.title.lock().unwrap().clone(),
             echo_ack: 0, // set by the server session, not the emulator
+            bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+            mouse_mode,
+            cursor_shape,
+            cursor_blink: style.blinking,
         }
     }
 }
