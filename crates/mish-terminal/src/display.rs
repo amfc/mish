@@ -15,8 +15,8 @@
 //! modes) — they affect byte count, not correctness.
 
 use crate::screen::{
-    Cell, Color, Screen, F_BOLD, F_DIM, F_HIDDEN, F_INVERSE, F_ITALIC, F_STRIKEOUT, F_UNDERLINE,
-    NAMED_BACKGROUND, NAMED_FOREGROUND,
+    Cell, Color, Hyperlink, Screen, F_BOLD, F_DIM, F_HIDDEN, F_INVERSE, F_ITALIC, F_STRIKEOUT,
+    F_UNDERLINE, NAMED_BACKGROUND, NAMED_FOREGROUND,
 };
 
 /// Builder that accumulates the output frame and tracks the emulated cursor /
@@ -32,6 +32,8 @@ struct FrameState {
     /// incremental frame is correct regardless of the pen the previous frame
     /// left behind.
     current: Option<(Color, Color, u16)>,
+    /// Current OSC 8 hyperlink (outer `None` = unknown / not yet established).
+    current_link: Option<Option<Hyperlink>>,
 }
 
 fn cell_width(cell: &Cell) -> i32 {
@@ -51,6 +53,7 @@ fn is_blank(cell: &Cell) -> bool {
     cell.c == ' '
         && cell.flags == 0
         && cell.combining.is_empty()
+        && cell.hyperlink.is_none()
         && cell.fg == Color::Named(NAMED_FOREGROUND)
 }
 
@@ -62,6 +65,25 @@ impl FrameState {
             cursor_y: old.cursor_row as i32,
             cursor_visible: old.cursor_visible,
             current: None,
+            current_link: None,
+        }
+    }
+
+    /// Emit an OSC 8 open/close if the target hyperlink differs from current.
+    fn update_hyperlink(&mut self, link: &Option<Hyperlink>) {
+        if self.current_link.as_ref() == Some(link) {
+            return;
+        }
+        self.current_link = Some(link.clone());
+        match link {
+            Some(h) => {
+                let params = match &h.id {
+                    Some(id) => format!("id={id}"),
+                    None => String::new(),
+                };
+                self.push(&format!("\x1b]8;{};{}\x1b\\", params, h.uri));
+            }
+            None => self.push("\x1b]8;;\x1b\\"),
         }
     }
 
@@ -205,6 +227,7 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
         frame.cursor_y = 0;
         // The leading reset establishes a known default pen.
         frame.current = Some((Color::Named(NAMED_FOREGROUND), Color::Named(NAMED_BACKGROUND), 0));
+        frame.current_link = Some(None);
     }
 
     // On a full repaint, hide the cursor up front (mosh does this). On an
@@ -335,6 +358,7 @@ fn put_row(frame: &mut FrameState, old: &Screen, new: &Screen, y: u16, initializ
         // Draw a visible cell.
         frame.append_silent_move(y as i32, x as i32);
         frame.update_rendition(cell.fg, cell.bg, cell.flags);
+        frame.update_hyperlink(&cell.hyperlink);
         frame.append_cell(cell);
         frame.cursor_x += cell_width(cell);
         x += cell_width(cell) as u16;
@@ -356,8 +380,9 @@ fn put_row(frame: &mut FrameState, old: &Screen, new: &Screen, y: u16, initializ
 fn flush_blanks(frame: &mut FrameState, y: u16, x_end: u16, count: u16, bg: Color, at_eol: bool) {
     let start = x_end - count;
     frame.append_silent_move(y as i32, start as i32);
-    // Erasable blanks have default fg and no flags by construction.
+    // Erasable blanks have default fg, no flags, and no hyperlink.
     frame.update_rendition(Color::Named(NAMED_FOREGROUND), bg, 0);
+    frame.update_hyperlink(&None);
     if at_eol {
         // Erase to end of line (BCE fills with current bg).
         frame.push("\x1b[K");

@@ -62,6 +62,7 @@ fn arb_cell() -> impl Strategy<Value = Cell> {
             bg,
             flags,
             combining: Vec::new(),
+            hyperlink: None,
         })
 }
 

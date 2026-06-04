@@ -196,6 +196,31 @@ fn no_op_sequence_yields_empty_diff() {
     );
 }
 
+/// emulation-attributes-osc8: hyperlinks are captured per cell and survive the
+/// diff round-trip.
+#[test]
+fn osc8_hyperlink_captured_and_diffed() {
+    let mut e = Emulator::new(20, 2);
+    // OSC 8 link "ex" → https://example.com, then close.
+    e.feed(b"\x1b]8;;https://example.com\x1b\\ex\x1b]8;;\x1b\\");
+    let s = e.snapshot();
+    let cell = s.cell(0, 0).unwrap();
+    assert_eq!(cell.c, 'e');
+    assert_eq!(
+        cell.hyperlink.as_ref().map(|h| h.uri.as_str()),
+        Some("https://example.com")
+    );
+    // The next char shares the link; the char after the close has none.
+    assert!(s.cell(0, 1).unwrap().hyperlink.is_some());
+    assert!(s.cell(0, 2).unwrap().hyperlink.is_none());
+
+    // Round-trip through the diff (alacritty echoes the captured id verbatim).
+    let blank = Screen::blank(20, 2);
+    let mut e2 = Emulator::new(20, 2);
+    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
+    assert_eq!(e2.snapshot(), s, "hyperlinks round-trip exactly");
+}
+
 /// Terminal modes (bracketed paste, mouse reporting, cursor style) are captured
 /// and round-trip through the diff.
 #[test]

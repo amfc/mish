@@ -134,6 +134,10 @@ fn convert_cell(cell: &ATermCell) -> Cell {
         bg: convert_color(cell.bg),
         flags: convert_flags(cell.flags),
         combining: cell.zerowidth().map(|z| z.to_vec()).unwrap_or_default(),
+        hyperlink: cell.hyperlink().map(|h| screen::Hyperlink {
+            id: Some(h.id().to_string()),
+            uri: h.uri().to_string(),
+        }),
     }
 }
 

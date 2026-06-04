@@ -57,8 +57,16 @@ pub const CURSOR_BLOCK: u8 = 0;
 pub const CURSOR_UNDERLINE: u8 = 1;
 pub const CURSOR_BEAM: u8 = 2;
 
-/// A single screen cell: one base character, its rendering attributes, and any
-/// zero-width combining marks attached to it (e.g. `e` + U+0301 = `é`).
+/// An OSC 8 hyperlink (`id` is optional; `uri` is the target).
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Hyperlink {
+    pub id: Option<String>,
+    pub uri: String,
+}
+
+/// A single screen cell: one base character, its rendering attributes, any
+/// zero-width combining marks attached to it (e.g. `e` + U+0301 = `é`), and an
+/// optional OSC 8 hyperlink.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Cell {
     pub c: char,
@@ -67,6 +75,8 @@ pub struct Cell {
     pub flags: u16,
     /// Combining (zero-width) characters following the base glyph.
     pub combining: Vec<char>,
+    /// OSC 8 hyperlink covering this cell, if any.
+    pub hyperlink: Option<Hyperlink>,
 }
 
 impl Default for Cell {
@@ -77,6 +87,7 @@ impl Default for Cell {
             bg: Color::Named(NAMED_BACKGROUND),
             flags: 0,
             combining: Vec::new(),
+            hyperlink: None,
         }
     }
 }
