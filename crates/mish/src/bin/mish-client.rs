@@ -172,7 +172,11 @@ async fn run_terminal(t: transport::QuicTransport) {
                         let _ = key_tx.send(ClientInput::Detach).await;
                         break;
                     }
-                    if key_tx.send(ClientInput::Keys(buf[..n].to_vec())).await.is_err() {
+                    if key_tx
+                        .send(ClientInput::Keys(buf[..n].to_vec()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -183,15 +187,18 @@ async fn run_terminal(t: transport::QuicTransport) {
     // SIGWINCH: report new terminal size.
     let resize_tx = in_tx.clone();
     tokio::spawn(async move {
-        let mut sig = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::window_change(),
-        ) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
+        let mut sig =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
         while sig.recv().await.is_some() {
             if let Ok((cols, rows)) = crossterm::terminal::size() {
-                if resize_tx.send(ClientInput::Resize { cols, rows }).await.is_err() {
+                if resize_tx
+                    .send(ClientInput::Resize { cols, rows })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }

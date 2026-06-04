@@ -155,10 +155,12 @@ impl FrameState {
 
     fn append_cell(&mut self, cell: &Cell) {
         let mut buf = [0u8; 4];
-        self.out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+        self.out
+            .extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
         // Re-emit any combining marks so the receiver's emulator reattaches them.
         for &cm in &cell.combining {
-            self.out.extend_from_slice(cm.encode_utf8(&mut buf).as_bytes());
+            self.out
+                .extend_from_slice(cm.encode_utf8(&mut buf).as_bytes());
         }
     }
 }
@@ -249,7 +251,11 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
         frame.cursor_x = 0;
         frame.cursor_y = 0;
         // The leading reset establishes a known default pen.
-        frame.current = Some((Color::Named(NAMED_FOREGROUND), Color::Named(NAMED_BACKGROUND), 0));
+        frame.current = Some((
+            Color::Named(NAMED_FOREGROUND),
+            Color::Named(NAMED_BACKGROUND),
+            0,
+        ));
         frame.current_link = Some(None);
     }
 
@@ -326,9 +332,7 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
         }
     }
 
-    if !initialized
-        || old.cursor_shape != new.cursor_shape
-        || old.cursor_blink != new.cursor_blink
+    if !initialized || old.cursor_shape != new.cursor_shape || old.cursor_blink != new.cursor_blink
     {
         // DECSCUSR: 1/2 block, 3/4 underline, 5/6 beam (odd = blink).
         let base = match new.cursor_shape {

@@ -25,7 +25,10 @@ fn diff_is_delivered_and_idempotent() {
 
     a.set_current_state(BytesState::new(b"hello".to_vec()));
     let out = a.tick(0);
-    let inst = out.into_iter().find(|i| i.has_diff()).expect("a data instruction");
+    let inst = out
+        .into_iter()
+        .find(|i| i.has_diff())
+        .expect("a data instruction");
 
     b.recv(0, &inst);
     assert_eq!(b.remote_state().as_slice(), b"hello");
@@ -51,7 +54,11 @@ fn unknown_old_num_is_dropped() {
         timestamp_reply: None,
     };
     b.recv(0, &bogus);
-    assert_eq!(b.remote_state().as_slice(), b"", "must not apply unanchored diff");
+    assert_eq!(
+        b.remote_state().as_slice(),
+        b"",
+        "must not apply unanchored diff"
+    );
     assert_eq!(b.remote_state_num(), 0);
 }
 
@@ -100,7 +107,10 @@ fn ack_advances_sender_to_synced() {
             break;
         }
     }
-    assert!(a.is_synced(), "A should become synced after B acks (t={now})");
+    assert!(
+        a.is_synced(),
+        "A should become synced after B acks (t={now})"
+    );
 }
 
 #[test]

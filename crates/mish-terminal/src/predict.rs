@@ -150,8 +150,10 @@ impl PredictionEngine {
                 Err(e) => {
                     let valid = e.valid_up_to();
                     if valid > 0 {
-                        let chars: Vec<char> =
-                            std::str::from_utf8(&self.utf8[..valid]).unwrap().chars().collect();
+                        let chars: Vec<char> = std::str::from_utf8(&self.utf8[..valid])
+                            .unwrap()
+                            .chars()
+                            .collect();
                         for ch in chars {
                             self.predict_char(ch, input_index);
                         }
@@ -378,10 +380,18 @@ mod tests {
         let base = screen_with_ack(20, 3, 0);
         // "ü" = 0xC3 0xBC; feed the bytes in two separate chunks.
         p.new_user_bytes(&[0xC3], &base, 1);
-        assert_eq!(p.active_predictions(), 0, "no glyph until the char is complete");
+        assert_eq!(
+            p.active_predictions(),
+            0,
+            "no glyph until the char is complete"
+        );
         p.new_user_bytes(&[0xBC], &base, 1);
         let shown = p.predicted_screen(&base);
-        assert_eq!(shown.cell(0, 0).unwrap().c, 'ü', "complete char predicted, not corrupted");
+        assert_eq!(
+            shown.cell(0, 0).unwrap().c,
+            'ü',
+            "complete char predicted, not corrupted"
+        );
     }
 
     #[test]
@@ -428,7 +438,10 @@ mod tests {
         }
         let shown = p.predicted_screen(&base);
         let line: String = (0..10).map(|c| shown.cell(0, c).unwrap().c).collect();
-        assert_eq!(line, "glück faĩl", "predicted text must be exact, uncorrupted UTF-8");
+        assert_eq!(
+            line, "glück faĩl",
+            "predicted text must be exact, uncorrupted UTF-8"
+        );
         // No replacement characters anywhere.
         assert!(
             shown.cells.iter().all(|cell| cell.c != '\u{fffd}'),
@@ -497,7 +510,10 @@ mod tests {
         let shown = p.predicted_screen(&base);
         assert_eq!(shown.cell(0, 0).unwrap().c, '世');
         assert_ne!(shown.cell(0, 0).unwrap().flags & crate::screen::F_WIDE, 0);
-        assert_ne!(shown.cell(0, 1).unwrap().flags & crate::screen::F_WIDE_SPACER, 0);
+        assert_ne!(
+            shown.cell(0, 1).unwrap().flags & crate::screen::F_WIDE_SPACER,
+            0
+        );
         // Cursor advanced by the full display width.
         assert_eq!(shown.cursor_col, 2);
     }

@@ -21,7 +21,7 @@ covered by an equivalent test rather than a byte-for-byte port (we render to a
 | emulation-attributes-256color8/248 | `emulation_mish::indexed_256_background`, `emulator_test::sgr_attributes_and_color` | 256-color |
 | emulation-attributes-truecolor | `emulator_test::rgb_truecolor` | 24-bit color |
 | emulation-attributes-bce | `emulation_mish::background_color_erase` | BCE on erase |
-| emulation-attributes-osc8 | — | hyperlinks not modeled in `Screen` (deferred) |
+| emulation-attributes-osc8 | `emulation_mish::osc8_hyperlink_captured_and_diffed` | OSC 8 hyperlinks modeled + round-tripped |
 
 ## Network / protocol behavior
 
@@ -31,7 +31,7 @@ covered by an equivalent test rather than a byte-for-byte port (we render to a
 | repeat / repeat-with-input | `turmoil_sim::repeat_sessions_converge` | 50 sessions back-to-back |
 | window-resize | `emulation_mish::resize_reflows`, `loopback::client_resize_propagates_to_server_pty` | resize/reflow + SIGWINCH path |
 | server-network-timeout | `loopback::server_exits_after_network_timeout` | idle timeout (paused clock) |
-| server-signal-timeout | — | OS-signal-driven; not modeled |
+| server-signal-timeout | `server_cli::exits_on_signal_timeout_without_client` | MOSH_SERVER_SIGNAL_TMOUT: exit if no client connects |
 | pty-deadlock | `pty_real::flow_control_does_not_deadlock` | ^S/^Q (XOFF/XON) around I/O, session keeps flowing |
 | local | `full_stack::quic_pty_full_stack` | real PTY + QUIC end-to-end |
 | e2e-success / e2e-failure | `loopback::*`, `full_stack::*` | full client↔server round trip |

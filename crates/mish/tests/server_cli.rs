@@ -30,7 +30,10 @@ async fn binds_port_in_requested_range() {
         .unwrap();
 
     let port = read_connect_port(&mut child).await;
-    assert!((51000..=51010).contains(&port), "bound port {port} in range");
+    assert!(
+        (51000..=51010).contains(&port),
+        "bound port {port} in range"
+    );
     let _ = child.kill().await;
 }
 

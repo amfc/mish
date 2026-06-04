@@ -94,7 +94,9 @@ works because the data path is independent UDP.
 | QUIC e2e | full stack over real Quinn endpoints: two-way sync, 25% datagram loss recovery, client migration/roaming | `mish-quic/tests/quic_e2e.rs` |
 | Terminal | screen-diff & user-stream PBTs, emulator VT parsing, client/server convergence over the sim (incl. 40% loss) | `mish-terminal/tests/*` |
 | Fragmentation | split/reassemble round-trip, out-of-order, lost-fragment | `mish-ssp/src/frag.rs` |
-| Full stack | headless loopback, real PTY shell, and real QUIC + real PTY end-to-end | `mosh/tests/*` |
+| Full stack | headless loopback, real PTY shell, daemonization, SSH/local bootstrap, real QUIC + real PTY end-to-end | `mosh/tests/*` |
+| Fuzz/robustness | no-panic on arbitrary wire bytes / screen diffs / VT input (proptest) + `cargo-fuzz` scaffold | `*/tests/fuzz_*.rs`, `fuzz/` |
+| madsim sim | sans-IO core over madsim's simulated UDP (latency/loss), reproducible by seed | `mish-madsim/tests/` |
 
 ```sh
 cargo test          # everything
@@ -145,14 +147,33 @@ cargo clippy --all-targets
       UTF-8 before predicting (the `prediction-unicode` regression), abandons on
       escape sequences. Plus **`mish-sim`**: the real async session over
       `turmoil`-simulated UDP with latency, loss, partitions, and a controllable
-      clock. *(done. Deferred: SRTT-gated/underlined prediction display — a
-      refinement on *when* predictions show.)*
+      clock. Predictive echo is **adaptive** (SRTT-gated, mosh's default) with
+      tentative predictions underlined and glitch suppression. *(done)*
 
 See [`COVERAGE.md`](COVERAGE.md) for the mapping of mosh's own test suite to the
 mish equivalents.
 
-- [ ] **M7 — Polish.** Server signal-timeout, flow-control/pty-deadlock test,
-      shutdown handshake, hyperlink (OSC 8) modeling, `madsim` sim mode.
+- [x] **M7 — Fidelity & hardening.** Server **daemonization** (fork/setsid, so
+      SSH can close); **combining marks + wide (CJK) chars** carried through the
+      diff; **clean shutdown handshake** (SHUTDOWN_NUM); **bracketed-paste / mouse
+      / cursor-style** modes synced; **OSC 8 hyperlinks**; **scroll-detection +
+      minimal-SGR** diff; `mish-server` **`-p` port range / `-l` locale /
+      signal-timeout**; a **`madsim`** deterministic engine (`mish-madsim`,
+      `--cfg madsim`) alongside turmoil; **fuzz/robustness** tests (proptest
+      no-panic on arbitrary wire/diff bytes, plus a `cargo-fuzz` scaffold in
+      `fuzz/`); builds on **stable** Rust with a **GitHub Actions CI**
+      (fmt/clippy/test + madsim). *(done)*
+
+## Toolchain, fuzzing & CI
+
+Builds on stable Rust (pinned in `rust-toolchain.toml`). CI
+(`.github/workflows/ci.yml`) runs `fmt`/`clippy`/`test` and the madsim engine.
+
+```sh
+cargo test                                   # everything (stable)
+RUSTFLAGS="--cfg madsim" cargo test -p mish-madsim   # deterministic madsim sim
+cargo +nightly fuzz run screen_apply         # cargo-fuzz target (needs cargo-fuzz)
+```
 
 ## License
 

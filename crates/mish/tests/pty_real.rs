@@ -100,9 +100,9 @@ async fn flow_control_does_not_deadlock() {
     // echo, then XOFF, more input while paused, XON, then a final marker.
     for seq in [
         &b"echo AAA\r"[..],
-        &b"\x13"[..],          // ^S (XOFF)
+        &b"\x13"[..], // ^S (XOFF)
         &b"echo BBB\r"[..],
-        &b"\x11"[..],          // ^Q (XON)
+        &b"\x11"[..], // ^Q (XON)
         &b"echo DEADLOCK_OK\r"[..],
     ] {
         cin_tx.send(ClientInput::Keys(seq.to_vec())).await.unwrap();

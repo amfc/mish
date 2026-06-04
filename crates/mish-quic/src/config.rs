@@ -50,9 +50,8 @@ pub fn self_signed_server_config() -> (ServerConfig, CertificateDer<'static>) {
     let cert_der = cert.cert.der().clone();
     let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
 
-    let mut server_config =
-        ServerConfig::with_single_cert(vec![cert_der.clone()], key_der.into())
-            .expect("valid single-cert server config");
+    let mut server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], key_der.into())
+        .expect("valid single-cert server config");
     server_config.transport_config(transport_config());
     (server_config, cert_der)
 }

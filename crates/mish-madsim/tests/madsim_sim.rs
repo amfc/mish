@@ -86,8 +86,7 @@ async fn ping_client(server: SocketAddr, payload: Vec<u8>) -> bool {
             return true;
         }
         let wait = core.wait_time(now).unwrap_or(3_600_000).max(1);
-        if let Ok(Ok((n, _))) =
-            timeout(Duration::from_millis(wait), sock.recv_from(&mut buf)).await
+        if let Ok(Ok((n, _))) = timeout(Duration::from_millis(wait), sock.recv_from(&mut buf)).await
         {
             let now2 = start.elapsed().as_millis() as u64;
             if let Some(inst) = Instruction::decode(&buf[..n]) {

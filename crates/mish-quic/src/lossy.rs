@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, ServerConfig, TokioRuntime, UdpPoller};
+use quinn::{
+    AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, ServerConfig, TokioRuntime, UdpPoller,
+};
 use rustls::pki_types::CertificateDer;
 
 use crate::config;
@@ -135,12 +137,8 @@ pub fn lossy_insecure_client_endpoint(
     seed: u64,
 ) -> Result<Endpoint, QuicError> {
     let socket = lossy_socket(bind, loss, seed)?;
-    let mut endpoint = Endpoint::new_with_abstract_socket(
-        EndpointConfig::default(),
-        None,
-        socket,
-        runtime(),
-    )?;
+    let mut endpoint =
+        Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime())?;
     endpoint.set_default_client_config(config::insecure_client_config());
     Ok(endpoint)
 }

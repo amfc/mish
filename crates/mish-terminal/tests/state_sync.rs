@@ -30,7 +30,14 @@ fn arb_cell() -> impl Strategy<Value = Cell> {
         arb_color_with_default(mish_terminal::screen::NAMED_FOREGROUND),
         arb_color_with_default(mish_terminal::screen::NAMED_BACKGROUND),
         // Round-trippable attribute flags (no wide-char markers).
-        prop_oneof![Just(0u16), Just(2u16), Just(4u16), Just(6u16), Just(8u16), Just(16u16)],
+        prop_oneof![
+            Just(0u16),
+            Just(2u16),
+            Just(4u16),
+            Just(6u16),
+            Just(8u16),
+            Just(16u16)
+        ],
     )
         .prop_map(|(c, fg, bg, flags)| Cell {
             c,

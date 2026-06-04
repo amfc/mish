@@ -1,0 +1,27 @@
+[package]
+name = "mish-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mish-ssp = { path = "../crates/mish-ssp" }
+mish-terminal = { path = "../crates/mish-terminal" }
+
+[[bin]]
+name = "instruction_decode"
+path = "fuzz_targets/instruction_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "screen_apply"
+path = "fuzz_targets/screen_apply.rs"
+test = false
+doc = false
+bench = false

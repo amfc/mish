@@ -42,7 +42,11 @@ fn sequential_updates_converge_to_latest() {
         sim.run_until(|s| s.now() >= target, MAX_TIME);
     }
     let ok = sim.run_until(|s| s.b_view_of_a().as_slice() == b"state-19", MAX_TIME);
-    assert!(ok, "B converges to the final state (saw {:?})", String::from_utf8_lossy(sim.b_view_of_a().as_slice()));
+    assert!(
+        ok,
+        "B converges to the final state (saw {:?})",
+        String::from_utf8_lossy(sim.b_view_of_a().as_slice())
+    );
 }
 
 #[test]
@@ -57,7 +61,10 @@ fn converges_under_heavy_loss() {
     let mut sim = NetworkSim::<BytesState, BytesState>::new(cfg);
     sim.set_a_local(BytesState::new(b"survives 50% loss".to_vec()));
     sim.set_b_local(BytesState::new(b"and reordering".to_vec()));
-    let ok = sim.run_until(|s| converged(s, b"survives 50% loss", b"and reordering"), MAX_TIME);
+    let ok = sim.run_until(
+        |s| converged(s, b"survives 50% loss", b"and reordering"),
+        MAX_TIME,
+    );
     assert!(
         ok,
         "should converge despite loss (t={}, sent={}, dropped={})",

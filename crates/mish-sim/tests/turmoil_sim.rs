@@ -11,11 +11,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use mish_sim::TurmoilUdpTransport;
 use mish_ssp::clock::{Clock, TokioClock};
 use mish_ssp::core::SspConfig;
 use mish_ssp::session::{Driver, Session};
 use mish_ssp::states::BytesState;
-use mish_sim::TurmoilUdpTransport;
 
 const PORT: u16 = 9000;
 
@@ -48,12 +48,10 @@ fn session(
 /// Run an echo endpoint forever: whatever it receives, it sends back with an
 /// `-ack` suffix.
 async fn echo_server() -> turmoil::Result {
-    let transport = TurmoilUdpTransport::bind_server(SocketAddr::new(
-        Ipv4Addr::UNSPECIFIED.into(),
-        PORT,
-    ))
-    .await
-    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let transport =
+        TurmoilUdpTransport::bind_server(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), PORT))
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     let handle = session(transport);
 
     let mut remote = handle.subscribe_remote();
@@ -152,10 +150,7 @@ fn large_payload_fragments_and_converges_under_loss() {
 
     let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
     sim.host("server", echo_server);
-    sim.client(
-        "client",
-        ping_expect_ack(payload, Duration::from_secs(90)),
-    );
+    sim.client("client", ping_expect_ack(payload, Duration::from_secs(90)));
 
     sim.run().unwrap();
 }
@@ -173,11 +168,9 @@ fn repeat_sessions_converge() {
             .build();
         sim.host("server", echo_server);
         let payload = format!("session-{iter}").into_bytes();
-        sim.client(
-            "client",
-            ping_expect_ack(payload, Duration::from_secs(20)),
-        );
-        sim.run().unwrap_or_else(|e| panic!("iteration {iter} failed: {e}"));
+        sim.client("client", ping_expect_ack(payload, Duration::from_secs(20)));
+        sim.run()
+            .unwrap_or_else(|e| panic!("iteration {iter} failed: {e}"));
     }
 }
 

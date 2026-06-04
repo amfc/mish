@@ -161,7 +161,10 @@ fn build_endpoint(imp: Impairments, seed: u64) -> Endpoint {
         while let Some(dgram) = app_rx.recv().await {
             let (drop, delay) = {
                 let mut r = rng.lock().unwrap();
-                (r.next_f64() < imp.loss, r.delay_in(imp.min_delay_ms, imp.max_delay_ms))
+                (
+                    r.next_f64() < imp.loss,
+                    r.delay_in(imp.min_delay_ms, imp.max_delay_ms),
+                )
             };
             if drop {
                 continue;

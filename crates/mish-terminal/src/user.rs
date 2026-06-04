@@ -90,8 +90,11 @@ impl SyncState for UserStream {
         debug_assert!(from >= self.base, "diffing against a trimmed-away ancestor");
         let start_idx = from.saturating_sub(self.base) as usize;
         let suffix: Vec<UserEvent> = self.events.iter().skip(start_idx).cloned().collect();
-        bincode::serialize(&StreamDiff { start: from, suffix })
-            .expect("user stream diff serialization is infallible")
+        bincode::serialize(&StreamDiff {
+            start: from,
+            suffix,
+        })
+        .expect("user stream diff serialization is infallible")
     }
 
     fn apply_diff(&mut self, diff: &[u8]) {

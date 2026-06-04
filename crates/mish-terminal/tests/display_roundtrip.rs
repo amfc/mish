@@ -101,7 +101,13 @@ fn scroll_up_is_minimal_and_correct() {
     let cols = 20u16;
     let rows = 6u16;
     let line = |s: &str| -> Vec<Cell> {
-        let mut row: Vec<Cell> = s.chars().map(|c| Cell { c, ..Cell::default() }).collect();
+        let mut row: Vec<Cell> = s
+            .chars()
+            .map(|c| Cell {
+                c,
+                ..Cell::default()
+            })
+            .collect();
         row.resize(cols as usize, Cell::default());
         row
     };
@@ -138,7 +144,10 @@ fn scroll_up_is_minimal_and_correct() {
         full.len()
     );
     // Round-trips exactly.
-    assert!(screen_eq(&apply(&old, &new), &new), "scroll diff must reproduce new");
+    assert!(
+        screen_eq(&apply(&old, &new), &new),
+        "scroll diff must reproduce new"
+    );
 }
 
 proptest! {

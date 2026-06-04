@@ -108,7 +108,10 @@ fn main() -> Result<()> {
     let socket = bind_in_range(&opts.ports).context("binding UDP socket")?;
     let port = socket.local_addr()?.port();
 
-    println!("MISH CONNECT {port} {}", mish::bootstrap::to_hex(cert.as_ref()));
+    println!(
+        "MISH CONNECT {port} {}",
+        mish::bootstrap::to_hex(cert.as_ref())
+    );
     std::io::stdout().flush().ok();
     eprintln!("mish server listening on UDP port {port}");
 
@@ -137,14 +140,14 @@ async fn serve(
 
     // Signal timeout: give up if no client connects within the window.
     let signal_timeout = env_secs("MOSH_SERVER_SIGNAL_TMOUT", 60);
-    let t = match tokio::time::timeout(signal_timeout, mish_quic::transport::accept(&endpoint)).await
-    {
-        Ok(conn) => conn.context("accepting QUIC connection")?,
-        Err(_) => {
-            eprintln!("no client connected within the signal timeout; exiting");
-            return Ok(());
-        }
-    };
+    let t =
+        match tokio::time::timeout(signal_timeout, mish_quic::transport::accept(&endpoint)).await {
+            Ok(conn) => conn.context("accepting QUIC connection")?,
+            Err(_) => {
+                eprintln!("no client connected within the signal timeout; exiting");
+                return Ok(());
+            }
+        };
     eprintln!("client connected from {}", t.remote_address());
 
     let pty = PtyProcess::spawn(&command, cols, rows).context("spawning PTY child")?;

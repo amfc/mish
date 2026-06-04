@@ -128,9 +128,7 @@ async fn read_connect(child: &mut Child) -> Result<(u16, Vec<u8>)> {
                 return Ok(parsed);
             }
         }
-        Err(anyhow!(
-            "server exited before printing a MISH CONNECT line"
-        ))
+        Err(anyhow!("server exited before printing a MISH CONNECT line"))
     };
 
     tokio::time::timeout(Duration::from_secs(30), read)
@@ -194,7 +192,10 @@ mod tests {
     #[test]
     fn parse_connect_line() {
         let line = format!("MISH CONNECT 51234 {}", to_hex(&[0xde, 0xad, 0xbe, 0xef]));
-        assert_eq!(parse_connect(&line), Some((51234, vec![0xde, 0xad, 0xbe, 0xef])));
+        assert_eq!(
+            parse_connect(&line),
+            Some((51234, vec![0xde, 0xad, 0xbe, 0xef]))
+        );
         assert_eq!(parse_connect("garbage"), None);
         assert_eq!(parse_connect("MISH CONNECT notaport ff"), None);
     }

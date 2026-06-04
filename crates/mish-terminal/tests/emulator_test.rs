@@ -90,5 +90,8 @@ fn clear_screen() {
     emu.feed(b"junk\r\nmore");
     emu.feed(b"\x1b[2J\x1b[H");
     let screen = emu.snapshot();
-    assert!(screen.to_lines().iter().all(|l| l.is_empty()), "screen cleared");
+    assert!(
+        screen.to_lines().iter().all(|l| l.is_empty()),
+        "screen cleared"
+    );
 }

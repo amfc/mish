@@ -419,9 +419,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             return Vec::new();
         }
 
-        let diff = self
-            .current_state
-            .diff_from(&self.assumed().state);
+        let diff = self.current_state.diff_from(&self.assumed().state);
 
         let mut out = Vec::new();
         if diff.is_empty() {
@@ -551,11 +549,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
 
         // 2. Locate the reference state this diff builds on. If we don't have it,
         //    drop the instruction. This enforces idempotency/replay-safety.
-        let reference = match self
-            .received_states
-            .iter()
-            .find(|s| s.num == inst.old_num)
-        {
+        let reference = match self.received_states.iter().find(|s| s.num == inst.old_num) {
             Some(r) => r.clone(),
             None => return,
         };

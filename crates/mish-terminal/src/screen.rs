@@ -138,7 +138,8 @@ impl Screen {
 
     pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
         if row < self.rows && col < self.cols {
-            self.cells.get(row as usize * self.cols as usize + col as usize)
+            self.cells
+                .get(row as usize * self.cols as usize + col as usize)
         } else {
             None
         }
@@ -180,6 +181,10 @@ impl Screen {
 /// the escape stream is an incremental frame (same dims) or a full repaint
 /// (resized), and echo_ack is the out-of-band prediction-validation counter.
 const DIFF_HEADER: usize = 12;
+
+/// Upper bound on a synchronized screen's cell count, to reject malformed or
+/// hostile diffs that would allocate an absurd grid (a generous ~2000×2000).
+const MAX_SCREEN_CELLS: u32 = 4_000_000;
 
 impl SyncState for Screen {
     fn new_initial() -> Self {
@@ -224,6 +229,12 @@ impl SyncState for Screen {
         let cols = u16::from_le_bytes([diff[8], diff[9]]);
         let rows = u16::from_le_bytes([diff[10], diff[11]]);
         let ansi = &diff[DIFF_HEADER..];
+
+        // Reject implausibly large geometries from a malformed/hostile diff,
+        // which would otherwise allocate an enormous grid.
+        if cols as u32 * rows as u32 > MAX_SCREEN_CELLS {
+            return;
+        }
 
         // Reconstruct the new screen by replaying the escape stream through a
         // throwaway emulator. When dimensions are unchanged the stream is an

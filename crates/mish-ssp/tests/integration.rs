@@ -32,7 +32,8 @@ where
     TB: Transport,
 {
     let clock = Arc::new(SystemClock::new());
-    let (da, ha) = Driver::<_, BytesState, BytesState>::with(Arc::new(ta), clock.clone(), fast_cfg());
+    let (da, ha) =
+        Driver::<_, BytesState, BytesState>::with(Arc::new(ta), clock.clone(), fast_cfg());
     let (db, hb) = Driver::<_, BytesState, BytesState>::with(Arc::new(tb), clock, fast_cfg());
     da.spawn();
     db.spawn();
@@ -43,7 +44,8 @@ where
 async fn clean_shutdown_closes_both_sides() {
     let (ta, tb) = memory::pair();
     let clock = Arc::new(SystemClock::new());
-    let (da, ha) = Driver::<_, BytesState, BytesState>::with(Arc::new(ta), clock.clone(), fast_cfg());
+    let (da, ha) =
+        Driver::<_, BytesState, BytesState>::with(Arc::new(ta), clock.clone(), fast_cfg());
     let (db, hb) = Driver::<_, BytesState, BytesState>::with(Arc::new(tb), clock, fast_cfg());
     let task_a = da.spawn();
     let task_b = db.spawn();
@@ -86,9 +88,12 @@ async fn lossless_one_way() {
     let (ha, mut hb) = connect(ta, tb);
 
     ha.set_local(BytesState::new(b"hello from A".to_vec()));
-    tokio::time::timeout(Duration::from_secs(5), await_state(&mut hb, b"hello from A"))
-        .await
-        .expect("converged");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        await_state(&mut hb, b"hello from A"),
+    )
+    .await
+    .expect("converged");
 }
 
 #[tokio::test]

@@ -129,7 +129,11 @@ where
 {
     /// Build a driver and its application handle using the system clock.
     pub fn new(transport: Arc<T>) -> (Self, SessionHandle<L, R>) {
-        Self::with(transport, Arc::new(SystemClock::new()), SspConfig::default())
+        Self::with(
+            transport,
+            Arc::new(SystemClock::new()),
+            SspConfig::default(),
+        )
     }
 
     /// Build a driver with an injected clock and config (for tests / simulation).
@@ -203,9 +207,7 @@ where
 
             // 3. Sleep until the next protocol event, or until something happens.
             let wait = self.core.wait_time(self.clock.now_ms());
-            let sleep = tokio::time::sleep(Duration::from_millis(
-                wait.unwrap_or(3_600_000),
-            ));
+            let sleep = tokio::time::sleep(Duration::from_millis(wait.unwrap_or(3_600_000)));
             tokio::pin!(sleep);
 
             tokio::select! {

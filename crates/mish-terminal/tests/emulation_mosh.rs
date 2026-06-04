@@ -23,7 +23,10 @@ fn eightieth_column_deferred_wrap() {
     let mut e = Emulator::new(80, 24);
     e.feed(&[b'E'; 80]);
     let s = e.snapshot();
-    assert_eq!(s.cursor_row, 0, "cursor stays on row 0 after exactly 80 columns");
+    assert_eq!(
+        s.cursor_row, 0,
+        "cursor stays on row 0 after exactly 80 columns"
+    );
     assert_eq!(s.to_lines()[0].chars().filter(|&c| c == 'E').count(), 80);
 
     // The 81st character finally wraps to row 1.
@@ -36,10 +39,25 @@ fn eightieth_column_deferred_wrap() {
 #[test]
 fn cursor_motion_positions() {
     let positions: &[(u16, u16, char)] = &[
-        (1, 1, 'A'), (10, 1, 'B'), (1, 2, 'C'), (1, 4, 'D'), (10, 4, 'E'),
-        (1, 7, 'F'), (1, 11, 'G'), (10, 11, 'H'), (1, 16, 'I'), (2, 16, 'J'),
-        (1, 22, 'K'), (60, 23, 'L'), (59, 23, 'M'), (57, 23, 'N'), (54, 23, 'O'),
-        (50, 23, 'P'), (45, 23, 'Q'), (39, 23, 'R'), (32, 23, 'S'),
+        (1, 1, 'A'),
+        (10, 1, 'B'),
+        (1, 2, 'C'),
+        (1, 4, 'D'),
+        (10, 4, 'E'),
+        (1, 7, 'F'),
+        (1, 11, 'G'),
+        (10, 11, 'H'),
+        (1, 16, 'I'),
+        (2, 16, 'J'),
+        (1, 22, 'K'),
+        (60, 23, 'L'),
+        (59, 23, 'M'),
+        (57, 23, 'N'),
+        (54, 23, 'O'),
+        (50, 23, 'P'),
+        (45, 23, 'Q'),
+        (39, 23, 'R'),
+        (32, 23, 'S'),
     ];
     let mut e = Emulator::new(80, 24);
     e.feed(b"\x1b[H\x1b[J");
@@ -65,7 +83,10 @@ fn scroll_up() {
     let s = e.snapshot();
     assert_eq!(s.to_lines()[0], "text 5", "top 4 lines scrolled off");
     assert_eq!(s.to_lines()[19], "text 24", "row 24 moved up by 4");
-    assert!(s.to_lines()[20..].iter().all(|l| l.is_empty()), "exposed lines blank");
+    assert!(
+        s.to_lines()[20..].iter().all(|l| l.is_empty()),
+        "exposed lines blank"
+    );
 }
 
 /// emulation-back-tab: CBT (`ESC[<n>Z`, cursor backward tab) and CHT
@@ -86,8 +107,16 @@ fn back_tab_and_forward_tab() {
     // CHT 1 from col 12 → col 16; 't' there.
     assert_eq!(line0(&[b"\x1b[I", b"t"]), "hello, wurld    t");
     // CHT 99 clamps to the last column.
-    let s = run(80, 24, &[b"\x1b[H\x1b[J", b"hello, wurld", b"\x1b[99I", b"#"]);
-    assert_eq!(s.cell(0, 79).unwrap().c, '#', "forward-tab clamps to last column");
+    let s = run(
+        80,
+        24,
+        &[b"\x1b[H\x1b[J", b"hello, wurld", b"\x1b[99I", b"#"],
+    );
+    assert_eq!(
+        s.cell(0, 79).unwrap().c,
+        '#',
+        "forward-tab clamps to last column"
+    );
 }
 
 /// emulation-attributes-16color: SGR foreground colors (30–37) produce distinct
@@ -112,12 +141,19 @@ fn background_color_erase() {
     let mut e = Emulator::new(20, 3);
     e.feed(b"\x1b[41mX"); // red background, write X at (0,0); cursor now (0,1)
     let red_bg = e.snapshot().cell(0, 0).unwrap().bg;
-    assert_ne!(red_bg, Color::Named(mish_terminal::screen::NAMED_BACKGROUND));
+    assert_ne!(
+        red_bg,
+        Color::Named(mish_terminal::screen::NAMED_BACKGROUND)
+    );
     // ESC[J (erase below) fills the rest of the cursor's line with the active
     // background color (BCE), as mosh's bce test relies on.
     e.feed(b"\x1b[J");
     let s = e.snapshot();
-    assert_eq!(s.cell(0, 5).unwrap().bg, red_bg, "erased cells keep the bg color");
+    assert_eq!(
+        s.cell(0, 5).unwrap().bg,
+        red_bg,
+        "erased cells keep the bg color"
+    );
 }
 
 /// emulation-attributes-256color & truecolor are covered by emulator_test.rs;
@@ -153,7 +189,10 @@ fn wrap_across_rows() {
     e.feed(&[b'B'; 80]);
     let s = e.snapshot();
     assert!(s.to_lines()[0].chars().all(|c| c == 'A'), "row 0 all A");
-    assert!(s.to_lines()[1].chars().all(|c| c == 'B'), "row 1 all B (wrapped)");
+    assert!(
+        s.to_lines()[1].chars().all(|c| c == 'B'),
+        "row 1 all B (wrapped)"
+    );
 }
 
 /// emulation-ascii-iso-8859: ASCII and Latin-1 high characters render.
@@ -261,7 +300,10 @@ fn combining_marks_captured_and_diffed() {
     let blank = Screen::blank(10, 2);
     let mut e2 = Emulator::new(10, 2);
     e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
-    assert_eq!(e2.snapshot().cell(0, 0).unwrap().combining, vec!['\u{0301}']);
+    assert_eq!(
+        e2.snapshot().cell(0, 0).unwrap().combining,
+        vec!['\u{0301}']
+    );
 }
 
 /// Wide (CJK) characters occupy a glyph cell + a spacer, and round-trip exactly.
@@ -272,7 +314,11 @@ fn wide_char_cells_and_diff() {
     e.feed("世界".as_bytes());
     let s = e.snapshot();
     assert_eq!(s.cell(0, 0).unwrap().c, '世');
-    assert_ne!(s.cell(0, 0).unwrap().flags & screen::F_WIDE, 0, "wide flag set");
+    assert_ne!(
+        s.cell(0, 0).unwrap().flags & screen::F_WIDE,
+        0,
+        "wide flag set"
+    );
     assert_ne!(
         s.cell(0, 1).unwrap().flags & screen::F_WIDE_SPACER,
         0,

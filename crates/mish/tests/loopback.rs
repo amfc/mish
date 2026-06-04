@@ -42,7 +42,10 @@ async fn server_exits_after_network_timeout() {
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
     }
-    assert!(server.is_finished(), "server should exit after the network timeout");
+    assert!(
+        server.is_finished(),
+        "server should exit after the network timeout"
+    );
     server.await.expect("server task joined");
 }
 
@@ -141,13 +144,17 @@ async fn client_resize_propagates_to_server_pty() {
     ));
 
     cin_tx
-        .send(ClientInput::Resize { cols: 132, rows: 43 })
+        .send(ClientInput::Resize {
+            cols: 132,
+            rows: 43,
+        })
         .await
         .unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let PtyControl::Resize { cols, rows } = pty_in_rx.recv().await.expect("pty control") {
+            if let PtyControl::Resize { cols, rows } = pty_in_rx.recv().await.expect("pty control")
+            {
                 if cols == 132 && rows == 43 {
                     return;
                 }

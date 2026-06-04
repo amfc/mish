@@ -37,7 +37,8 @@ fn clock() -> Arc<dyn Clock> {
 
 /// Spawn a driver for an accepted/connected transport and return its handle.
 fn spawn_driver(t: QuicTransport, clock: Arc<dyn Clock>) -> Handle {
-    let (driver, handle) = Driver::<_, BytesState, BytesState>::with(Arc::new(t), clock, fast_cfg());
+    let (driver, handle) =
+        Driver::<_, BytesState, BytesState>::with(Arc::new(t), clock, fast_cfg());
     driver.spawn();
     handle
 }
@@ -72,7 +73,9 @@ async fn quic_two_way_sync() {
 
     // Client side.
     let client_ep = transport::loopback_client().unwrap();
-    let t = transport::connect(&client_ep, addr, "localhost").await.unwrap();
+    let t = transport::connect(&client_ep, addr, "localhost")
+        .await
+        .unwrap();
     let mut client = spawn_driver(t, clk);
     let mut server = rx.await.unwrap();
 
@@ -108,7 +111,9 @@ async fn quic_recovers_from_datagram_loss() {
     });
 
     let client_ep = lossy::lossy_insecure_client_endpoint(bind, 0.25, 0xB0B).unwrap();
-    let t = transport::connect(&client_ep, addr, "localhost").await.unwrap();
+    let t = transport::connect(&client_ep, addr, "localhost")
+        .await
+        .unwrap();
     let client = spawn_driver(t, clk);
     let mut server = rx.await.unwrap();
 
@@ -142,15 +147,20 @@ async fn quic_survives_client_migration() {
     });
 
     let client_ep = transport::loopback_client().unwrap();
-    let t = transport::connect(&client_ep, addr, "localhost").await.unwrap();
+    let t = transport::connect(&client_ep, addr, "localhost")
+        .await
+        .unwrap();
     let client = spawn_driver(t, clk);
     let (mut server, server_probe) = rx.await.unwrap();
 
     // Establish sync on the original path.
     client.set_local(BytesState::new(b"before-roam".to_vec()));
-    tokio::time::timeout(Duration::from_secs(10), await_state(&mut server, b"before-roam"))
-        .await
-        .expect("initial sync");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        await_state(&mut server, b"before-roam"),
+    )
+    .await
+    .expect("initial sync");
     let addr_before = server_probe.remote_address();
 
     // Roam: rebind the client endpoint to a brand-new local UDP port.
@@ -160,9 +170,12 @@ async fn quic_survives_client_migration() {
 
     // New data after migration must still arrive.
     client.set_local(BytesState::new(b"after-roam".to_vec()));
-    tokio::time::timeout(Duration::from_secs(10), await_state(&mut server, b"after-roam"))
-        .await
-        .expect("sync continues after migration");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        await_state(&mut server, b"after-roam"),
+    )
+    .await
+    .expect("sync continues after migration");
 
     let addr_after = server_probe.remote_address();
     assert_ne!(
