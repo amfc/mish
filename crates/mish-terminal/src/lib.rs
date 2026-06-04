@@ -17,12 +17,14 @@
 //! A mish **client** is an [`mish_ssp::SspCore`]`<UserStream, Screen>`; the
 //! **server** is its mirror, `SspCore<Screen, UserStream>`.
 
+pub mod display;
 pub mod emulator;
 pub mod predict;
 pub mod render;
 pub mod screen;
 pub mod user;
 
+pub use display::new_frame;
 pub use emulator::Emulator;
 pub use predict::{PredictMode, PredictionEngine};
 pub use render::render_full;

@@ -13,8 +13,8 @@ use mish_ssp::core::SspConfig;
 use mish_ssp::session::{Driver, Session};
 use mish_ssp::state::SyncState;
 use mish_ssp::transport::Transport;
+use mish_terminal::display::new_frame;
 use mish_terminal::predict::{PredictMode, PredictionEngine};
-use mish_terminal::render::render_full;
 use mish_terminal::screen::Screen;
 use mish_terminal::user::UserStream;
 use tokio::sync::mpsc;
@@ -58,6 +58,23 @@ pub async fn run_client<T: Transport>(
     let mut engine = PredictionEngine::new(predict);
     // Latest screen actually received from the server (predictions overlay it).
     let mut server_screen = Screen::new_initial();
+    // Last screen we painted to the TTY; new frames diff against it so we emit
+    // only minimal updates (mosh's Display::new_frame), not full repaints.
+    let mut painted = Screen::new_initial();
+    let mut painted_once = false;
+
+    // Emit a minimal frame from `painted` to the current predicted screen.
+    macro_rules! repaint {
+        () => {{
+            let predicted = engine.predicted_screen(&server_screen);
+            let frame = new_frame(&painted, &predicted, painted_once);
+            painted = predicted;
+            painted_once = true;
+            if !frame.is_empty() && output.send(frame).is_err() {
+                break;
+            }
+        }};
+    }
 
     loop {
         tokio::select! {
@@ -68,9 +85,7 @@ pub async fn run_client<T: Transport>(
                         handle.set_local(stream.clone());
                         // Speculatively echo the keystroke immediately.
                         engine.new_user_bytes(&b, &server_screen, stream.total());
-                        if output.send(render_full(&engine.predicted_screen(&server_screen))).is_err() {
-                            break;
-                        }
+                        repaint!();
                     }
                     Some(ClientInput::Resize { cols, rows }) => {
                         stream.push_resize(cols, rows);
@@ -86,9 +101,7 @@ pub async fn run_client<T: Transport>(
                 server_screen = remote.borrow_and_update().clone();
                 // Validate/cull predictions against the freshly-confirmed screen.
                 engine.new_server_screen(&server_screen);
-                if output.send(render_full(&engine.predicted_screen(&server_screen))).is_err() {
-                    break;
-                }
+                repaint!();
             }
         }
     }

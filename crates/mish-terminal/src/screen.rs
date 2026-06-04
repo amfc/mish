@@ -137,22 +137,11 @@ impl Screen {
     }
 }
 
-/// Wire form of a screen diff (bincode-encoded). Only changed rows are carried.
-#[derive(Serialize, Deserialize)]
-struct ScreenDiff {
-    cols: u16,
-    rows: u16,
-    /// Set when the dimensions changed (then *every* row is included).
-    resized: bool,
-    /// `(row_index, row_cells)` for each changed row.
-    changed_rows: Vec<(u16, Vec<Cell>)>,
-    cursor_row: u16,
-    cursor_col: u16,
-    cursor_visible: bool,
-    /// `Some` only when the title changed.
-    title: Option<String>,
-    echo_ack: u64,
-}
+/// Diff header (little-endian) preceding the mosh `new_frame` escape stream:
+/// `echo_ack: u64 | cols: u16 | rows: u16`. Dimensions tell the receiver whether
+/// the escape stream is an incremental frame (same dims) or a full repaint
+/// (resized), and echo_ack is the out-of-band prediction-validation counter.
+const DIFF_HEADER: usize = 12;
 
 impl SyncState for Screen {
     fn new_initial() -> Self {
@@ -171,79 +160,43 @@ impl SyncState for Screen {
     }
 
     fn diff_from(&self, prev: &Self) -> Vec<u8> {
-        let resized = self.cols != prev.cols || self.rows != prev.rows;
-
-        let mut changed_rows = Vec::new();
-        for row in 0..self.rows {
-            let differs = resized || self.row_slice(row) != prev.row_slice(row);
-            if differs {
-                changed_rows.push((row, self.row_slice(row).to_vec()));
-            }
-        }
-
-        let cursor_changed = self.cursor_row != prev.cursor_row
-            || self.cursor_col != prev.cursor_col
-            || self.cursor_visible != prev.cursor_visible;
-        let title = if self.title != prev.title {
-            Some(self.title.clone())
-        } else {
-            None
-        };
-
-        // Nothing changed ⇒ empty diff (SSP treats it as a no-op).
-        if !resized
-            && changed_rows.is_empty()
-            && !cursor_changed
-            && title.is_none()
-            && self.echo_ack == prev.echo_ack
-        {
+        // The diff is mosh's minimal escape stream transforming `prev` into
+        // `self` (cursor moves, ECH/EL erases, SGR runs) — see `crate::display`.
+        let ansi = crate::display::new_frame(prev, self, true);
+        if ansi.is_empty() && self.echo_ack == prev.echo_ack {
             return Vec::new();
         }
-
-        let diff = ScreenDiff {
-            cols: self.cols,
-            rows: self.rows,
-            resized,
-            changed_rows,
-            cursor_row: self.cursor_row,
-            cursor_col: self.cursor_col,
-            cursor_visible: self.cursor_visible,
-            title,
-            echo_ack: self.echo_ack,
-        };
-        bincode::serialize(&diff).expect("screen diff serialization is infallible")
+        let mut out = Vec::with_capacity(DIFF_HEADER + ansi.len());
+        out.extend_from_slice(&self.echo_ack.to_le_bytes());
+        out.extend_from_slice(&self.cols.to_le_bytes());
+        out.extend_from_slice(&self.rows.to_le_bytes());
+        out.extend_from_slice(&ansi);
+        out
     }
 
     fn apply_diff(&mut self, diff: &[u8]) {
-        if diff.is_empty() {
-            return;
+        if diff.len() < DIFF_HEADER {
+            return; // empty (no-op) or malformed
         }
-        let diff: ScreenDiff = match bincode::deserialize(diff) {
-            Ok(d) => d,
-            Err(_) => return, // malformed; drop
-        };
+        let echo_ack = u64::from_le_bytes(diff[0..8].try_into().unwrap());
+        let cols = u16::from_le_bytes([diff[8], diff[9]]);
+        let rows = u16::from_le_bytes([diff[10], diff[11]]);
+        let ansi = &diff[DIFF_HEADER..];
 
-        if diff.resized || diff.cols != self.cols || diff.rows != self.rows {
-            self.cols = diff.cols;
-            self.rows = diff.rows;
-            self.cells = vec![Cell::default(); diff.cols as usize * diff.rows as usize];
+        // Reconstruct the new screen by replaying the escape stream through a
+        // throwaway emulator. When dimensions are unchanged the stream is an
+        // incremental frame from `self` (== the reference state we were cloned
+        // from), so we first paint `self`; when resized, the stream is a full
+        // repaint and paints from blank.
+        let mut emu = crate::emulator::Emulator::new(cols, rows);
+        if cols == self.cols && rows == self.rows {
+            let blank = Screen::blank(cols, rows);
+            emu.feed(&crate::display::new_frame(&blank, self, false));
         }
-
-        let w = self.cols as usize;
-        for (row, cells) in diff.changed_rows {
-            if (row as usize) < self.rows as usize && cells.len() == w {
-                let start = row as usize * w;
-                self.cells[start..start + w].clone_from_slice(&cells);
-            }
-        }
-
-        self.cursor_row = diff.cursor_row;
-        self.cursor_col = diff.cursor_col;
-        self.cursor_visible = diff.cursor_visible;
-        self.echo_ack = diff.echo_ack;
-        if let Some(title) = diff.title {
-            self.title = title;
-        }
+        emu.feed(ansi);
+        let mut next = emu.snapshot();
+        next.echo_ack = echo_ack;
+        *self = next;
     }
 
     fn equals(&self, other: &Self) -> bool {
