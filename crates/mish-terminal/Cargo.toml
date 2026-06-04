@@ -1,0 +1,17 @@
+[package]
+name = "mish-terminal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Terminal SyncStates for mish: the screen (Complete) and keystroke stream (UserStream), with an alacritty-terminal-backed emulator."
+
+[dependencies]
+mish-ssp = { path = "../mish-ssp" }
+serde = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+alacritty_terminal = "0.26"
+
+[dev-dependencies]
+proptest = { workspace = true }
