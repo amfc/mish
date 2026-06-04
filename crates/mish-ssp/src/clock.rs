@@ -44,3 +44,33 @@ impl Clock for SystemClock {
         self.origin.elapsed().as_millis() as Millis
     }
 }
+
+/// A clock backed by `tokio::time::Instant`, anchored at construction.
+///
+/// Unlike [`SystemClock`], this tracks tokio's (possibly *simulated*) time, so
+/// it stays consistent with `tokio::time::sleep` under `tokio::time::pause` and
+/// inside discrete-event simulators like `turmoil`. Use this for the async
+/// driver in any simulated environment.
+pub struct TokioClock {
+    origin: tokio::time::Instant,
+}
+
+impl TokioClock {
+    pub fn new() -> Self {
+        Self {
+            origin: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for TokioClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for TokioClock {
+    fn now_ms(&self) -> Millis {
+        self.origin.elapsed().as_millis() as Millis
+    }
+}

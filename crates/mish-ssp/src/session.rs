@@ -151,6 +151,11 @@ where
 
     /// Run the event loop until the transport closes.
     pub async fn run(mut self) -> Result<(), SessionError> {
+        // Once the application drops every handle, `local_rx` is permanently
+        // closed; we must stop selecting on it or the always-ready `None` would
+        // busy-loop (and, under a paused/simulated clock, wedge the whole runtime
+        // by never letting it go idle).
+        let mut local_open = true;
         loop {
             let now = self.clock.now_ms();
 
@@ -189,15 +194,11 @@ where
                         Err(_) => { /* transient: treat as a drop */ }
                     }
                 }
-                // Application changed the local state.
-                local = self.local_rx.recv() => {
+                // Application changed the local state (only while a handle lives).
+                local = self.local_rx.recv(), if local_open => {
                     match local {
                         Some(state) => self.core.set_current_state(state),
-                        None => {
-                            // App dropped its handle; keep running so in-flight
-                            // state still drains? For now, finish.
-                            // (A clean shutdown handshake is a later milestone.)
-                        }
+                        None => local_open = false, // handle dropped; keep serving
                     }
                 }
                 // Protocol timer fired; loop back to tick().

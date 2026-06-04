@@ -33,7 +33,7 @@ pub mod state;
 pub mod states;
 pub mod transport;
 
-pub use clock::{Clock, Millis, SystemClock};
+pub use clock::{Clock, Millis, SystemClock, TokioClock};
 pub use core::{SspConfig, SspCore};
 pub use instruction::Instruction;
 pub use session::{Driver, Session, SessionError, SessionHandle};
