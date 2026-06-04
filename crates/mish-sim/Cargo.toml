@@ -1,0 +1,19 @@
+[package]
+name = "mish-sim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Deterministic network-simulation tests (turmoil) for mish."
+
+[dependencies]
+mish-ssp = { path = "../mish-ssp" }
+mish-terminal = { path = "../mish-terminal" }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+turmoil = "0.6"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
