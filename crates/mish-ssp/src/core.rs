@@ -84,6 +84,43 @@ struct Timestamped<S> {
     state: S,
 }
 
+/// Jacobson/Karels SRTT/RTTVAR estimator (RFC 6298 / mosh's `Connection`).
+#[derive(Clone, Debug)]
+struct Rtt {
+    srtt: f64,
+    rttvar: f64,
+    initialized: bool,
+}
+
+impl Rtt {
+    fn new() -> Self {
+        Self {
+            srtt: 1000.0,
+            rttvar: 500.0,
+            initialized: false,
+        }
+    }
+
+    fn sample(&mut self, r: Millis) {
+        let r = r as f64;
+        if !self.initialized {
+            self.srtt = r;
+            self.rttvar = r / 2.0;
+            self.initialized = true;
+        } else {
+            const ALPHA: f64 = 1.0 / 8.0;
+            const BETA: f64 = 1.0 / 4.0;
+            self.rttvar = (1.0 - BETA) * self.rttvar + BETA * (self.srtt - r).abs();
+            self.srtt = (1.0 - ALPHA) * self.srtt + ALPHA * r;
+        }
+    }
+
+    /// Retransmission timeout estimate (ms), before clamping to config bounds.
+    fn rto(&self) -> f64 {
+        self.srtt + 4.0 * self.rttvar
+    }
+}
+
 /// One direction-pair of the State Synchronization Protocol.
 ///
 /// `L` is the local state we send to the peer; `R` is the remote state we
@@ -112,6 +149,13 @@ pub struct SspCore<L: SyncState, R: SyncState> {
     // ---- Receiver half (incoming `R`) ----
     /// Sorted ascending by num; front = oldest retained, back = newest.
     received_states: VecDeque<Timestamped<R>>,
+
+    // ---- RTT estimation ----
+    rtt: Rtt,
+    /// Most recent timestamp received from the peer, and when we received it, so
+    /// we can echo it adjusted for the time we held it.
+    saved_timestamp: Option<u16>,
+    saved_timestamp_received_at: Millis,
 }
 
 impl<L: SyncState, R: SyncState> SspCore<L, R> {
@@ -145,6 +189,9 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             last_heard: 0,
             mindelay_clock: None,
             received_states,
+            rtt: Rtt::new(),
+            saved_timestamp: None,
+            saved_timestamp_received_at: 0,
         }
     }
 
@@ -184,12 +231,24 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
     // ----- Timing -----
 
     fn send_interval(&self) -> Millis {
-        // TODO(rtt): scale with SRTT once the datagram-layer RTT estimator lands.
-        self.cfg.send_interval_min
+        // Aim for ~2 frames per RTT, clamped to the configured bounds. Falls back
+        // to the minimum interval until we have an RTT sample.
+        if self.rtt.initialized {
+            (self.rtt.srtt / 2.0).ceil() as Millis
+        } else {
+            self.cfg.send_interval_min
+        }
+        .clamp(self.cfg.send_interval_min, self.cfg.send_interval_max)
     }
 
     fn timeout(&self) -> Millis {
-        self.cfg.rto
+        // RTT-derived RTO, clamped so it never exceeds the configured rto (which
+        // acts as the conservative upper bound) and stays above a small floor.
+        if self.rtt.initialized {
+            (self.rtt.rto().ceil() as Millis).clamp(50, self.cfg.rto)
+        } else {
+            self.cfg.rto
+        }
     }
 
     /// The assumed receiver state: newest unacked sent state recent enough to
@@ -323,7 +382,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             self.add_sent_state(now, new_num);
         }
 
-        self.emit(diff, new_num, out);
+        self.emit(now, diff, new_num, out);
 
         self.assumed_receiver_idx = self.sent_states.len() - 1;
         self.next_ack_time = now + self.cfg.ack_interval;
@@ -333,9 +392,19 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
     fn send_empty_ack(&mut self, now: Millis, out: &mut Vec<Instruction>) {
         let new_num = self.sent_states.back().expect("never empty").num + 1;
         self.add_sent_state(now, new_num);
-        self.emit(Vec::new(), new_num, out);
+        self.emit(now, Vec::new(), new_num, out);
         self.next_ack_time = now + self.cfg.ack_interval;
         self.next_send_time = NEVER;
+    }
+
+    /// Build the timestamp echo for an outgoing instruction: the peer's last
+    /// timestamp plus how long we've held it (so the peer can subtract its own
+    /// processing/queueing time when computing RTT).
+    fn timestamp_reply(&self, now: Millis) -> Option<u16> {
+        self.saved_timestamp.map(|ts| {
+            let held = now.saturating_sub(self.saved_timestamp_received_at) as u16;
+            ts.wrapping_add(held)
+        })
     }
 
     /// Push `current_state` as a newly-sent state, capping the queue.
@@ -353,11 +422,9 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         }
     }
 
-    fn emit(&mut self, diff: Vec<u8>, new_num: u64, out: &mut Vec<Instruction>) {
-        // FRAGMENTATION: mosh splits instructions exceeding the MTU into
-        // Fragments and adds random chaff. For the in-memory transport datagrams
-        // are unbounded, so we emit a single instruction. The QUIC datagram
-        // transport will reintroduce fragmentation here.
+    fn emit(&mut self, now: Millis, diff: Vec<u8>, new_num: u64, out: &mut Vec<Instruction>) {
+        // Fragmentation/MTU-splitting and length-disguising chaff are handled one
+        // layer up (the session Driver fragments by transport MTU).
         out.push(Instruction {
             protocol_version: PROTOCOL_VERSION,
             old_num: self.assumed().num,
@@ -365,6 +432,8 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             ack_num: self.ack_num,
             throwaway_num: self.sent_states.front().expect("never empty").num,
             diff,
+            timestamp: (now & 0xFFFF) as u16,
+            timestamp_reply: self.timestamp_reply(now),
         });
         self.pending_data_ack = false;
     }
@@ -377,6 +446,18 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         if inst.protocol_version != PROTOCOL_VERSION {
             return;
         }
+
+        // 0. RTT bookkeeping: take a round-trip sample from our echoed timestamp,
+        //    and remember the peer's timestamp so we can echo it back.
+        if let Some(reply) = inst.timestamp_reply {
+            let sample = (now as u16).wrapping_sub(reply) as Millis;
+            // Guard against absurd samples from clock skew / wraparound.
+            if sample < 60_000 {
+                self.rtt.sample(sample);
+            }
+        }
+        self.saved_timestamp = Some(inst.timestamp);
+        self.saved_timestamp_received_at = now;
 
         // 1. The peer told us what it has received from us → advance our acks.
         self.process_acknowledgment_through(inst.ack_num);

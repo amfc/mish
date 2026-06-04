@@ -35,6 +35,7 @@ pub async fn run_server<T: Transport>(
     cols: u16,
     rows: u16,
     clock: Arc<dyn Clock>,
+    network_timeout: Option<std::time::Duration>,
     mut pty_output: mpsc::Receiver<Vec<u8>>,
     pty_input: mpsc::UnboundedSender<PtyControl>,
 ) {
@@ -53,9 +54,18 @@ pub async fn run_server<T: Transport>(
     handle.set_local(publish(&emu, processed));
 
     let mut remote = handle.subscribe_remote();
+    // Idle watchdog: if we don't hear from the client (no inbound state, not
+    // even a keepalive) within network_timeout, shut the session down — mosh's
+    // MOSH_SERVER_NETWORK_TMOUT, which keeps orphaned servers from lingering.
+    let mut last_heard = tokio::time::Instant::now();
 
     loop {
+        let idle = network_timeout.map(|t| tokio::time::sleep_until(last_heard + t));
         tokio::select! {
+            _ = async { idle.unwrap().await }, if network_timeout.is_some() => {
+                // No client traffic within the timeout window.
+                return;
+            }
             // Child produced output → feed the emulator, publish the new screen.
             out = pty_output.recv() => {
                 match out {
@@ -71,6 +81,8 @@ pub async fn run_server<T: Transport>(
                 if changed.is_err() {
                     break; // driver stopped
                 }
+                // Heard from the client (input or keepalive) — reset the watchdog.
+                last_heard = tokio::time::Instant::now();
                 let stream = remote.borrow_and_update().clone();
                 for ev in stream.events_since(processed) {
                     match ev {

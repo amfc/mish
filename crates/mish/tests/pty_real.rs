@@ -29,6 +29,7 @@ async fn real_shell_output_reaches_client() {
         80,
         24,
         clock.clone(),
+        None,
         pty.output,
         pty.control,
     ));

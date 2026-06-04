@@ -30,7 +30,7 @@ async fn quic_pty_full_stack() {
     tokio::spawn(async move {
         let t = transport::accept(&server_ep).await.expect("accept");
         let pty = PtyProcess::spawn("/bin/sh", 80, 24).expect("spawn shell");
-        run_server(Arc::new(t), 80, 24, sclock, pty.output, pty.control).await;
+        run_server(Arc::new(t), 80, 24, sclock, None, pty.output, pty.control).await;
     });
 
     // Client: connect over QUIC, run the session with a channel-faked TTY.

@@ -47,6 +47,8 @@ fn unknown_old_num_is_dropped() {
         ack_num: 0,
         throwaway_num: 0,
         diff: BytesState::new(b"evil".to_vec()).as_slice().to_vec(),
+        timestamp: 0,
+        timestamp_reply: None,
     };
     b.recv(0, &bogus);
     assert_eq!(b.remote_state().as_slice(), b"", "must not apply unanchored diff");
@@ -63,6 +65,8 @@ fn wrong_protocol_version_ignored() {
         ack_num: 0,
         throwaway_num: 0,
         diff: vec![],
+        timestamp: 0,
+        timestamp_reply: None,
     };
     b.recv(0, &inst);
     assert_eq!(b.remote_state_num(), 0);
@@ -113,6 +117,8 @@ fn malformed_diff_does_not_panic() {
         ack_num: 0,
         throwaway_num: 0,
         diff: vec![0xff, 0xff, 0xff, 0xff, b'x'], // prefix len ~4B, tail "x"
+        timestamp: 0,
+        timestamp_reply: None,
     };
     b.recv(0, &inst);
     // truncate(huge) is a no-op on an empty vec, then "x" is appended.

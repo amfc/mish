@@ -52,7 +52,23 @@ async fn main() -> Result<()> {
     let pty = PtyProcess::spawn(&command, cols, rows).context("spawning PTY child")?;
     let clock = Arc::new(SystemClock::new());
 
-    run_server(Arc::new(t), cols, rows, clock, pty.output, pty.control).await;
+    // Idle network timeout (mosh's MOSH_SERVER_NETWORK_TMOUT); default 5 minutes.
+    let network_timeout = std::env::var("MOSH_SERVER_NETWORK_TMOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .or(Some(std::time::Duration::from_secs(300)));
+
+    run_server(
+        Arc::new(t),
+        cols,
+        rows,
+        clock,
+        network_timeout,
+        pty.output,
+        pty.control,
+    )
+    .await;
     eprintln!("session ended");
     Ok(())
 }

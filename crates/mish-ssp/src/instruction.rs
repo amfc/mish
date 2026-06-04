@@ -36,6 +36,12 @@ pub struct Instruction {
     /// The diff, as produced by [`crate::state::SyncState::diff_from`]. Empty
     /// means "no state change" (a pure ack / keepalive).
     pub diff: Vec<u8>,
+    /// Sender's send time, low 16 bits of milliseconds (for the peer's RTT echo).
+    pub timestamp: u16,
+    /// Echo of the peer's most-recent `timestamp`, adjusted for hold time, or
+    /// `None` if we haven't heard a timestamp yet. The original sender subtracts
+    /// this from "now" to get a round-trip sample.
+    pub timestamp_reply: Option<u16>,
 }
 
 impl Instruction {
@@ -71,6 +77,8 @@ mod tests {
             ack_num: 7,
             throwaway_num: 2,
             diff: b"some diff bytes".to_vec(),
+            timestamp: 1234,
+            timestamp_reply: Some(1000),
         };
         let bytes = inst.encode();
         assert_eq!(Instruction::decode(&bytes), Some(inst));

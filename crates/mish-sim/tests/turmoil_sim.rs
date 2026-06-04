@@ -160,6 +160,27 @@ fn large_payload_fragments_and_converges_under_loss() {
     sim.run().unwrap();
 }
 
+/// Port of mosh's repeat.test: run many independent sessions back-to-back, each
+/// converging and tearing down cleanly. A leak or a teardown hang would surface
+/// as a failure or a stall here.
+#[test]
+fn repeat_sessions_converge() {
+    for iter in 0..50u32 {
+        let mut sim = turmoil::Builder::new()
+            .min_message_latency(Duration::from_millis(5))
+            .max_message_latency(Duration::from_millis(60))
+            .simulation_duration(Duration::from_secs(30))
+            .build();
+        sim.host("server", echo_server);
+        let payload = format!("session-{iter}").into_bytes();
+        sim.client(
+            "client",
+            ping_expect_ack(payload, Duration::from_secs(20)),
+        );
+        sim.run().unwrap_or_else(|e| panic!("iteration {iter} failed: {e}"));
+    }
+}
+
 #[test]
 fn survives_network_partition() {
     // Partition the client from the server for a stretch of simulated time,

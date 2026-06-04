@@ -8,9 +8,43 @@ use std::time::Duration;
 
 use mish::client::{run_client, ClientInput};
 use mish::server::{run_server, PtyControl};
-use mish_ssp::clock::{Clock, SystemClock};
+use mish_ssp::clock::{Clock, SystemClock, TokioClock};
 use mish_ssp::memory;
 use tokio::sync::mpsc;
+
+/// Port of mosh's server-network-timeout.test: with no client ever sending,
+/// the server shuts itself down after MOSH_SERVER_NETWORK_TMOUT. Uses paused
+/// virtual time so the 10s timeout elapses instantly.
+#[tokio::test(start_paused = true)]
+async fn server_exits_after_network_timeout() {
+    // A connected-but-silent transport (no client Driver on the other end).
+    let (server_t, _client_t) = memory::pair();
+    let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+    let (_pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (pty_in_tx, _pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
+
+    let server = tokio::spawn(run_server(
+        Arc::new(server_t),
+        80,
+        24,
+        clock,
+        Some(Duration::from_secs(10)),
+        pty_out_rx,
+        pty_in_tx,
+    ));
+
+    // Step virtual time forward (yielding so the server/driver tasks register
+    // and fire their timers) until the server exits or we pass the deadline.
+    for _ in 0..30 {
+        if server.is_finished() {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(server.is_finished(), "server should exit after the network timeout");
+    server.await.expect("server task joined");
+}
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
@@ -29,6 +63,7 @@ async fn server_output_reaches_client_and_input_reaches_server() {
         80,
         24,
         clock.clone(),
+        None,
         pty_out_rx,
         pty_in_tx,
     ));
@@ -88,6 +123,7 @@ async fn client_resize_propagates_to_server_pty() {
         80,
         24,
         clock.clone(),
+        None,
         pty_out_rx,
         pty_in_tx,
     ));
