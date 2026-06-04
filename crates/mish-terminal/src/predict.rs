@@ -23,7 +23,14 @@ pub enum PredictMode {
     Never,
     /// Always overlay predictions (mosh's `--predict=always`).
     Always,
+    /// Overlay predictions only when the link is laggy enough to benefit
+    /// (mosh's default `--predict=adaptive`), gated on the SRTT estimate.
+    Adaptive,
 }
+
+/// SRTT (ms) at or above which adaptive prediction switches on. Mirrors mosh's
+/// notion that prediction helps once the round-trip is perceptible.
+const ADAPTIVE_SRTT_TRIGGER_MS: f64 = 50.0;
 
 #[derive(Clone)]
 struct CellPrediction {
@@ -48,6 +55,8 @@ pub struct PredictionEngine {
     /// for the rest of the current input batch (the escape sequence's remaining
     /// bytes must not be echoed as text).
     suppress: bool,
+    /// Latest SRTT estimate (ms), for adaptive gating.
+    srtt_ms: f64,
     cols: u16,
     rows: u16,
 }
@@ -63,8 +72,23 @@ impl PredictionEngine {
             have_cursor: false,
             utf8: Vec::new(),
             suppress: false,
+            srtt_ms: 0.0,
             cols: 0,
             rows: 0,
+        }
+    }
+
+    /// Update the SRTT estimate used by [`PredictMode::Adaptive`] gating.
+    pub fn set_srtt(&mut self, srtt_ms: f64) {
+        self.srtt_ms = srtt_ms;
+    }
+
+    /// Whether predictions should currently be displayed.
+    fn showing(&self) -> bool {
+        match self.mode {
+            PredictMode::Never => false,
+            PredictMode::Always => true,
+            PredictMode::Adaptive => self.srtt_ms >= ADAPTIVE_SRTT_TRIGGER_MS,
         }
     }
 
@@ -243,7 +267,7 @@ impl PredictionEngine {
 
     /// The screen to display: the server screen with active predictions overlaid.
     pub fn predicted_screen(&self, server: &Screen) -> Screen {
-        if self.mode == PredictMode::Never || self.cells.is_empty() && !self.have_cursor {
+        if !self.showing() || (self.cells.is_empty() && !self.have_cursor) {
             return server.clone();
         }
         let mut s = server.clone();
@@ -356,6 +380,19 @@ mod tests {
             shown.cells.iter().all(|cell| cell.c != '\u{fffd}'),
             "no U+FFFD replacement characters"
         );
+    }
+
+    #[test]
+    fn adaptive_mode_gates_on_srtt() {
+        let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        let base = screen_with_ack(20, 2, 0);
+        p.new_user_bytes(b"x", &base, 1);
+        // Fast link: predictions tracked but not displayed.
+        p.set_srtt(5.0);
+        assert_eq!(p.predicted_screen(&base).cell(0, 0).unwrap().c, ' ');
+        // Laggy link: now the prediction is shown.
+        p.set_srtt(120.0);
+        assert_eq!(p.predicted_screen(&base).cell(0, 0).unwrap().c, 'x');
     }
 
     #[test]

@@ -111,15 +111,16 @@ async fn main() -> Result<()> {
 
     let clock = Arc::new(SystemClock::new());
 
-    // Run until the session ends or the user detaches. Predictive echo is on
-    // (mosh's --predict=always) so typing feels instant on high-latency links.
+    // Run until the session ends or the user detaches. Predictive echo is
+    // adaptive (mosh's default --predict=adaptive): predictions show once the
+    // link is laggy enough to benefit.
     tokio::select! {
         _ = run_client(
             Arc::new(t),
             cols,
             rows,
             clock,
-            mish_terminal::predict::PredictMode::Always,
+            mish_terminal::predict::PredictMode::Adaptive,
             in_rx,
             out_tx,
         ) => {}

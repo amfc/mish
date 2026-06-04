@@ -66,6 +66,8 @@ pub async fn run_client<T: Transport>(
     // Emit a minimal frame from `painted` to the current predicted screen.
     macro_rules! repaint {
         () => {{
+            // Keep adaptive prediction in step with the measured link latency.
+            engine.set_srtt(handle.srtt_ms());
             let predicted = engine.predicted_screen(&server_screen);
             let frame = new_frame(&painted, &predicted, painted_once);
             painted = predicted;

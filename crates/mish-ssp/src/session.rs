@@ -52,6 +52,7 @@ pub trait Session: Send + Sync {
 pub struct SessionHandle<L: SyncState, R: SyncState> {
     local_tx: mpsc::UnboundedSender<L>,
     remote_rx: watch::Receiver<R>,
+    srtt_rx: watch::Receiver<f64>,
 }
 
 impl<L: SyncState, R: SyncState> Clone for SessionHandle<L, R> {
@@ -59,6 +60,7 @@ impl<L: SyncState, R: SyncState> Clone for SessionHandle<L, R> {
         Self {
             local_tx: self.local_tx.clone(),
             remote_rx: self.remote_rx.clone(),
+            srtt_rx: self.srtt_rx.clone(),
         }
     }
 }
@@ -83,6 +85,12 @@ impl<L: SyncState + Send + Sync + 'static, R: SyncState + Send + Sync + 'static>
 }
 
 impl<L: SyncState, R: SyncState> SessionHandle<L, R> {
+    /// Current smoothed round-trip time estimate (ms). Lets the client gate
+    /// predictive echo on link latency (mosh's adaptive prediction).
+    pub fn srtt_ms(&self) -> f64 {
+        *self.srtt_rx.borrow()
+    }
+
     /// Await the next change to the remote state, returning a clone. `None` once
     /// the driver has stopped.
     pub async fn remote_changed(&mut self) -> Option<R> {
@@ -98,6 +106,7 @@ pub struct Driver<T: Transport, L: SyncState, R: SyncState> {
     clock: Arc<dyn Clock>,
     local_rx: mpsc::UnboundedReceiver<L>,
     remote_tx: watch::Sender<R>,
+    srtt_tx: watch::Sender<f64>,
     last_published_num: u64,
     fragmenter: Fragmenter,
     defragmenter: Defragmenter,
@@ -123,12 +132,15 @@ where
         let (local_tx, local_rx) = mpsc::unbounded_channel();
         let (remote_tx, remote_rx) = watch::channel(R::new_initial());
         let now = clock.now_ms();
+        let core = SspCore::with_config(now, cfg);
+        let (srtt_tx, srtt_rx) = watch::channel(core.srtt_ms());
         let driver = Self {
             transport,
-            core: SspCore::with_config(now, cfg),
+            core,
             clock,
             local_rx,
             remote_tx,
+            srtt_tx,
             last_published_num: 0,
             fragmenter: Fragmenter::new(),
             defragmenter: Defragmenter::new(),
@@ -136,6 +148,7 @@ where
         let handle = SessionHandle {
             local_tx,
             remote_rx,
+            srtt_rx,
         };
         (driver, handle)
     }
@@ -186,6 +199,7 @@ where
                                     let now = self.clock.now_ms();
                                     self.core.recv(now, &inst);
                                     self.publish_remote();
+                                    let _ = self.srtt_tx.send(self.core.srtt_ms());
                                 }
                             }
                             // Malformed / incomplete datagrams are silently dropped.

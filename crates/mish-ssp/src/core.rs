@@ -221,6 +221,16 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         self.received_states.back().expect("never empty").num
     }
 
+    /// Smoothed round-trip time estimate in milliseconds (the configured RTO
+    /// until the first RTT sample arrives). Drives adaptive predictive echo.
+    pub fn srtt_ms(&self) -> f64 {
+        if self.rtt.initialized {
+            self.rtt.srtt
+        } else {
+            self.cfg.rto as f64
+        }
+    }
+
     /// Whether everything we've produced has been acknowledged by the peer.
     pub fn is_synced(&self) -> bool {
         let back = self.sent_states.back().expect("never empty");
