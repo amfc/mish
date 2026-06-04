@@ -17,22 +17,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Color {
     /// A named/default palette slot (the emulator's `NamedColor` discriminant).
-    Named(u8),
+    /// `u16` because the discriminants for default fg/bg are 256/257 — they must
+    /// not be truncated into the basic 0–15 range (that bug aliased the default
+    /// background onto red).
+    Named(u16),
     /// A 256-color palette index.
     Indexed(u8),
     /// A true-color RGB value.
     Rgb(u8, u8, u8),
 }
 
-// Named-color discriminants we care about for defaults. These match
-// alacritty/vte's `NamedColor` enum ordering (Foreground = 256, Background =
-// 257 in the palette sense, but as enum discriminants they are small); the
-// emulator layer maps real values, so here we only need stable sentinels for
-// blank cells.
-/// Default foreground sentinel for blank cells.
-pub const NAMED_FOREGROUND: u8 = 0;
-/// Default background sentinel for blank cells.
-pub const NAMED_BACKGROUND: u8 = 1;
+// Default-color discriminants, matching vte's `NamedColor::Foreground`/
+// `Background`. Blank cells use these so they compare equal to emulator-produced
+// empty cells.
+/// Default foreground (`NamedColor::Foreground` discriminant).
+pub const NAMED_FOREGROUND: u16 = 256;
+/// Default background (`NamedColor::Background` discriminant).
+pub const NAMED_BACKGROUND: u16 = 257;
 
 // Cell attribute flags (a curated subset of the emulator's flags).
 pub const F_INVERSE: u16 = 1 << 0;
@@ -76,6 +77,10 @@ pub struct Screen {
     pub cursor_col: u16,
     pub cursor_visible: bool,
     pub title: String,
+    /// How many of the client's `UserStream` events the server had applied when
+    /// this screen was produced (mosh's "echo ack"). The client uses it to
+    /// validate or cull speculative local predictions. Server→client only.
+    pub echo_ack: u64,
 }
 
 impl Screen {
@@ -89,6 +94,7 @@ impl Screen {
             cursor_col: 0,
             cursor_visible: true,
             title: String::new(),
+            echo_ack: 0,
         }
     }
 
@@ -145,6 +151,7 @@ struct ScreenDiff {
     cursor_visible: bool,
     /// `Some` only when the title changed.
     title: Option<String>,
+    echo_ack: u64,
 }
 
 impl SyncState for Screen {
@@ -159,6 +166,7 @@ impl SyncState for Screen {
             cursor_col: 0,
             cursor_visible: true,
             title: String::new(),
+            echo_ack: 0,
         }
     }
 
@@ -183,7 +191,12 @@ impl SyncState for Screen {
         };
 
         // Nothing changed ⇒ empty diff (SSP treats it as a no-op).
-        if !resized && changed_rows.is_empty() && !cursor_changed && title.is_none() {
+        if !resized
+            && changed_rows.is_empty()
+            && !cursor_changed
+            && title.is_none()
+            && self.echo_ack == prev.echo_ack
+        {
             return Vec::new();
         }
 
@@ -196,6 +209,7 @@ impl SyncState for Screen {
             cursor_col: self.cursor_col,
             cursor_visible: self.cursor_visible,
             title,
+            echo_ack: self.echo_ack,
         };
         bincode::serialize(&diff).expect("screen diff serialization is infallible")
     }
@@ -226,6 +240,7 @@ impl SyncState for Screen {
         self.cursor_row = diff.cursor_row;
         self.cursor_col = diff.cursor_col;
         self.cursor_visible = diff.cursor_visible;
+        self.echo_ack = diff.echo_ack;
         if let Some(title) = diff.title {
             self.title = title;
         }

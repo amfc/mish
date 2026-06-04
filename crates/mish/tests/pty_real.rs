@@ -41,6 +41,7 @@ async fn real_shell_output_reaches_client() {
         80,
         24,
         clock.clone(),
+        mish_terminal::predict::PredictMode::Never,
         cin_rx,
         cout_tx,
     ));

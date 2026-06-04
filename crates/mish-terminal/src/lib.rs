@@ -18,11 +18,13 @@
 //! **server** is its mirror, `SspCore<Screen, UserStream>`.
 
 pub mod emulator;
+pub mod predict;
 pub mod render;
 pub mod screen;
 pub mod user;
 
 pub use emulator::Emulator;
+pub use predict::{PredictMode, PredictionEngine};
 pub use render::render_full;
 pub use screen::{Cell, Color, Screen};
 pub use user::{UserEvent, UserStream};

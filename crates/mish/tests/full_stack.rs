@@ -45,6 +45,7 @@ async fn quic_pty_full_stack() {
         80,
         24,
         clock.clone(),
+        mish_terminal::predict::PredictMode::Never,
         cin_rx,
         cout_tx,
     ));

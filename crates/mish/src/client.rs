@@ -11,7 +11,9 @@ use std::sync::Arc;
 use mish_ssp::clock::Clock;
 use mish_ssp::core::SspConfig;
 use mish_ssp::session::{Driver, Session};
+use mish_ssp::state::SyncState;
 use mish_ssp::transport::Transport;
+use mish_terminal::predict::{PredictMode, PredictionEngine};
 use mish_terminal::render::render_full;
 use mish_terminal::screen::Screen;
 use mish_terminal::user::UserStream;
@@ -36,6 +38,7 @@ pub async fn run_client<T: Transport>(
     cols: u16,
     rows: u16,
     clock: Arc<dyn Clock>,
+    predict: PredictMode,
     mut input: mpsc::Receiver<ClientInput>,
     output: mpsc::UnboundedSender<Vec<u8>>,
 ) {
@@ -52,14 +55,22 @@ pub async fn run_client<T: Transport>(
     handle.set_local(stream.clone());
 
     let mut remote = handle.subscribe_remote();
+    let mut engine = PredictionEngine::new(predict);
+    // Latest screen actually received from the server (predictions overlay it).
+    let mut server_screen = Screen::new_initial();
 
     loop {
         tokio::select! {
             inp = input.recv() => {
                 match inp {
                     Some(ClientInput::Keys(b)) => {
-                        stream.push_keystroke(b);
+                        stream.push_keystroke(b.clone());
                         handle.set_local(stream.clone());
+                        // Speculatively echo the keystroke immediately.
+                        engine.new_user_bytes(&b, &server_screen, stream.total());
+                        if output.send(render_full(&engine.predicted_screen(&server_screen))).is_err() {
+                            break;
+                        }
                     }
                     Some(ClientInput::Resize { cols, rows }) => {
                         stream.push_resize(cols, rows);
@@ -72,8 +83,10 @@ pub async fn run_client<T: Transport>(
                 if changed.is_err() {
                     break; // driver stopped
                 }
-                let screen = remote.borrow_and_update().clone();
-                if output.send(render_full(&screen)).is_err() {
+                server_screen = remote.borrow_and_update().clone();
+                // Validate/cull predictions against the freshly-confirmed screen.
+                engine.new_server_screen(&server_screen);
+                if output.send(render_full(&engine.predicted_screen(&server_screen))).is_err() {
                     break;
                 }
             }

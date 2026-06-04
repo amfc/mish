@@ -97,6 +97,7 @@ impl Emulator {
             cursor_col: cursor.column.0 as u16,
             cursor_visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
             title: self.listener.title.lock().unwrap().clone(),
+            echo_ack: 0, // set by the server session, not the emulator
         }
     }
 }
@@ -112,7 +113,7 @@ fn convert_cell(cell: &ATermCell) -> Cell {
 
 fn convert_color(color: ATermColor) -> Color {
     match color {
-        ATermColor::Named(named) => Color::Named(named as u8),
+        ATermColor::Named(named) => Color::Named(named as u16),
         ATermColor::Indexed(i) => Color::Indexed(i),
         ATermColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
     }

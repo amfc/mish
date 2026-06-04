@@ -14,7 +14,7 @@ use proptest::prelude::*;
 
 fn arb_color() -> impl Strategy<Value = Color> {
     prop_oneof![
-        (0u8..4).prop_map(Color::Named),
+        (0u16..300).prop_map(Color::Named),
         any::<u8>().prop_map(Color::Indexed),
         (any::<u8>(), any::<u8>(), any::<u8>()).prop_map(|(r, g, b)| Color::Rgb(r, g, b)),
     ]
@@ -36,8 +36,9 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
             0u16..cols,
             any::<bool>(),
             "[a-z ]{0,8}",
+            any::<u64>(),
         )
-            .prop_map(|(cols, rows, cells, cr, cc, cv, title)| Screen {
+            .prop_map(|(cols, rows, cells, cr, cc, cv, title, echo_ack)| Screen {
                 cols,
                 rows,
                 cells,
@@ -45,6 +46,7 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
                 cursor_col: cc,
                 cursor_visible: cv,
                 title,
+                echo_ack,
             })
     })
 }

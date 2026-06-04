@@ -41,6 +41,7 @@ async fn server_output_reaches_client_and_input_reaches_server() {
         80,
         24,
         clock.clone(),
+        mish_terminal::predict::PredictMode::Never,
         cin_rx,
         cout_tx,
     ));
@@ -98,6 +99,7 @@ async fn client_resize_propagates_to_server_pty() {
         80,
         24,
         clock.clone(),
+        mish_terminal::predict::PredictMode::Never,
         cin_rx,
         cout_tx,
     ));

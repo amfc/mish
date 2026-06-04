@@ -43,11 +43,16 @@ pub async fn run_server<T: Transport>(
     driver.spawn();
 
     let mut emu = Emulator::new(cols, rows);
-    handle.set_local(emu.snapshot());
+    // How many user events we've already applied to the PTY (the echo ack).
+    let mut processed: u64 = 0;
+    let publish = |emu: &Emulator, processed: u64| {
+        let mut screen = emu.snapshot();
+        screen.echo_ack = processed;
+        screen
+    };
+    handle.set_local(publish(&emu, processed));
 
     let mut remote = handle.subscribe_remote();
-    // How many user events we've already applied to the PTY.
-    let mut processed: u64 = 0;
 
     loop {
         tokio::select! {
@@ -56,7 +61,7 @@ pub async fn run_server<T: Transport>(
                 match out {
                     Some(bytes) => {
                         emu.feed(&bytes);
-                        handle.set_local(emu.snapshot());
+                        handle.set_local(publish(&emu, processed));
                     }
                     None => break, // child exited
                 }
@@ -67,7 +72,6 @@ pub async fn run_server<T: Transport>(
                     break; // driver stopped
                 }
                 let stream = remote.borrow_and_update().clone();
-                let mut resized = false;
                 for ev in stream.events_since(processed) {
                     match ev {
                         UserEvent::Keystroke(b) => {
@@ -83,15 +87,13 @@ pub async fn run_server<T: Transport>(
                                 return;
                             }
                             emu.resize(*cols, *rows);
-                            resized = true;
                         }
                     }
                 }
                 processed = stream.total();
-                if resized {
-                    // Reflect the new geometry in the synchronized screen.
-                    handle.set_local(emu.snapshot());
-                }
+                // Publish the new echo ack (and any geometry change) so the
+                // client can validate its predictions.
+                handle.set_local(publish(&emu, processed));
             }
         }
     }
