@@ -1,0 +1,33 @@
+[package]
+name = "mish"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "mish client and server binaries: a roaming, low-latency remote shell over QUIC."
+default-run = "mish-server"
+
+[dependencies]
+mish-ssp = { path = "../mish-ssp" }
+mish-quic = { path = "../mish-quic" }
+mish-terminal = { path = "../mish-terminal" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "signal"] }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# binary-only I/O deps
+portable-pty = "0.9"
+crossterm = "0.29"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bin]]
+name = "mish-server"
+path = "src/bin/mish-server.rs"
+
+[[bin]]
+name = "mish-client"
+path = "src/bin/mish-client.rs"

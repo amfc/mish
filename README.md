@@ -68,6 +68,8 @@ edges, then hammer the deterministic core.
 | Async integration | real `Driver` event loop over in-memory transport, incl. 30% loss | `mish-ssp/tests/integration.rs` |
 | QUIC e2e | full stack over real Quinn endpoints: two-way sync, 25% datagram loss recovery, client migration/roaming | `mish-quic/tests/quic_e2e.rs` |
 | Terminal | screen-diff & user-stream PBTs, emulator VT parsing, client/server convergence over the sim (incl. 40% loss) | `mish-terminal/tests/*` |
+| Fragmentation | split/reassemble round-trip, out-of-order, lost-fragment | `mish-ssp/src/frag.rs` |
+| Full stack | headless loopback, real PTY shell, and real QUIC + real PTY end-to-end | `mosh/tests/*` |
 
 ```sh
 cargo test          # everything
@@ -79,8 +81,12 @@ cargo clippy --all-targets
 - [x] **M1 — SSP core + transport/session traits.** Sans-IO `SspCore`,
       `SyncState`/`Transport`/`Session` traits, in-memory transport, virtual-time
       simulator, PBT + sim + async integration tests. *(done)*
-- [ ] **M2 — RTT estimation & fragmentation.** Datagram-layer timestamp echo for
-      SRTT/RTO; instruction fragmentation + chaff for the MTU.
+- [~] **M2 — RTT estimation & fragmentation.** *Fragmentation done*: the
+      `Driver` splits oversized instructions across MTU-sized datagrams and
+      reassembles them (`mish_ssp::frag`), so full-screen diffs traverse QUIC.
+      Recovery is per-instruction (a lost fragment re-diffs the whole
+      instruction), matching mosh. *(Still deferred: datagram-layer timestamp
+      echo for SRTT/RTO — currently a fixed RTO — and length-disguising chaff.)*
 - [x] **M3 — QUIC transport (`mish-quic`).** Quinn endpoint with the unreliable
       datagram extension implementing `Transport`; datagram-only connections
       (streams disabled); self-signed/insecure + trusted TLS configs; **client
@@ -95,8 +101,15 @@ cargo clippy --all-targets
       ANSI `render`er. PBTs + emulator tests + client/server convergence over the
       simulator (incl. 40% loss). *(done)*
       *(Deferred: client-side predictive echo — mosh's `terminaloverlay`.)*
-- [ ] **M5 — Binaries.** `mish-server` (PTY + child shell) and `mish-client`
-      (raw TTY, resize, predictions), bootstrap handshake.
+- [x] **M5 — Binaries (`mosh` crate).** `mish-server` (spawns a shell on a real
+      PTY via `portable-pty`, feeds output through the emulator, applies the
+      client's `UserStream` back to the PTY) and `mish-client` (raw TTY via
+      `crossterm`, forwards keystrokes, repaints received screens, SIGWINCH
+      resize, `Ctrl-]` detach). Session loops are transport-generic and
+      I/O-decoupled, so they're tested headlessly; plus a real-PTY test and a
+      **full-stack test** (real QUIC + real `/bin/sh` + emulator + render).
+      *(done)* *(Deferred: client-side predictive echo; SSH-bootstrapped certs —
+      the demo uses insecure TLS verification.)*
 - [ ] **M6 — Shutdown handshake, key rotation, fuzzing, soak sims.**
 
 ## License

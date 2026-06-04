@@ -1,0 +1,98 @@
+//! The server session loop: bridges a child process's PTY to the SSP layer.
+//!
+//! The server synchronizes `Screen` (out) and receives `UserStream` (in):
+//! it is an `SspCore<Screen, UserStream>`. This function is **generic over the
+//! transport and decoupled from the real PTY via channels**, so it can be tested
+//! over the in-memory transport with a fake PTY (see `tests/loopback.rs`). The
+//! binary wires a real `portable-pty` child into these channels.
+
+use std::sync::Arc;
+
+use mish_ssp::clock::Clock;
+use mish_ssp::core::SspConfig;
+use mish_ssp::session::{Driver, Session};
+use mish_ssp::transport::Transport;
+use mish_terminal::emulator::Emulator;
+use mish_terminal::screen::Screen;
+use mish_terminal::user::{UserEvent, UserStream};
+use tokio::sync::mpsc;
+
+/// A control message from the session to the child PTY.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PtyControl {
+    /// Bytes to write to the child's input.
+    Input(Vec<u8>),
+    /// The client resized; resize the child's PTY.
+    Resize { cols: u16, rows: u16 },
+}
+
+/// Run a server session until the PTY closes (child exits) or the peer leaves.
+///
+/// * `pty_output` yields raw bytes produced by the child process.
+/// * `pty_input` receives [`PtyControl`] messages to apply to the child.
+pub async fn run_server<T: Transport>(
+    transport: Arc<T>,
+    cols: u16,
+    rows: u16,
+    clock: Arc<dyn Clock>,
+    mut pty_output: mpsc::Receiver<Vec<u8>>,
+    pty_input: mpsc::UnboundedSender<PtyControl>,
+) {
+    let (driver, handle) =
+        Driver::<T, Screen, UserStream>::with(transport, clock, SspConfig::default());
+    driver.spawn();
+
+    let mut emu = Emulator::new(cols, rows);
+    handle.set_local(emu.snapshot());
+
+    let mut remote = handle.subscribe_remote();
+    // How many user events we've already applied to the PTY.
+    let mut processed: u64 = 0;
+
+    loop {
+        tokio::select! {
+            // Child produced output → feed the emulator, publish the new screen.
+            out = pty_output.recv() => {
+                match out {
+                    Some(bytes) => {
+                        emu.feed(&bytes);
+                        handle.set_local(emu.snapshot());
+                    }
+                    None => break, // child exited
+                }
+            }
+            // Client sent new input → apply the new events to the PTY.
+            changed = remote.changed() => {
+                if changed.is_err() {
+                    break; // driver stopped
+                }
+                let stream = remote.borrow_and_update().clone();
+                let mut resized = false;
+                for ev in stream.events_since(processed) {
+                    match ev {
+                        UserEvent::Keystroke(b) => {
+                            if pty_input.send(PtyControl::Input(b.clone())).is_err() {
+                                return;
+                            }
+                        }
+                        UserEvent::Resize { cols, rows } => {
+                            if pty_input
+                                .send(PtyControl::Resize { cols: *cols, rows: *rows })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            emu.resize(*cols, *rows);
+                            resized = true;
+                        }
+                    }
+                }
+                processed = stream.total();
+                if resized {
+                    // Reflect the new geometry in the synchronized screen.
+                    handle.set_local(emu.snapshot());
+                }
+            }
+        }
+    }
+}
