@@ -335,6 +335,29 @@ mod tests {
         assert_eq!(p.predicted_screen(&confirmed).cell(0, 0).unwrap().c, 'Z');
     }
 
+    /// Port of mosh's prediction-unicode.test: typing multibyte UTF-8 with
+    /// prediction enabled must never produce a corrupted/replacement glyph, even
+    /// when bytes of one character arrive in separate reads.
+    #[test]
+    fn prediction_unicode_no_corruption() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(40, 2, 0);
+        // "glück faĩl": ü = U+00FC (C3 BC), ĩ = U+0129 (C4 A9).
+        let input = "glück faĩl".as_bytes().to_vec();
+        // Deliver one byte at a time — the worst case for UTF-8 splitting.
+        for (i, b) in input.iter().enumerate() {
+            p.new_user_bytes(&[*b], &base, (i + 1) as u64);
+        }
+        let shown = p.predicted_screen(&base);
+        let line: String = (0..10).map(|c| shown.cell(0, c).unwrap().c).collect();
+        assert_eq!(line, "glück faĩl", "predicted text must be exact, uncorrupted UTF-8");
+        // No replacement characters anywhere.
+        assert!(
+            shown.cells.iter().all(|cell| cell.c != '\u{fffd}'),
+            "no U+FFFD replacement characters"
+        );
+    }
+
     #[test]
     fn escape_sequence_abandons_prediction() {
         let mut p = PredictionEngine::new(PredictMode::Always);

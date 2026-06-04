@@ -81,12 +81,14 @@ cargo clippy --all-targets
 - [x] **M1 — SSP core + transport/session traits.** Sans-IO `SspCore`,
       `SyncState`/`Transport`/`Session` traits, in-memory transport, virtual-time
       simulator, PBT + sim + async integration tests. *(done)*
-- [~] **M2 — RTT estimation & fragmentation.** *Fragmentation done*: the
-      `Driver` splits oversized instructions across MTU-sized datagrams and
-      reassembles them (`mish_ssp::frag`), so full-screen diffs traverse QUIC.
-      Recovery is per-instruction (a lost fragment re-diffs the whole
-      instruction), matching mosh. *(Still deferred: datagram-layer timestamp
-      echo for SRTT/RTO — currently a fixed RTO — and length-disguising chaff.)*
+- [x] **M2 — RTT estimation & fragmentation.** The `Driver` splits oversized
+      instructions across MTU-sized datagrams and reassembles them
+      (`mish_ssp::frag`), so full-screen diffs traverse QUIC; recovery is
+      per-instruction (a lost fragment re-diffs the whole instruction), matching
+      mosh. Instructions carry a 16-bit timestamp + echo; the core runs a
+      Jacobson/Karels SRTT/RTTVAR estimator that scales the send interval and
+      retransmit timeout (RFC 6298 / mosh's `Connection`). *(done. Deferred:
+      length-disguising chaff — QUIC already pads/encrypts.)*
 - [x] **M3 — QUIC transport (`mish-quic`).** Quinn endpoint with the unreliable
       datagram extension implementing `Transport`; datagram-only connections
       (streams disabled); self-signed/insecure + trusted TLS configs; **client
@@ -95,12 +97,13 @@ cargo clippy --all-targets
       *(Deferred: `turmoil`/`madsim` virtual-time sim of the QUIC layer — the
       deterministic core sim already covers protocol logic.)*
 - [x] **M4 — Terminal layer (`mish-terminal`).** `Screen` (`Complete`) and
-      `UserStream` `SyncState`s as pure data — row-granular screen diff,
-      append-only/trimmable input log — plus an `alacritty-terminal`-backed
-      `Emulator` that turns PTY bytes into `Screen` snapshots, and a full-frame
-      ANSI `render`er. PBTs + emulator tests + client/server convergence over the
-      simulator (incl. 40% loss). *(done)*
-      *(Deferred: client-side predictive echo — mosh's `terminaloverlay`.)*
+      `UserStream` `SyncState`s as pure data, an `alacritty-terminal`-backed
+      `Emulator` (PTY bytes → `Screen`), and a faithful port of mosh's
+      **`Display::new_frame`** minimal-diff (`display.rs`): cell-level change
+      detection, ECH/EL blank runs, SGR-on-change, CR/LF/BS cursor optimization.
+      It is both the SSP wire diff and the client's TTY paint, verified by
+      round-trip identity (the check mosh runs in verbose mode). PBTs + the ported
+      `emulation-*` suite + client/server convergence under loss. *(done)*
 - [x] **M5 — Binaries (`mosh` crate).** `mish-server` (spawns a shell on a real
       PTY via `portable-pty`, feeds output through the emulator, applies the
       client's `UserStream` back to the PTY) and `mish-client` (raw TTY via
@@ -108,9 +111,23 @@ cargo clippy --all-targets
       resize, `Ctrl-]` detach). Session loops are transport-generic and
       I/O-decoupled, so they're tested headlessly; plus a real-PTY test and a
       **full-stack test** (real QUIC + real `/bin/sh` + emulator + render).
-      *(done)* *(Deferred: client-side predictive echo; SSH-bootstrapped certs —
-      the demo uses insecure TLS verification.)*
-- [ ] **M6 — Shutdown handshake, key rotation, fuzzing, soak sims.**
+      *(done. Deferred: SSH-bootstrapped certs — the demo uses insecure TLS
+      verification.)*
+- [x] **M6 — Predictive echo + deterministic network simulation.**
+      Client-side speculative echo (`mish-terminal/src/predict.rs`, mosh's
+      `terminaloverlay`): overlays predicted keystrokes, validates/culls them
+      against the server's `echo_ack`, flushes on misprediction, decodes complete
+      UTF-8 before predicting (the `prediction-unicode` regression), abandons on
+      escape sequences. Plus **`mish-sim`**: the real async session over
+      `turmoil`-simulated UDP with latency, loss, partitions, and a controllable
+      clock. *(done. Deferred: SRTT-gated/underlined prediction display — a
+      refinement on *when* predictions show.)*
+
+See [`COVERAGE.md`](COVERAGE.md) for the mapping of mosh's own test suite to the
+mish equivalents.
+
+- [ ] **M7 — Polish.** Server signal-timeout, flow-control/pty-deadlock test,
+      shutdown handshake, hyperlink (OSC 8) modeling, `madsim` sim mode.
 
 ## License
 
