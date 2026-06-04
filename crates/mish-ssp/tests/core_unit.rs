@@ -104,6 +104,35 @@ fn ack_advances_sender_to_synced() {
 }
 
 #[test]
+fn shutdown_handshake_both_sides_close() {
+    let mut a = Core::new(0);
+    let mut b = Core::new(0);
+
+    a.start_shutdown();
+    let mut now = 0;
+    for _ in 0..100 {
+        now += 20;
+        for inst in a.tick(now) {
+            b.recv(now, &inst);
+        }
+        // The peer mirrors the shutdown once it sees ours.
+        if b.peer_is_shutting_down() {
+            b.start_shutdown();
+        }
+        for inst in b.tick(now) {
+            a.recv(now, &inst);
+        }
+        if a.is_shutdown_acked() && b.is_shutdown_acked() {
+            break;
+        }
+    }
+    assert!(a.is_shutdown_acked(), "A's shutdown acknowledged by B");
+    assert!(b.is_shutdown_acked(), "B's shutdown acknowledged by A");
+    assert!(a.peer_is_shutting_down());
+    assert!(b.peer_is_shutting_down());
+}
+
+#[test]
 fn malformed_diff_does_not_panic() {
     // A diff that isn't a valid BytesState diff: recv must not panic in release;
     // in debug the BytesState debug_assert is bypassed because we go through the

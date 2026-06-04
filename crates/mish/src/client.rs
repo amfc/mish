@@ -26,6 +26,8 @@ pub enum ClientInput {
     Keys(Vec<u8>),
     /// The local terminal was resized.
     Resize { cols: u16, rows: u16 },
+    /// The user detached (e.g. Ctrl-]): begin a clean shutdown.
+    Detach,
 }
 
 /// Run a client session until input ends or the peer leaves.
@@ -44,7 +46,7 @@ pub async fn run_client<T: Transport>(
 ) {
     let (driver, handle) =
         Driver::<T, UserStream, Screen>::with(transport, clock, SspConfig::default());
-    driver.spawn();
+    let driver_task = driver.spawn();
 
     // Accumulate the user-input log. We keep the full prefix so diffs against
     // older acknowledged states stay valid; the SSP layer trims acked events
@@ -93,7 +95,8 @@ pub async fn run_client<T: Transport>(
                         stream.push_resize(cols, rows);
                         handle.set_local(stream.clone());
                     }
-                    None => break, // user input ended → disconnect
+                    // Detach or input closed → begin a clean shutdown.
+                    Some(ClientInput::Detach) | None => break,
                 }
             }
             changed = remote.changed() => {
@@ -107,4 +110,9 @@ pub async fn run_client<T: Transport>(
             }
         }
     }
+
+    // Clean shutdown: ask the peer to close, then wait briefly for the driver to
+    // finish the handshake.
+    handle.shutdown();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), driver_task).await;
 }

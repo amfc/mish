@@ -53,6 +53,7 @@ pub struct SessionHandle<L: SyncState, R: SyncState> {
     local_tx: mpsc::UnboundedSender<L>,
     remote_rx: watch::Receiver<R>,
     srtt_rx: watch::Receiver<f64>,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl<L: SyncState, R: SyncState> Clone for SessionHandle<L, R> {
@@ -61,6 +62,7 @@ impl<L: SyncState, R: SyncState> Clone for SessionHandle<L, R> {
             local_tx: self.local_tx.clone(),
             remote_rx: self.remote_rx.clone(),
             srtt_rx: self.srtt_rx.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 }
@@ -91,6 +93,12 @@ impl<L: SyncState, R: SyncState> SessionHandle<L, R> {
         *self.srtt_rx.borrow()
     }
 
+    /// Request a clean shutdown: the driver sends a SHUTDOWN handshake and ends
+    /// once the peer acknowledges (or after a short grace period).
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
     /// Await the next change to the remote state, returning a clone. `None` once
     /// the driver has stopped.
     pub async fn remote_changed(&mut self) -> Option<R> {
@@ -107,6 +115,7 @@ pub struct Driver<T: Transport, L: SyncState, R: SyncState> {
     local_rx: mpsc::UnboundedReceiver<L>,
     remote_tx: watch::Sender<R>,
     srtt_tx: watch::Sender<f64>,
+    shutdown: Arc<tokio::sync::Notify>,
     last_published_num: u64,
     fragmenter: Fragmenter,
     defragmenter: Defragmenter,
@@ -134,6 +143,7 @@ where
         let now = clock.now_ms();
         let core = SspCore::with_config(now, cfg);
         let (srtt_tx, srtt_rx) = watch::channel(core.srtt_ms());
+        let shutdown = Arc::new(tokio::sync::Notify::new());
         let driver = Self {
             transport,
             core,
@@ -141,6 +151,7 @@ where
             local_rx,
             remote_tx,
             srtt_tx,
+            shutdown: shutdown.clone(),
             last_published_num: 0,
             fragmenter: Fragmenter::new(),
             defragmenter: Defragmenter::new(),
@@ -149,6 +160,7 @@ where
             local_tx,
             remote_rx,
             srtt_rx,
+            shutdown,
         };
         (driver, handle)
     }
@@ -169,6 +181,8 @@ where
         // busy-loop (and, under a paused/simulated clock, wedge the whole runtime
         // by never letting it go idle).
         let mut local_open = true;
+        let mut shutting_down = false;
+        let mut shutdown_deadline = crate::clock::NEVER;
         loop {
             let now = self.clock.now_ms();
 
@@ -179,6 +193,13 @@ where
 
             // 2. Publish remote-state changes to subscribers.
             self.publish_remote();
+
+            // 3. Clean-shutdown completion: the peer acknowledged our shutdown
+            //    (we sent our final ack-bearing frame in the tick above), or the
+            //    grace period elapsed.
+            if shutting_down && (self.core.is_shutdown_acked() || now >= shutdown_deadline) {
+                return Ok(());
+            }
 
             // 3. Sleep until the next protocol event, or until something happens.
             let wait = self.core.wait_time(self.clock.now_ms());
@@ -200,6 +221,13 @@ where
                                     self.core.recv(now, &inst);
                                     self.publish_remote();
                                     let _ = self.srtt_tx.send(self.core.srtt_ms());
+                                    // The peer initiated shutdown — mirror it so
+                                    // both sides converge to a clean close.
+                                    if self.core.peer_is_shutting_down() && !shutting_down {
+                                        shutting_down = true;
+                                        self.core.start_shutdown();
+                                        shutdown_deadline = now + 5000;
+                                    }
                                 }
                             }
                             // Malformed / incomplete datagrams are silently dropped.
@@ -214,6 +242,12 @@ where
                         Some(state) => self.core.set_current_state(state),
                         None => local_open = false, // handle dropped; keep serving
                     }
+                }
+                // Application requested a clean shutdown.
+                _ = self.shutdown.notified(), if !shutting_down => {
+                    shutting_down = true;
+                    self.core.start_shutdown();
+                    shutdown_deadline = self.clock.now_ms() + 5000;
                 }
                 // Protocol timer fired; loop back to tick().
                 _ = &mut sleep => {}

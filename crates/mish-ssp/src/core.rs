@@ -156,6 +156,14 @@ pub struct SspCore<L: SyncState, R: SyncState> {
     /// we can echo it adjusted for the time we held it.
     saved_timestamp: Option<u16>,
     saved_timestamp_received_at: Millis,
+
+    // ---- Shutdown handshake ----
+    /// We have initiated a clean shutdown (sending num = SHUTDOWN_NUM).
+    shutdown_in_progress: bool,
+    /// The peer has acknowledged our shutdown (ack_num == SHUTDOWN_NUM).
+    shutdown_acked: bool,
+    /// The peer is shutting down (we received new_num == SHUTDOWN_NUM).
+    peer_shutdown: bool,
 }
 
 impl<L: SyncState, R: SyncState> SspCore<L, R> {
@@ -192,6 +200,9 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             rtt: Rtt::new(),
             saved_timestamp: None,
             saved_timestamp_received_at: 0,
+            shutdown_in_progress: false,
+            shutdown_acked: false,
+            peer_shutdown: false,
         }
     }
 
@@ -229,6 +240,43 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         } else {
             self.cfg.rto as f64
         }
+    }
+
+    /// Begin a clean shutdown: subsequent ticks send `SHUTDOWN_NUM` instructions
+    /// until the peer acknowledges (see [`SspCore::is_shutdown_acked`]).
+    pub fn start_shutdown(&mut self) {
+        if !self.shutdown_in_progress {
+            self.shutdown_in_progress = true;
+            self.next_send_time = 0; // fire on the next tick
+        }
+    }
+
+    pub fn shutdown_in_progress(&self) -> bool {
+        self.shutdown_in_progress
+    }
+
+    /// The peer has acknowledged our shutdown — safe to close.
+    pub fn is_shutdown_acked(&self) -> bool {
+        self.shutdown_acked
+    }
+
+    /// The peer has begun shutting down (we should ack and close).
+    pub fn peer_is_shutting_down(&self) -> bool {
+        self.peer_shutdown
+    }
+
+    fn emit_shutdown(&mut self, now: Millis, out: &mut Vec<Instruction>) {
+        let front = self.sent_states.front().expect("never empty").num;
+        out.push(Instruction {
+            protocol_version: PROTOCOL_VERSION,
+            old_num: self.assumed().num,
+            new_num: crate::instruction::SHUTDOWN_NUM,
+            ack_num: self.ack_num,
+            throwaway_num: front,
+            diff: Vec::new(),
+            timestamp: (now & 0xFFFF) as u16,
+            timestamp_reply: self.timestamp_reply(now),
+        });
     }
 
     /// Whether everything we've produced has been acknowledged by the peer.
@@ -330,6 +378,9 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
 
     /// Absolute time of the next event, or [`None`] if there is nothing to do.
     pub fn next_wakeup(&mut self, now: Millis) -> Option<Millis> {
+        if self.shutdown_in_progress {
+            return Some(self.next_send_time);
+        }
         self.calculate_timers(now);
         let next = self.next_ack_time.min(self.next_send_time);
         if next == NEVER {
@@ -351,6 +402,17 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
     /// (usually 0 or 1). Call when [`SspCore::next_wakeup`] says it's due (the
     /// driver may also call it eagerly — it self-gates on the timers).
     pub fn tick(&mut self, now: Millis) -> Vec<Instruction> {
+        // Shutdown takes over the send loop: resend a SHUTDOWN_NUM instruction at
+        // the frame rate until the peer acknowledges it.
+        if self.shutdown_in_progress {
+            let mut out = Vec::new();
+            if now >= self.next_send_time {
+                self.emit_shutdown(now, &mut out);
+                self.next_send_time = now + self.send_interval();
+            }
+            return out;
+        }
+
         self.calculate_timers(now);
 
         if now < self.next_ack_time && now < self.next_send_time {
@@ -468,6 +530,21 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         }
         self.saved_timestamp = Some(inst.timestamp);
         self.saved_timestamp_received_at = now;
+
+        // Shutdown handshake.
+        if inst.ack_num == crate::instruction::SHUTDOWN_NUM {
+            // The peer acknowledged our shutdown.
+            self.shutdown_acked = true;
+        }
+        if inst.new_num == crate::instruction::SHUTDOWN_NUM {
+            // The peer is shutting down; record it and ack it (our outgoing
+            // ack_num becomes SHUTDOWN_NUM) — don't apply as a normal state.
+            self.peer_shutdown = true;
+            self.ack_num = crate::instruction::SHUTDOWN_NUM;
+            self.last_heard = now;
+            self.pending_data_ack = true;
+            return;
+        }
 
         // 1. The peer told us what it has received from us → advance our acks.
         self.process_acknowledgment_through(inst.ack_num);

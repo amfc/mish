@@ -27,7 +27,7 @@ use mish::client::{run_client, ClientInput};
 use mish_quic::{transport, CertificateDer};
 use mish_ssp::clock::SystemClock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// Detach key: Ctrl-] (0x1d), same as telnet's escape.
 const DETACH: u8 = 0x1d;
@@ -145,7 +145,6 @@ async fn run_terminal(t: transport::QuicTransport) {
 
     let (in_tx, in_rx) = mpsc::channel::<ClientInput>(256);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (detach_tx, detach_rx) = oneshot::channel::<()>();
 
     // stdout: write rendered frames.
     let writer = tokio::spawn(async move {
@@ -157,20 +156,20 @@ async fn run_terminal(t: transport::QuicTransport) {
         }
     });
 
-    // stdin: forward raw keystrokes; Ctrl-] detaches.
+    // stdin: forward raw keystrokes; Ctrl-] requests a clean detach.
     let key_tx = in_tx.clone();
     tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 1024];
-        let mut detach = Some(detach_tx);
         loop {
             match stdin.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    let _ = key_tx.send(ClientInput::Detach).await;
+                    break;
+                }
                 Ok(n) => {
                     if buf[..n].contains(&DETACH) {
-                        if let Some(tx) = detach.take() {
-                            let _ = tx.send(());
-                        }
+                        let _ = key_tx.send(ClientInput::Detach).await;
                         break;
                     }
                     if key_tx.send(ClientInput::Keys(buf[..n].to_vec())).await.is_err() {
@@ -201,20 +200,19 @@ async fn run_terminal(t: transport::QuicTransport) {
 
     let clock = Arc::new(SystemClock::new());
 
-    // Run until the session ends or the user detaches. Predictive echo is
-    // adaptive (mosh's default --predict=adaptive).
-    tokio::select! {
-        _ = run_client(
-            Arc::new(t),
-            cols,
-            rows,
-            clock,
-            mish_terminal::predict::PredictMode::Adaptive,
-            in_rx,
-            out_tx,
-        ) => {}
-        _ = detach_rx => {}
-    }
+    // Run until the session ends or the user detaches (Ctrl-] → ClientInput::
+    // Detach, which triggers a clean shutdown handshake inside run_client).
+    // Predictive echo is adaptive (mosh's default --predict=adaptive).
+    run_client(
+        Arc::new(t),
+        cols,
+        rows,
+        clock,
+        mish_terminal::predict::PredictMode::Adaptive,
+        in_rx,
+        out_tx,
+    )
+    .await;
 
     drop(_guard);
     writer.abort();
