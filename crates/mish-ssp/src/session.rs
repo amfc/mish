@@ -14,11 +14,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 
 use crate::clock::{Clock, SystemClock};
 use crate::core::{SspConfig, SspCore};
+use crate::frag::{Defragmenter, Fragmenter};
 use crate::instruction::Instruction;
 use crate::state::SyncState;
 use crate::transport::{Transport, TransportError};
@@ -99,6 +99,8 @@ pub struct Driver<T: Transport, L: SyncState, R: SyncState> {
     local_rx: mpsc::UnboundedReceiver<L>,
     remote_tx: watch::Sender<R>,
     last_published_num: u64,
+    fragmenter: Fragmenter,
+    defragmenter: Defragmenter,
 }
 
 impl<T, L, R> Driver<T, L, R>
@@ -128,6 +130,8 @@ where
             local_rx,
             remote_tx,
             last_published_num: 0,
+            fragmenter: Fragmenter::new(),
+            defragmenter: Defragmenter::new(),
         };
         let handle = SessionHandle {
             local_tx,
@@ -170,12 +174,16 @@ where
                 recv = self.transport.recv() => {
                     match recv {
                         Ok(bytes) => {
-                            if let Some(inst) = Instruction::decode(&bytes) {
-                                let now = self.clock.now_ms();
-                                self.core.recv(now, &inst);
-                                self.publish_remote();
+                            // Reassemble fragments; a complete instruction may
+                            // arrive on the last fragment of a group.
+                            if let Some(payload) = self.defragmenter.push(&bytes) {
+                                if let Some(inst) = Instruction::decode(&payload) {
+                                    let now = self.clock.now_ms();
+                                    self.core.recv(now, &inst);
+                                    self.publish_remote();
+                                }
                             }
-                            // Malformed datagrams are silently dropped.
+                            // Malformed / incomplete datagrams are silently dropped.
                         }
                         Err(TransportError::Closed) => return Err(SessionError::Closed),
                         Err(_) => { /* transient: treat as a drop */ }
@@ -198,15 +206,19 @@ where
         }
     }
 
-    async fn send(&self, inst: Instruction) -> Result<(), SessionError> {
-        let bytes = Bytes::from(inst.encode());
-        match self.transport.send(bytes).await {
-            Ok(()) => Ok(()),
-            Err(TransportError::Closed) => Err(SessionError::Closed),
-            // Oversize / transient send errors look like a dropped datagram to
-            // the protocol, which will re-diff and try again.
-            Err(_) => Ok(()),
+    async fn send(&mut self, inst: Instruction) -> Result<(), SessionError> {
+        let payload = inst.encode();
+        let max = self.transport.max_datagram_size();
+        for fragment in self.fragmenter.fragment(&payload, max) {
+            match self.transport.send(fragment).await {
+                Ok(()) => {}
+                Err(TransportError::Closed) => return Err(SessionError::Closed),
+                // Oversize / transient send errors look like a dropped datagram
+                // to the protocol, which will re-diff and try again.
+                Err(_) => {}
+            }
         }
+        Ok(())
     }
 
     fn publish_remote(&mut self) {

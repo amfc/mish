@@ -76,7 +76,9 @@ impl Transport for QuicTransport {
     }
 
     fn max_datagram_size(&self) -> usize {
-        self.conn.max_datagram_size().unwrap_or(0)
+        // Floor to a conservative MTU if the connection can't report a size yet,
+        // so the fragmenter never produces 1-byte fragments.
+        self.conn.max_datagram_size().unwrap_or(1200).max(512)
     }
 }
 
