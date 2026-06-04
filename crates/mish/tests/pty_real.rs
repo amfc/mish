@@ -64,3 +64,59 @@ async fn real_shell_output_reaches_client() {
     .await
     .expect("shell command output should render on the client");
 }
+
+/// Port of mosh's pty-deadlock.test: exercising terminal flow control (^S/^Q)
+/// around input/output must not wedge the session. We type a command, send
+/// XOFF (^S) to pause output, type more, send XON (^Q) to resume, then a final
+/// command — and the final marker must still arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flow_control_does_not_deadlock() {
+    let (ta, tb) = memory::pair();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+
+    let pty = PtyProcess::spawn("/bin/sh", 80, 24).expect("spawn shell on PTY");
+    tokio::spawn(run_server(
+        Arc::new(ta),
+        80,
+        24,
+        clock.clone(),
+        None,
+        pty.output,
+        pty.control,
+    ));
+
+    let (cin_tx, cin_rx) = mpsc::channel::<ClientInput>(64);
+    let (cout_tx, mut cout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(run_client(
+        Arc::new(tb),
+        80,
+        24,
+        clock.clone(),
+        mish_terminal::predict::PredictMode::Never,
+        cin_rx,
+        cout_tx,
+    ));
+
+    // echo, then XOFF, more input while paused, XON, then a final marker.
+    for seq in [
+        &b"echo AAA\r"[..],
+        &b"\x13"[..],          // ^S (XOFF)
+        &b"echo BBB\r"[..],
+        &b"\x11"[..],          // ^Q (XON)
+        &b"echo DEADLOCK_OK\r"[..],
+    ] {
+        cin_tx.send(ClientInput::Keys(seq.to_vec())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let frame = cout_rx.recv().await.expect("client output");
+            if contains(&frame, b"DEADLOCK_OK") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("session must keep flowing through ^S/^Q flow control");
+}

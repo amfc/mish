@@ -32,7 +32,7 @@ covered by an equivalent test rather than a byte-for-byte port (we render to a
 | window-resize | `emulation_mish::resize_reflows`, `loopback::client_resize_propagates_to_server_pty` | resize/reflow + SIGWINCH path |
 | server-network-timeout | `loopback::server_exits_after_network_timeout` | idle timeout (paused clock) |
 | server-signal-timeout | — | OS-signal-driven; not modeled |
-| pty-deadlock | — | flow-control (^S/^Q) timing; not deterministically portable |
+| pty-deadlock | `pty_real::flow_control_does_not_deadlock` | ^S/^Q (XOFF/XON) around I/O, session keeps flowing |
 | local | `full_stack::quic_pty_full_stack` | real PTY + QUIC end-to-end |
 | e2e-success / e2e-failure | `loopback::*`, `full_stack::*` | full client↔server round trip |
 
