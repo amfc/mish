@@ -1,0 +1,23 @@
+[package]
+name = "mish-quic"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "QUIC unreliable-datagram Transport for mish, built on Quinn."
+
+[dependencies]
+mish-ssp = { path = "../mish-ssp" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+rcgen = "0.13"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "net"] }
