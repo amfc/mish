@@ -108,6 +108,7 @@ fn convert_cell(cell: &ATermCell) -> Cell {
         fg: convert_color(cell.fg),
         bg: convert_color(cell.bg),
         flags: convert_flags(cell.flags),
+        combining: cell.zerowidth().map(|z| z.to_vec()).unwrap_or_default(),
     }
 }
 

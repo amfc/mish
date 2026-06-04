@@ -46,13 +46,16 @@ pub const F_STRIKEOUT: u16 = 1 << 6;
 pub const F_WIDE: u16 = 1 << 7;
 pub const F_WIDE_SPACER: u16 = 1 << 8;
 
-/// A single screen cell: one character plus its rendering attributes.
+/// A single screen cell: one base character, its rendering attributes, and any
+/// zero-width combining marks attached to it (e.g. `e` + U+0301 = `é`).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Cell {
     pub c: char,
     pub fg: Color,
     pub bg: Color,
     pub flags: u16,
+    /// Combining (zero-width) characters following the base glyph.
+    pub combining: Vec<char>,
 }
 
 impl Default for Cell {
@@ -62,6 +65,7 @@ impl Default for Cell {
             fg: Color::Named(NAMED_FOREGROUND),
             bg: Color::Named(NAMED_BACKGROUND),
             flags: 0,
+            combining: Vec::new(),
         }
     }
 }

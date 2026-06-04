@@ -196,6 +196,45 @@ fn no_op_sequence_yields_empty_diff() {
     );
 }
 
+/// Combining marks are captured on the base cell and survive the new_frame diff.
+#[test]
+fn combining_marks_captured_and_diffed() {
+    let mut e = Emulator::new(10, 2);
+    e.feed("e\u{0301}".as_bytes()); // é = e + COMBINING ACUTE ACCENT
+    let s = e.snapshot();
+    let cell = s.cell(0, 0).unwrap();
+    assert_eq!(cell.c, 'e');
+    assert_eq!(cell.combining, vec!['\u{0301}']);
+
+    // Round-trip through the minimal diff.
+    let blank = Screen::blank(10, 2);
+    let mut e2 = Emulator::new(10, 2);
+    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
+    assert_eq!(e2.snapshot().cell(0, 0).unwrap().combining, vec!['\u{0301}']);
+}
+
+/// Wide (CJK) characters occupy a glyph cell + a spacer, and round-trip exactly.
+#[test]
+fn wide_char_cells_and_diff() {
+    use mish_terminal::screen;
+    let mut e = Emulator::new(10, 2);
+    e.feed("世界".as_bytes());
+    let s = e.snapshot();
+    assert_eq!(s.cell(0, 0).unwrap().c, '世');
+    assert_ne!(s.cell(0, 0).unwrap().flags & screen::F_WIDE, 0, "wide flag set");
+    assert_ne!(
+        s.cell(0, 1).unwrap().flags & screen::F_WIDE_SPACER,
+        0,
+        "spacer follows"
+    );
+    assert_eq!(s.cell(0, 2).unwrap().c, '界');
+
+    let blank = Screen::blank(10, 2);
+    let mut e2 = Emulator::new(10, 2);
+    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
+    assert_eq!(e2.snapshot(), s, "wide chars round-trip exactly");
+}
+
 /// window-resize (emulation side): resizing reflows; content and dimensions
 /// update without panic.
 #[test]

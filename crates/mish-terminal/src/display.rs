@@ -50,6 +50,7 @@ fn cell_width(cell: &Cell) -> i32 {
 fn is_blank(cell: &Cell) -> bool {
     cell.c == ' '
         && cell.flags == 0
+        && cell.combining.is_empty()
         && cell.fg == Color::Named(NAMED_FOREGROUND)
 }
 
@@ -121,6 +122,10 @@ impl FrameState {
     fn append_cell(&mut self, cell: &Cell) {
         let mut buf = [0u8; 4];
         self.out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+        // Re-emit any combining marks so the receiver's emulator reattaches them.
+        for &cm in &cell.combining {
+            self.out.extend_from_slice(cm.encode_utf8(&mut buf).as_bytes());
+        }
     }
 }
 

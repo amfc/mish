@@ -32,7 +32,13 @@ fn arb_cell() -> impl Strategy<Value = Cell> {
         // Round-trippable attribute flags (no wide-char markers).
         prop_oneof![Just(0u16), Just(2u16), Just(4u16), Just(6u16), Just(8u16), Just(16u16)],
     )
-        .prop_map(|(c, fg, bg, flags)| Cell { c, fg, bg, flags })
+        .prop_map(|(c, fg, bg, flags)| Cell {
+            c,
+            fg,
+            bg,
+            flags,
+            combining: Vec::new(),
+        })
 }
 
 fn arb_screen() -> impl Strategy<Value = Screen> {

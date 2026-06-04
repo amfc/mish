@@ -197,14 +197,43 @@ impl PredictionEngine {
                 self.reset();
                 self.suppress = true;
             }
-            // Printable: echo the glyph and advance.
+            // Printable: echo the glyph and advance by its display width.
             c => {
-                let cell = Cell {
-                    c,
-                    ..Cell::default()
-                };
-                self.push_cell(cell, input_index);
-                self.advance_cursor();
+                use unicode_width::UnicodeWidthChar;
+                match UnicodeWidthChar::width(c).unwrap_or(1) {
+                    0 => {
+                        // Combining mark: attach to the cell just to our left.
+                        let (r, pc) = (self.cursor_row, self.cursor_col.saturating_sub(1));
+                        if let Some(p) = self.cells.iter_mut().find(|p| p.row == r && p.col == pc) {
+                            p.cell.combining.push(c);
+                        }
+                    }
+                    2 => {
+                        // Wide char: the glyph cell plus a spacer.
+                        let wide = Cell {
+                            c,
+                            flags: crate::screen::F_WIDE,
+                            ..Cell::default()
+                        };
+                        self.push_cell(wide, input_index);
+                        self.advance_cursor();
+                        let spacer = Cell {
+                            c: ' ',
+                            flags: crate::screen::F_WIDE_SPACER,
+                            ..Cell::default()
+                        };
+                        self.push_cell(spacer, input_index);
+                        self.advance_cursor();
+                    }
+                    _ => {
+                        let cell = Cell {
+                            c,
+                            ..Cell::default()
+                        };
+                        self.push_cell(cell, input_index);
+                        self.advance_cursor();
+                    }
+                }
                 self.cursor_index = input_index;
             }
         }
@@ -393,6 +422,19 @@ mod tests {
         // Laggy link: now the prediction is shown.
         p.set_srtt(120.0);
         assert_eq!(p.predicted_screen(&base).cell(0, 0).unwrap().c, 'x');
+    }
+
+    #[test]
+    fn predicts_wide_char_with_spacer() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 2, 0);
+        p.new_user_bytes("世".as_bytes(), &base, 1);
+        let shown = p.predicted_screen(&base);
+        assert_eq!(shown.cell(0, 0).unwrap().c, '世');
+        assert_ne!(shown.cell(0, 0).unwrap().flags & crate::screen::F_WIDE, 0);
+        assert_ne!(shown.cell(0, 1).unwrap().flags & crate::screen::F_WIDE_SPACER, 0);
+        // Cursor advanced by the full display width.
+        assert_eq!(shown.cursor_col, 2);
     }
 
     #[test]
