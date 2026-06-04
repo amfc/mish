@@ -90,6 +90,25 @@ pub fn server_endpoint(addr: SocketAddr) -> Result<(Endpoint, CertificateDer<'st
     Ok((endpoint, cert))
 }
 
+/// Build a server endpoint from an already-bound `std` UDP socket and a
+/// pre-built server config. Used by `mish-server`, which binds the socket and
+/// prints its port *before* daemonizing (and before any tokio runtime exists),
+/// then constructs the endpoint here inside the runtime. Must be called within a
+/// tokio runtime context.
+pub fn server_from_socket(
+    socket: std::net::UdpSocket,
+    server_config: quinn::ServerConfig,
+) -> Result<Endpoint, QuicError> {
+    let runtime = std::sync::Arc::new(quinn::TokioRuntime);
+    let endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        runtime,
+    )?;
+    Ok(endpoint)
+}
+
 /// Build a client endpoint bound to `addr` (port 0 for ephemeral) that trusts a
 /// specific server certificate.
 pub fn client_endpoint(

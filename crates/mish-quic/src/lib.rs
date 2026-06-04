@@ -30,3 +30,7 @@ pub use transport::{
 /// Re-exported so downstream crates can pass certificates without depending on
 /// `rustls` directly.
 pub use rustls::pki_types::CertificateDer;
+
+/// Re-exported so `mish-server` can hold a pre-built config across a fork
+/// without depending on `quinn` directly.
+pub use quinn::ServerConfig;

@@ -40,10 +40,14 @@ impl Drop for Bootstrap {
     }
 }
 
-/// Build the `mish-server` argument list: an ephemeral port plus an optional
-/// `-- command`.
-fn server_args(port: &str, command: Option<&str>) -> Vec<String> {
-    let mut args = vec![port.to_string()];
+/// Build the `mish-server` argument list: optional `--detach`, an ephemeral
+/// port, then an optional `-- command`.
+fn server_args(detach: bool, port: &str, command: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if detach {
+        args.push("--detach".to_string());
+    }
+    args.push(port.to_string());
     if let Some(cmd) = command {
         args.push("--".into());
         args.push(cmd.into());
@@ -53,8 +57,10 @@ fn server_args(port: &str, command: Option<&str>) -> Vec<String> {
 
 /// Start `mish-server` locally as a child process (no SSH). Used for `--local`.
 pub async fn local(server_cmd: &str, command: Option<&str>) -> Result<Bootstrap> {
+    // Local mode: keep the server in the foreground as a managed child (no
+    // detach — we kill it when the session ends).
     let mut child = Command::new(server_cmd)
-        .args(server_args("0", command))
+        .args(server_args(false, "0", command))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -77,10 +83,13 @@ pub async fn ssh(
     server_cmd: &str,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
+    // Over SSH: detach the server so it survives SSH closing (real mosh does
+    // this). The `ssh` process exits once the server's parent returns; the
+    // daemon keeps serving over UDP.
     let mut child = Command::new(ssh_cmd)
         .arg(host)
         .arg(server_cmd)
-        .args(server_args("0", command))
+        .args(server_args(true, "0", command))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
