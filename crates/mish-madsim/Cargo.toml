@@ -1,0 +1,18 @@
+[package]
+name = "mish-madsim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "madsim-based deterministic simulation tests for mish (run with RUSTFLAGS=\"--cfg madsim\")."
+
+[dependencies]
+mish-ssp = { path = "../mish-ssp" }
+mish-terminal = { path = "../mish-terminal" }
+bytes = { workspace = true }
+
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
