@@ -132,13 +132,25 @@ impl FrameState {
     }
 
     /// Emit an SGR sequence if the target rendition differs from current (or is
-    /// not yet established).
+    /// not yet established). When only the colors changed (attributes the same),
+    /// emit just the color codes — no reset + re-set of every attribute.
     fn update_rendition(&mut self, fg: Color, bg: Color, flags: u16) {
-        if self.current == Some((fg, bg, flags)) {
-            return;
+        match self.current {
+            Some((cf, cb, cflags)) if (cf, cb, cflags) == (fg, bg, flags) => return,
+            Some((cf, cb, cflags)) if cflags == flags => {
+                // Only colors changed: emit the minimal color delta.
+                let mut codes: Vec<String> = Vec::new();
+                if cf != fg {
+                    color_code_explicit(&mut codes, fg, true);
+                }
+                if cb != bg {
+                    color_code_explicit(&mut codes, bg, false);
+                }
+                self.push(&format!("\x1b[{}m", codes.join(";")));
+            }
+            _ => self.push(&sgr(fg, bg, flags)),
         }
         self.current = Some((fg, bg, flags));
-        self.push(&sgr(fg, bg, flags));
     }
 
     fn append_cell(&mut self, cell: &Cell) {
@@ -178,6 +190,17 @@ fn sgr(fg: Color, bg: Color, flags: u16) -> String {
     push_color(&mut codes, fg, true);
     push_color(&mut codes, bg, false);
     format!("\x1b[{}m", codes.join(";"))
+}
+
+/// Like `push_color` but emits the explicit default code (39/49) instead of
+/// relying on a preceding reset — for minimal color-only SGR deltas.
+fn color_code_explicit(codes: &mut Vec<String>, color: Color, fg: bool) {
+    match color {
+        Color::Named(NAMED_FOREGROUND) | Color::Named(NAMED_BACKGROUND) => {
+            codes.push(if fg { "39".into() } else { "49".into() });
+        }
+        other => push_color(codes, other, fg),
+    }
 }
 
 fn push_color(codes: &mut Vec<String>, color: Color, fg: bool) {
@@ -237,8 +260,23 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
         frame.push("\x1b[?25l");
     }
 
+    // Vertical-scroll detection: if `new` is `old` shifted up by k rows, emit a
+    // scroll (cheap: a few line feeds at the bottom) and redraw only the exposed
+    // rows, instead of repainting every shifted row.
+    let mut baseline_owned: Option<Screen> = None;
+    if initialized {
+        if let Some(k) = detect_scroll_up(old, new) {
+            frame.append_move(new.rows as i32 - 1, 0);
+            frame.push_n(k as usize, b'\n'); // LF at the bottom scrolls up
+            frame.cursor_x = 0;
+            frame.cursor_y = new.rows as i32 - 1;
+            baseline_owned = Some(scroll_up(old, k));
+        }
+    }
+    let baseline = baseline_owned.as_ref().unwrap_or(old);
+
     for y in 0..new.rows {
-        put_row(&mut frame, old, new, y, initialized);
+        put_row(&mut frame, baseline, new, y, initialized);
     }
 
     // Final cursor position.
@@ -404,4 +442,51 @@ fn row_eq(old: &Screen, new: &Screen, y: u16) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => false,
     })
+}
+
+/// If `new` equals `old` scrolled up by `k` rows (1..rows) — i.e. the top
+/// `rows-k` rows of `new` match the bottom `rows-k` rows of `old` — return the
+/// smallest such `k`. Returns `None` if the cells are identical or no scroll
+/// relationship holds.
+fn detect_scroll_up(old: &Screen, new: &Screen) -> Option<u16> {
+    if old.cols != new.cols || old.rows != new.rows || old.rows < 2 {
+        return None;
+    }
+    if old.cells == new.cells {
+        return None; // identical — nothing to scroll
+    }
+    let rows = new.rows;
+    let w = new.cols as usize;
+    for k in 1..rows {
+        let shifted_matches = (0..rows - k).all(|i| {
+            let oi = (i + k) as usize * w;
+            let ni = i as usize * w;
+            old.cells[oi..oi + w] == new.cells[ni..ni + w]
+        });
+        if shifted_matches {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// `old` with its rows shifted up by `k`; the bottom `k` rows become blank.
+/// Only the cells matter (used as the put_row baseline after a scroll).
+fn scroll_up(old: &Screen, k: u16) -> Screen {
+    let mut s = old.clone();
+    let rows = old.rows;
+    let w = old.cols as usize;
+    for i in 0..rows {
+        let di = i as usize * w;
+        let src = i + k;
+        if src < rows {
+            let si = src as usize * w;
+            s.cells[di..di + w].clone_from_slice(&old.cells[si..si + w]);
+        } else {
+            for c in &mut s.cells[di..di + w] {
+                *c = Cell::default();
+            }
+        }
+    }
+    s
 }

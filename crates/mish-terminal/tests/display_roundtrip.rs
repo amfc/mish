@@ -94,6 +94,53 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
     })
 }
 
+/// A scrolling screen should diff to a small (scroll + a couple rows) frame, not
+/// a full repaint, and still round-trip exactly.
+#[test]
+fn scroll_up_is_minimal_and_correct() {
+    let cols = 20u16;
+    let rows = 6u16;
+    let line = |s: &str| -> Vec<Cell> {
+        let mut row: Vec<Cell> = s.chars().map(|c| Cell { c, ..Cell::default() }).collect();
+        row.resize(cols as usize, Cell::default());
+        row
+    };
+    let mk = |labels: [&str; 6]| -> Screen {
+        let mut cells = Vec::new();
+        for l in labels {
+            cells.extend(line(l));
+        }
+        Screen {
+            cols,
+            rows,
+            cells,
+            cursor_row: rows - 1,
+            cursor_col: 0,
+            cursor_visible: true,
+            title: String::new(),
+            echo_ack: 0,
+            bracketed_paste: false,
+            mouse_mode: 0,
+            cursor_shape: 0,
+            cursor_blink: false,
+        }
+    };
+    let old = mk(["row0", "row1", "row2", "row3", "row4", "row5"]);
+    // Scrolled up by 2: old rows 2..6 move to the top, two new rows at the bottom.
+    let new = mk(["row2", "row3", "row4", "row5", "new6", "new7"]);
+
+    let diff = new_frame(&old, &new, true);
+    let full = new_frame(&Screen::blank(cols, rows), &new, false);
+    assert!(
+        diff.len() < full.len(),
+        "scroll diff ({}) should be smaller than a full repaint ({})",
+        diff.len(),
+        full.len()
+    );
+    // Round-trips exactly.
+    assert!(screen_eq(&apply(&old, &new), &new), "scroll diff must reproduce new");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
