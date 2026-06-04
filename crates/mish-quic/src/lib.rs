@@ -26,3 +26,7 @@ pub use transport::{
     accept, client_endpoint, connect, insecure_client_endpoint, loopback_client, loopback_server,
     server_endpoint, QuicError, QuicTransport,
 };
+
+/// Re-exported so downstream crates can pass certificates without depending on
+/// `rustls` directly.
+pub use rustls::pki_types::CertificateDer;

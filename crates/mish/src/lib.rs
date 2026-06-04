@@ -15,9 +15,11 @@
 //! transport (`tests/loopback.rs`). The binaries (`mish-server`, `mish-client`)
 //! wire a real PTY and TTY over the QUIC transport ([`mish_quic`]).
 
+pub mod bootstrap;
 pub mod client;
 pub mod pty;
 pub mod server;
 
+pub use bootstrap::Bootstrap;
 pub use client::{run_client, ClientInput};
 pub use server::{run_server, PtyControl};

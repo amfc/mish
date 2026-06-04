@@ -58,6 +58,31 @@ protocol:
 This is the FoundationDB testing philosophy: push all nondeterminism to the
 edges, then hammer the deterministic core.
 
+## Usage
+
+Like upstream mosh, `mish-client` bootstraps the session itself: it SSHes to the
+host, starts `mish-server`, reads the `MISH CONNECT <port> <cert>` line it prints
+over the (authenticated) SSH channel, then opens the QUIC/UDP session directly to
+that port — trusting exactly that certificate.
+
+```sh
+# Remote (like `mosh host`): SSH in, start the server, attach over UDP.
+mish-client user@host
+mish-client user@host -- tmux attach     # run a specific command
+
+# Local mode for testing: start mish-server as a child, no SSH.
+mish-client --local
+mish-client --local -- /bin/bash
+
+# Options: --ssh <cmd>  --server <cmd>     (Ctrl-] to detach)
+```
+
+`mish-server` (run on the remote by the bootstrap, or standalone) binds a UDP
+port and prints `MISH CONNECT <port> <hex-cert>` on stdout; everything else goes
+to stderr. `mish` does not yet daemonize the server, so the SSH channel stays
+open for the session (upstream mosh detaches it); roaming across IP changes still
+works because the data path is independent UDP.
+
 ## Testing
 
 | Layer | What | Where |

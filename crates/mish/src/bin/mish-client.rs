@@ -1,17 +1,30 @@
-//! `mish-client`: connect to a `mish-server` over QUIC and attach the local TTY.
+//! `mish-client`: bootstrap a session like mosh, then attach the local TTY.
 //!
-//! Captures raw keystrokes and forwards them as a `UserStream`, repaints each
-//! received `Screen`, and tracks terminal resizes via SIGWINCH. Detach with
-//! `Ctrl-]`.
+//! Like the upstream `mosh` wrapper, this SSHes to the host, starts
+//! `mish-server` there, reads the `MISH CONNECT <port> <cert>` line it prints,
+//! and opens the QUIC/UDP session to that port — trusting exactly that
+//! certificate (exchanged over the authenticated SSH channel). It then captures
+//! raw keystrokes (forwarded as a `UserStream`), repaints received screens, and
+//! tracks SIGWINCH resizes. Detach with `Ctrl-]`.
 //!
-//! Usage: `mish-client <addr>` (e.g. `mish-client 127.0.0.1:51234`).
+//! Usage:
+//! ```text
+//! mish-client [user@]host [-- command]      # SSH bootstrap (like `mosh host`)
+//! mish-client --local [-- command]          # run the server locally (testing)
+//!
+//! Options:
+//!   --local            start mish-server as a local child (no SSH)
+//!   --ssh <cmd>        ssh command to use (default: ssh)
+//!   --server <cmd>     mish-server command to run (default: mish-server,
+//!                      or the sibling binary in --local mode)
+//! ```
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use mish::bootstrap::{self, Bootstrap};
 use mish::client::{run_client, ClientInput};
-use mish_quic::transport;
+use mish_quic::{transport, CertificateDer};
 use mish_ssp::clock::SystemClock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -19,34 +32,111 @@ use tokio::sync::{mpsc, oneshot};
 /// Detach key: Ctrl-] (0x1d), same as telnet's escape.
 const DETACH: u8 = 0x1d;
 
-/// Restores cooked mode and leaves the alternate screen on drop.
-struct TerminalGuard;
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        // Leave alternate screen, show cursor.
-        print!("\x1b[?1049l\x1b[?25h");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
+struct Options {
+    local: bool,
+    ssh_cmd: String,
+    server_cmd: Option<String>,
+    host: Option<String>,
+    command: Option<String>,
+}
+
+fn parse_args() -> Result<Options> {
+    let mut opts = Options {
+        local: false,
+        ssh_cmd: "ssh".into(),
+        server_cmd: None,
+        host: None,
+        command: None,
+    };
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--local" => opts.local = true,
+            "--ssh" => opts.ssh_cmd = args.next().context("--ssh needs a value")?,
+            "--server" => opts.server_cmd = Some(args.next().context("--server needs a value")?),
+            "--" => {
+                let rest: Vec<String> = args.by_ref().collect();
+                if !rest.is_empty() {
+                    opts.command = Some(rest.join(" "));
+                }
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => bail!("unknown option: {other}"),
+            other => opts.host = Some(other.to_string()),
+        }
     }
+    if !opts.local && opts.host.is_none() {
+        print_usage();
+        bail!("a host is required (or use --local)");
+    }
+    Ok(opts)
+}
+
+fn print_usage() {
+    eprintln!(
+        "usage: mish-client [user@]host [-- command]\n       mish-client --local [-- command]\n\noptions: --local  --ssh <cmd>  --server <cmd>"
+    );
+}
+
+/// Default `mish-server` command for local mode: the sibling binary next to this
+/// executable, falling back to `mish-server` on PATH.
+fn default_local_server() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("mish-server")))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mish-server".into())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let addr: SocketAddr = std::env::args()
-        .nth(1)
-        .context("usage: mish-client <addr>")?
-        .parse()
-        .context("parsing server address")?;
+    let opts = parse_args()?;
 
-    let endpoint = transport::loopback_client().context("creating QUIC client endpoint")?;
-    let t = transport::connect(&endpoint, addr, "localhost")
+    // 1. Bootstrap: get (udp addr, cert) by starting mish-server locally or via SSH.
+    let boot: Bootstrap = if opts.local {
+        let server = opts.server_cmd.unwrap_or_else(default_local_server);
+        eprintln!("[mish-client] starting local server `{server}`…");
+        bootstrap::local(&server, opts.command.as_deref())
+            .await
+            .context("local bootstrap")?
+    } else {
+        let host = opts.host.clone().unwrap();
+        let server = opts.server_cmd.unwrap_or_else(|| "mish-server".into());
+        eprintln!("[mish-client] {} {host} {server}…", opts.ssh_cmd);
+        bootstrap::ssh(&opts.ssh_cmd, &host, &server, opts.command.as_deref())
+            .await
+            .context("ssh bootstrap")?
+    };
+    eprintln!("[mish-client] connecting to {} …", boot.addr);
+
+    // 2. Open the QUIC session to the bootstrapped port, trusting its cert.
+    let cert = CertificateDer::from(boot.cert_der.clone());
+    let endpoint = transport::client_endpoint("0.0.0.0:0".parse().unwrap(), cert)
+        .context("creating QUIC client endpoint")?;
+    let t = transport::connect(&endpoint, boot.addr, "localhost")
         .await
         .context("connecting to server")?;
 
+    // 3. Drive the local terminal.
+    run_terminal(t).await;
+
+    // Dropping `boot` tears down the server / ssh channel.
+    drop(boot);
+    Ok(())
+}
+
+/// Put the TTY in raw mode and run the client session until detach or close.
+async fn run_terminal(t: transport::QuicTransport) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-    crossterm::terminal::enable_raw_mode().context("entering raw mode")?;
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        eprintln!("[mish-client] not a terminal; cannot enter raw mode");
+        return;
+    }
     // Enter alternate screen so we don't clobber the user's scrollback.
     print!("\x1b[?1049h");
     use std::io::Write;
@@ -112,8 +202,7 @@ async fn main() -> Result<()> {
     let clock = Arc::new(SystemClock::new());
 
     // Run until the session ends or the user detaches. Predictive echo is
-    // adaptive (mosh's default --predict=adaptive): predictions show once the
-    // link is laggy enough to benefit.
+    // adaptive (mosh's default --predict=adaptive).
     tokio::select! {
         _ = run_client(
             Arc::new(t),
@@ -129,5 +218,15 @@ async fn main() -> Result<()> {
 
     drop(_guard);
     writer.abort();
-    Ok(())
+}
+
+/// Restores cooked mode and leaves the alternate screen on drop.
+struct TerminalGuard;
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        print!("\x1b[?1049l\x1b[?25h");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
 }

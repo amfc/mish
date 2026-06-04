@@ -32,16 +32,26 @@ async fn main() -> Result<()> {
     // Initial geometry; the client resizes us as soon as it connects.
     let (cols, rows) = (80u16, 24u16);
 
-    let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (endpoint, addr, _cert) = {
+    // Bind on all interfaces so a remote client (post-SSH bootstrap) can reach
+    // us; the client learns the actual port from the line we print.
+    let bind: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+    let (endpoint, addr, cert) = {
         let (ep, cert) = transport::server_endpoint(bind)?;
         let addr = ep.local_addr()?;
         (ep, addr, cert)
     };
 
-    println!("mish server listening on {addr}");
-    println!("connect with:  mish-client {addr}");
-    eprintln!("(demo: insecure TLS verification — use over trusted networks only)");
+    // Machine-parseable bootstrap line on stdout (mosh prints `MISH CONNECT
+    // <port> <key>`); we carry the self-signed cert (DER, hex) so the client can
+    // trust exactly this server over the already-authenticated SSH channel.
+    println!(
+        "MISH CONNECT {} {}",
+        addr.port(),
+        mish::bootstrap::to_hex(cert.as_ref())
+    );
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    eprintln!("mish server listening on UDP port {}", addr.port());
 
     // Serve a single connection (one shell per server invocation, like mosh).
     let t = transport::accept(&endpoint)
