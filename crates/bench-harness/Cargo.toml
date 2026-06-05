@@ -1,0 +1,22 @@
+[package]
+name = "bench-harness"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A/B latency harness: mish vs upstream mosh over a fault-injecting loopback UDP relay."
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "io-util", "sync"] }
+portable-pty = "0.9"
+mish-terminal = { path = "../mish-terminal" }
+anyhow = "1"
+
+[[bin]]
+name = "bench-harness"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench-child"
+path = "src/bin/bench-child.rs"

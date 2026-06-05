@@ -200,9 +200,9 @@ fn parse_args() -> Result<Options> {
             other => opts.host = Some(other.to_string()),
         }
     }
-    if !opts.local && opts.host.is_none() {
+    if !opts.local && opts.host.is_none() && opts.attach.is_none() {
         print_usage();
-        bail!("a host is required (or use --local)");
+        bail!("a host is required (or use --local / --attach)");
     }
     Ok(opts)
 }
