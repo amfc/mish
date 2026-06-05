@@ -32,3 +32,17 @@ path = "fuzz_targets/diff_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "frag_reassemble"
+path = "fuzz_targets/frag_reassemble.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "userstream_decode"
+path = "fuzz_targets/userstream_decode.rs"
+test = false
+doc = false
+bench = false

@@ -73,3 +73,36 @@ Deliberately not done (with rationale):
   for cursor rows >= 2 and for `CSI 0 J`/`CSI 2 J`. Repro:
   `\x1b[1;1H!\x1b[2;1H\x1b[1J`. Rare in practice; a fix would live in (or be
   worked around above) the alacritty dependency.
+
+## Feature/parity backlog (from the second review, medium/low priority)
+
+None of these are correctness or security gaps — the §1 review items
+(authentication, answerback, compression, escape/suspend/SIGCONT, status
+overlay) are all done. These are the remaining parity polish:
+
+- **Reverse video (DECSCNM `ESC[?5h`) + terminal bell (BEL).** mosh syncs both;
+  alacritty surfaces `Event::Bell` (dropped today) and may not model DECSCNM as a
+  `Screen` field — needs a transient bell counter and possibly emulator-side work.
+- **DECCKM cursor-key translation + legacy mouse encodings; client mode reset on
+  exit.** App-cursor-keys mode (SS3 vs CSI for arrows) needs client-side input
+  translation keyed on the synced mode; legacy mouse modes X10(9)/hilite(1001)/
+  UTF-8(1005)/urxvt(1015) unmodeled; SGR blink (5) dropped from renditions.
+  *(Client mode-reset-on-exit and the `[mish]` title prefix are already done.)*
+- **Prediction-ack timing + paste guard + cursor validation.** Port
+  `ECHO_TIMEOUT` (50 ms late-ack) + `input_history`/`set_echo_ack`; suppress
+  prediction on bulk paste; validate the predicted cursor against the server
+  cursor; time-based glitch escalation (`GLITCH_THRESHOLD`); `PredictMode::Experimental`.
+- **SSP: ECN frame-rate throttle, `attempt_prospective_resend_optimization`,
+  SIGUSR1-conditional idle shutdown of disconnected sessions, `apply_diff`
+  echo_ack monotonicity enforcement.**
+- **Server ops: login shell + `TERM`/`STY`/`PWD` env, syslog, `RLIMIT_CORE`
+  suppression, `-s`/`SSH_CONNECTION` & `-i`/`--family`/`-4`/`-6` bind modes.**
+  (utmp/wtmp stays deferred — blocked by portable-pty hiding the pts name.)
+- **CLI/bootstrap: `--predict`/`-a`/`-n` + `MOSH_PREDICTION_*` env, `-p`/range
+  plumbing, `--ssh` shell-split + `ssh -tt`/`-n`/`--no-ssh-pty`, server
+  `--version`/`--help`, `--no-init` (`MOSH_NO_TERM_INIT`), `-c` color advertise.**
+- **Initial window size from `TIOCGWINSZ` + PTY `IUTF8` input flag.** (The client
+  already reports the real size via `crossterm::size()`; IUTF8 may be blocked by
+  portable-pty.) Three-leg shutdown-handshake parity.
+- **Test harnesses: real-terminal reference (PTY-driven, beyond vt100) and a
+  diff-engine throughput benchmark (mosh's `benchmark.cc`).**
