@@ -78,12 +78,18 @@ mish-client user@host -- tmux attach     # run a specific command
 mish-client --local
 mish-client --local -- /bin/bash
 
-# Options: --ssh <cmd>  --server <cmd>     (Ctrl-] to detach)
+# Options: --ssh <cmd>  --server <cmd>
+# Keys: Ctrl-] quick-detach; escape prefix Ctrl-^ (MOSH_ESCAPE_KEY) then
+#       `.` quit / Ctrl-Z suspend (resumes cleanly on `fg`).
 ```
 
+A blue status banner ("mish: Last contact N seconds ago…") appears when the link
+stalls, and the window title is prefixed `[mish]`.
+
 `mish-server` (run on the remote by the bootstrap, or standalone) binds a UDP
-port and prints `MISH CONNECT <port> <hex-cert>` on stdout; everything else goes
-to stderr. Over SSH it daemonizes (`--detach`: fork + setsid), so the SSH channel
+port and prints `MISH CONNECT <port> <server-cert> <client-cert> <client-key>`
+(hex) on stdout; everything else goes to stderr. It forces a UTF-8 locale for the
+child shell. Over SSH it daemonizes (`--detach`: fork + setsid), so the SSH channel
 closes while the server keeps serving and roaming across IP changes works over
 the independent UDP/QUIC path.
 
@@ -112,7 +118,7 @@ the independent UDP/QUIC path.
 | Fragmentation | split/reassemble round-trip, out-of-order, lost-fragment | `mish-ssp/src/frag.rs` |
 | Full stack | headless loopback, real PTY shell, daemonization, SSH/local bootstrap, real QUIC + real PTY end-to-end | `mosh/tests/*` |
 | Fuzz/robustness | no-panic on arbitrary wire bytes / screen diffs / VT input; hostile-peer instructions (bounded, no-panic) + prediction-engine fuzz | `*/tests/fuzz_*.rs` |
-| Coverage-guided fuzz | libFuzzer + ASan targets (decode, screen-diff apply, emulator-driven diff round-trip) run as a CI smoke gate | `fuzz/` |
+| Coverage-guided fuzz | libFuzzer + ASan targets (instruction decode, screen-diff apply, emulator-driven diff round-trip, fragment reassembler, UserStream decode, differential-vs-vt100) run as a CI smoke gate; checked-in regression seeds replayed first | `fuzz/` |
 | Differential emulator | identical VT byte streams fed to our emulator and an independent one (`vt100`) must render the same screen + cursor | `mish-terminal/tests/differential_emulator.rs` |
 | Clock fuzz | non-monotonic / jumping / boundary clock values into the core's timer math: no panic, bounded memory, and forward jumps still converge | `mish-ssp/tests/fuzz_clock.rs` |
 | Roaming | a client that migrates its source address mid-session keeps converging (server re-pins the peer) | `mish-madsim/tests/madsim_fullstack.rs` |
@@ -122,6 +128,13 @@ the independent UDP/QUIC path.
 | Fault soak | loss + duplication + corruption + reorder together, across many seeds, asserting convergence and bounded memory | `mish-ssp/tests/sim_convergence.rs` |
 | madsim sim | sans-IO core, and full stack (scripted shell) over madsim's simulated UDP — reproducible by seed | `mish-madsim/tests/` |
 | Miri (UB) | the sans-IO core (frag/codec/diff/SSP) and prediction overlay run clean under Miri — no UB or aliasing violations | CI `miri` job |
+| Security: mutual auth | a client with no / wrong client cert is rejected (config + against the *real* server binary); a client rejects a wrong server cert; 0-RTT early data is off | `mish-quic/tests/auth.rs`, `mosh/tests/auth_e2e.rs`, `config.rs::early_data_is_off` |
+| Security: wire attacks | bit-flipped datagram (AEAD-rejected → heals), duplicated datagram (no double-apply), off-path injection, and a pre-handshake junk flood can't disrupt/hijack/exhaust the session | `mish-quic/tests/wire_attacks.rs` |
+| Security: key hygiene | the client private key never appears in the server's log (stderr) output | `mosh/tests/key_hygiene.rs` |
+
+See **[`SECURITY.md`](SECURITY.md)** for the full threat model and what's
+enforced/tested versus relied on QUIC (quinn) for (roaming-hijack path
+validation, 3× anti-amplification).
 
 The fuzz/round-trip harnesses earned their keep: they found and fixed several
 real bugs — a Driver CPU spin on a closed handle, a screen-diff OOM on a
@@ -130,7 +143,9 @@ wide-char model, a panic on a malformed `BytesState` diff, an out-of-bounds in
 the prediction UTF-8 decoder, (via the libFuzzer `screen_apply` target) a
 zero-dimension diff header that slipped past the cell-count guard and panicked
 the emulator grid, and (via the clock fuzzer) timer-math add-overflows on
-boundary timestamps — all now fixed and regression-guarded.
+boundary timestamps — all now fixed and regression-guarded. (The
+`screen_apply` crash artifact is promoted to a checked-in regression seed under
+`fuzz/regressions/`, replayed by CI.)
 
 ```sh
 cargo test          # everything
@@ -163,8 +178,10 @@ differences from upstream mosh.
       per-instruction (a lost fragment re-diffs the whole instruction), matching
       mosh. Instructions carry a 16-bit timestamp + echo; the core runs a
       Jacobson/Karels SRTT/RTTVAR estimator that scales the send interval and
-      retransmit timeout (RFC 6298 / mosh's `Connection`). *(done. Deferred:
-      length-disguising chaff — QUIC already pads/encrypts.)*
+      retransmit timeout (RFC 6298 / mosh's `Connection`). Each instruction is
+      **deflate-compressed (zlib-rs)** behind a flag when it shrinks — fewer
+      fragments, with a decompression-bomb cap. *(done. Deferred: length-disguising
+      chaff — QUIC already pads/encrypts.)*
 - [x] **M3 — QUIC transport (`mish-quic`).** Quinn endpoint with the unreliable
       datagram extension implementing `Transport`; datagram-only connections
       (streams disabled); **mutual-auth TLS** (pinned server + minted client cert)
@@ -177,15 +194,20 @@ differences from upstream mosh.
       `UserStream` `SyncState`s as pure data, an `alacritty-terminal`-backed
       `Emulator` (PTY bytes → `Screen`), and a faithful port of mosh's
       **`Display::new_frame`** minimal-diff (`display.rs`): cell-level change
-      detection, ECH/EL blank runs, SGR-on-change, CR/LF/BS cursor optimization.
-      It is both the SSP wire diff and the client's TTY paint, verified by
-      round-trip identity (the check mosh runs in verbose mode). PBTs + the ported
-      `emulation-*` suite + client/server convergence under loss. *(done)*
+      detection, ECH/EL blank runs, SGR-on-change, CR/LF/BS cursor optimization,
+      whole-screen + DECSTBM scroll-region detection. Host **answerbacks**
+      (DA/DSR/CPR/OSC-color/size queries) are captured and fed back to the child
+      PTY, so programs that probe the terminal don't hang. It is both the SSP wire
+      diff and the client's TTY paint, verified by round-trip identity (the check
+      mosh runs in verbose mode). PBTs + the ported `emulation-*` suite +
+      client/server convergence under loss. *(done)*
 - [x] **M5 — Binaries (`mosh` crate).** `mish-server` (spawns a shell on a real
       PTY via `portable-pty`, feeds output through the emulator, applies the
       client's `UserStream` back to the PTY) and `mish-client` (raw TTY via
       `crossterm`, forwards keystrokes, repaints received screens, SIGWINCH
-      resize, `Ctrl-]` detach). Session loops are transport-generic and
+      resize, `Ctrl-]` detach, `Ctrl-^` escape + `Ctrl-Z` suspend with clean
+      SIGCONT resume/repaint, and a "last contact" status banner on a stalled
+      link). Session loops are transport-generic and
       I/O-decoupled, so they're tested headlessly; plus a real-PTY test and a
       **full-stack test** (real QUIC + real `/bin/sh` + emulator + render).
       The QUIC session is **mutually authenticated**: `mish-server` mints a
