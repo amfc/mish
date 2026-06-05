@@ -79,6 +79,17 @@ pub struct SessionAuth {
 /// — transmitted solely over the authenticated SSH channel — can connect.
 pub fn authenticated_server_config() -> (ServerConfig, SessionAuth) {
     init_crypto();
+    let (rustls_server, auth) = authenticated_rustls_server();
+    let qsc = QuicServerConfig::try_from(rustls_server).expect("TLS13 quic server config");
+    let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
+    server_config.transport_config(transport_config());
+    (server_config, auth)
+}
+
+/// Build the underlying rustls server config (with the pinned client-cert
+/// verifier) and the session credentials. Split out so tests can inspect TLS
+/// properties — notably that 0-RTT/early-data is off (see `early_data_is_off`).
+fn authenticated_rustls_server() -> (rustls::ServerConfig, SessionAuth) {
     let server = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("server cert generation");
     let client = rcgen::generate_simple_self_signed(vec!["mish-client".to_string()])
@@ -98,17 +109,21 @@ pub fn authenticated_server_config() -> (ServerConfig, SessionAuth) {
             PrivateKeyDer::Pkcs8(server_key),
         )
         .expect("valid mutual-auth server config");
-
-    let qsc = QuicServerConfig::try_from(rustls_server).expect("TLS13 quic server config");
-    let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
-    server_config.transport_config(transport_config());
+    // NOTE: we never set `max_early_data_size`, so it stays at rustls's default of
+    // 0 — 0-RTT / TLS early data is OFF. This is deliberate: 0-RTT early data is
+    // replayable, and a replayed first UserStream frame (keystrokes — a
+    // non-idempotent PTY side effect) before the receiver has anti-replay state
+    // would be an injection path. Screen-state diffs are idempotent and
+    // sequence-numbered (replays are no-ops), but keystrokes are not. Keeping
+    // early data off closes this; `early_data_is_off` pins it if session
+    // resumption is ever added for fast reattach.
 
     let auth = SessionAuth {
         server_cert_der: server_cert_der.to_vec(),
         client_cert_der: client_cert_der.to_vec(),
         client_key_der: client.key_pair.serialize_der(),
     };
-    (server_config, auth)
+    (rustls_server, auth)
 }
 
 /// A client config that trusts the given server cert **and presents the minted
@@ -300,5 +315,24 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 0-RTT / TLS early data must be OFF on the server (max_early_data_size == 0).
+    /// Early data is replayable; a replayed first UserStream keystroke frame would
+    /// be an injection path. This regression-pins the safe default so enabling
+    /// session resumption later can't silently turn early data on.
+    #[test]
+    fn early_data_is_off() {
+        init_crypto();
+        let (rustls_server, _auth) = authenticated_rustls_server();
+        assert_eq!(
+            rustls_server.max_early_data_size, 0,
+            "0-RTT early data must remain disabled (replay-injection risk)"
+        );
     }
 }
