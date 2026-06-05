@@ -79,9 +79,21 @@ mish-client --local -- /bin/bash
 
 `mish-server` (run on the remote by the bootstrap, or standalone) binds a UDP
 port and prints `MISH CONNECT <port> <hex-cert>` on stdout; everything else goes
-to stderr. `mish` does not yet daemonize the server, so the SSH channel stays
-open for the session (upstream mosh detaches it); roaming across IP changes still
-works because the data path is independent UDP.
+to stderr. Over SSH it daemonizes (`--detach`: fork + setsid), so the SSH channel
+closes while the server keeps serving and roaming across IP changes works over
+the independent UDP/QUIC path.
+
+## Non-goals
+
+- **Wire compatibility with mosh.** This is intentionally *not* a drop-in for
+  mosh's protocol: it uses QUIC unreliable datagrams with TLS 1.3 instead of
+  mosh's UDP + hand-rolled OCB/AES, and a different instruction encoding. A
+  mish client only talks to a mish server. We deliberately trade
+  interoperability for reusing QUIC's crypto, congestion control, and connection
+  migration.
+- **Zero-RTT first paint.** QUIC's ~1-RTT handshake before the first datagram is
+  expected and fine; the value is in everything QUIC gives us for free. (The
+  *session* is still datagram-based and loss-tolerant after that.)
 
 ## Testing
 
@@ -102,6 +114,21 @@ works because the data path is independent UDP.
 cargo test          # everything
 cargo clippy --all-targets
 ```
+
+**vs. mosh's own tests:** mosh relies on tmux-driven end-to-end shell scripts
+(emulation captures, e2e success/failure, repeat, a couple of network behaviors),
+a handful of C++ unit tests (base64, OCB, encrypt/decrypt), and libFuzzer targets
+for its VT parser. It has **no in-process network simulation**. mish ports the
+equivalent emulation/e2e scenarios (see [`COVERAGE.md`](COVERAGE.md)) *and* adds
+what mosh lacks: a sans-IO deterministic simulator, **two** network-simulation
+engines (`turmoil` + `madsim`) running the real session under latency / loss /
+partitions, and property-based + fuzz testing — all reproducible by seed. So on
+the simulation/property axis our coverage is more complete; mosh's edge is years
+of real-world exposure across many terminals and a larger hand-curated emulation
+corpus.
+
+See [`FUTURE_WORK.md`](FUTURE_WORK.md) for the remaining (mostly small)
+differences from upstream mosh.
 
 ## Roadmap
 
