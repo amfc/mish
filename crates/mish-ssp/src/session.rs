@@ -53,6 +53,10 @@ pub struct SessionHandle<L: SyncState, R: SyncState> {
     local_tx: mpsc::UnboundedSender<L>,
     remote_rx: watch::Receiver<R>,
     srtt_rx: watch::Receiver<f64>,
+    /// Clock time (ms) of the last datagram received from the peer — for
+    /// liveness/“last contact” display, which screen-change events miss (an idle
+    /// but healthy link still exchanges keepalives without changing the screen).
+    last_recv_rx: watch::Receiver<u64>,
     shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -62,6 +66,7 @@ impl<L: SyncState, R: SyncState> Clone for SessionHandle<L, R> {
             local_tx: self.local_tx.clone(),
             remote_rx: self.remote_rx.clone(),
             srtt_rx: self.srtt_rx.clone(),
+            last_recv_rx: self.last_recv_rx.clone(),
             shutdown: self.shutdown.clone(),
         }
     }
@@ -93,6 +98,12 @@ impl<L: SyncState, R: SyncState> SessionHandle<L, R> {
         *self.srtt_rx.borrow()
     }
 
+    /// Clock time (ms) of the most recent datagram received from the peer. The
+    /// client compares this to "now" (same clock) to show "last contact N s ago".
+    pub fn last_recv_ms(&self) -> u64 {
+        *self.last_recv_rx.borrow()
+    }
+
     /// Request a clean shutdown: the driver sends a SHUTDOWN handshake and ends
     /// once the peer acknowledges (or after a short grace period).
     pub fn shutdown(&self) {
@@ -115,6 +126,7 @@ pub struct Driver<T: Transport, L: SyncState, R: SyncState> {
     local_rx: mpsc::UnboundedReceiver<L>,
     remote_tx: watch::Sender<R>,
     srtt_tx: watch::Sender<f64>,
+    last_recv_tx: watch::Sender<u64>,
     shutdown: Arc<tokio::sync::Notify>,
     last_published_num: u64,
     fragmenter: Fragmenter,
@@ -147,6 +159,7 @@ where
         let now = clock.now_ms();
         let core = SspCore::with_config(now, cfg);
         let (srtt_tx, srtt_rx) = watch::channel(core.srtt_ms());
+        let (last_recv_tx, last_recv_rx) = watch::channel(now);
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let driver = Self {
             transport,
@@ -155,6 +168,7 @@ where
             local_rx,
             remote_tx,
             srtt_tx,
+            last_recv_tx,
             shutdown: shutdown.clone(),
             last_published_num: 0,
             fragmenter: Fragmenter::new(),
@@ -164,6 +178,7 @@ where
             local_tx,
             remote_rx,
             srtt_rx,
+            last_recv_rx,
             shutdown,
         };
         (driver, handle)
@@ -215,6 +230,9 @@ where
                 recv = self.transport.recv() => {
                     match recv {
                         Ok(bytes) => {
+                            // A datagram arrived (even a keepalive that doesn't
+                            // change the screen) — record contact for liveness.
+                            let _ = self.last_recv_tx.send(self.clock.now_ms());
                             // Reassemble fragments; a complete instruction may
                             // arrive on the last fragment of a group.
                             if let Some(payload) = self.defragmenter.push(&bytes) {

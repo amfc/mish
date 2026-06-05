@@ -48,7 +48,7 @@ pub async fn run_client<T: Transport>(
     output: mpsc::UnboundedSender<Vec<u8>>,
 ) {
     let (driver, handle) =
-        Driver::<T, UserStream, Screen>::with(transport, clock, SspConfig::default());
+        Driver::<T, UserStream, Screen>::with(transport, clock.clone(), SspConfig::default());
     let driver_task = driver.spawn();
 
     // Accumulate the user-input log. We keep the full prefix so diffs against
@@ -68,14 +68,18 @@ pub async fn run_client<T: Transport>(
     let mut painted = Screen::new_initial();
     let mut painted_once = false;
 
-    // Emit a minimal frame from `painted` to the current predicted screen.
+    // Emit a minimal frame from `painted` to the current predicted screen, with
+    // a connection-status banner overlaid when the link has gone silent.
     macro_rules! repaint {
         () => {{
             // Keep adaptive prediction in step with the measured link latency.
             engine.set_srtt(handle.srtt_ms());
             let predicted = engine.predicted_screen(&server_screen);
-            let frame = new_frame(&painted, &predicted, painted_once);
-            painted = predicted;
+            let silent_secs = clock.now_ms().saturating_sub(handle.last_recv_ms()) / 1000;
+            let shown = mish_terminal::notification::stalled_overlay(&predicted, silent_secs)
+                .unwrap_or(predicted);
+            let frame = new_frame(&painted, &shown, painted_once);
+            painted = shown;
             painted_once = true;
             if !frame.is_empty() && output.send(frame).is_err() {
                 break;
@@ -83,8 +87,14 @@ pub async fn run_client<T: Transport>(
         }};
     }
 
+    // Wake periodically so the stall banner appears (and its "N seconds" counts
+    // up) even when no input or screen update is flowing.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
+            _ = tick.tick() => { repaint!(); }
             inp = input.recv() => {
                 match inp {
                     Some(ClientInput::Keys(b)) => {
