@@ -7,7 +7,7 @@ authors.workspace = true
 description = "State Synchronization Protocol (SSP) core for mish: a sans-IO, diff-based state sync engine over unreliable datagrams."
 
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

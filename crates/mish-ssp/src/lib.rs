@@ -25,6 +25,7 @@
 pub mod clock;
 pub mod core;
 pub mod frag;
+pub mod framing;
 pub mod instruction;
 pub mod memory;
 pub mod session;

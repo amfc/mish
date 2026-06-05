@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use bytes::Bytes;
 use mish_ssp::transport::{Transport, TransportError};
-use quinn::{Connection, Endpoint};
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
 
 use crate::config;
@@ -49,6 +49,22 @@ impl QuicTransport {
     /// The peer's current address — changes when the connection migrates.
     pub fn remote_address(&self) -> SocketAddr {
         self.conn.remote_address()
+    }
+
+    /// Open a reliable **side-channel**: a bidirectional QUIC stream for an
+    /// ordered, flow-controlled request/response exchange (scrollback history,
+    /// …), separate from the unreliable datagram path that carries the live
+    /// screen. Frame messages on it with [`mish_ssp::framing`]. The stream lives
+    /// inside the same mutually-authenticated connection, so it inherits the auth
+    /// model. (Caller side — typically the client requesting history.)
+    pub async fn open_side_channel(&self) -> Result<(SendStream, RecvStream), QuicError> {
+        Ok(self.conn.open_bi().await?)
+    }
+
+    /// Accept the next inbound side-channel stream the peer opened (server side,
+    /// e.g. a history fetch). Loop on this to serve requests.
+    pub async fn accept_side_channel(&self) -> Result<(SendStream, RecvStream), QuicError> {
+        Ok(self.conn.accept_bi().await?)
     }
 }
 

@@ -1,8 +1,12 @@
 //! QUIC/TLS configuration helpers.
 //!
-//! Builds endpoint configs with the **unreliable datagram extension enabled**
-//! and streams disabled — mish carries everything in datagrams, so we want a
-//! pure-datagram QUIC connection. Also provides a self-signed server cert and an
+//! Builds endpoint configs with the **unreliable datagram extension enabled**.
+//! The *live screen* rides datagrams (loss-tolerant latest-wins state sync); a
+//! small, bounded number of **reliable bidirectional streams** are allowed for
+//! request/response **side-channels** (e.g. scrollback history) that want
+//! ordered, flow-controlled, reliable delivery without bloating the per-frame
+//! diff. Streams live inside the same mutually-authenticated connection, so they
+//! add no new auth surface. Also provides a self-signed server cert and an
 //! insecure (accept-any-cert) client verifier for local testing.
 
 use std::sync::Arc;
@@ -30,13 +34,21 @@ pub fn init_crypto() {
     });
 }
 
-/// Transport config shared by client and server: datagrams on, streams off.
+/// Max concurrent inbound bidi streams a peer may open. Side-channels are
+/// short-lived request/response exchanges (one stream per in-flight request), so
+/// a small cap bounds memory while comfortably covering bursts of history
+/// fetches. Per-stream flow control bounds each stream's buffering.
+const MAX_SIDE_CHANNELS: u32 = 16;
+
+/// Transport config shared by client and server: datagrams on, plus a bounded
+/// number of reliable bidi streams for side-channels (scrollback, …).
 fn transport_config() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
     tc.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
     tc.datagram_send_buffer_size(DATAGRAM_BUFFER);
-    // We don't use QUIC streams at all.
-    tc.max_concurrent_bidi_streams(0u8.into());
+    // Allow a bounded number of reliable bidi streams for side-channels; no uni
+    // streams (every side-channel is request/response, so it needs both halves).
+    tc.max_concurrent_bidi_streams(MAX_SIDE_CHANNELS.into());
     tc.max_concurrent_uni_streams(0u8.into());
     // Keep idle connections alive across roaming gaps (mosh tolerates long naps).
     tc.keep_alive_interval(Some(Duration::from_secs(5)));
