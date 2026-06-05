@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 mish-ssp = { path = "../crates/mish-ssp" }
 mish-terminal = { path = "../crates/mish-terminal" }
+vt100 = "0.16.2"
 
 [[bin]]
 name = "instruction_decode"
@@ -43,6 +44,13 @@ bench = false
 [[bin]]
 name = "userstream_decode"
 path = "fuzz_targets/userstream_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "differential_emulator"
+path = "fuzz_targets/differential_emulator.rs"
 test = false
 doc = false
 bench = false
