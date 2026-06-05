@@ -17,18 +17,25 @@
 //!
 //! Options:
 //!   --local            start mish-server as a local child (no SSH)
-//!   --ssh <cmd>        ssh command to use (default: ssh)
+//!   --ssh <cmd>        ssh command, shell-split (default: ssh); we append -n and
+//!                      -tt and run `host -- <server …>`, like upstream mosh
+//!   --no-ssh-pty       don't allocate a remote PTY (omit ssh -tt)
 //!   --server <cmd>     mish-server command to run (default: mish-server,
 //!                      or the sibling binary in --local mode)
+//!   --predict <mode>   adaptive|always|never|experimental (default: adaptive);
+//!     -a/-n            also via MOSH_PREDICTION_DISPLAY; -a=always, -n=never
+//!   --no-init          don't enter the alternate screen (MOSH_NO_TERM_INIT)
+//!   --version          print version and exit
 //! ```
 
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use mish::bootstrap::{self, Bootstrap};
+use mish::bootstrap::{self, shell_split, Bootstrap};
 use mish::client::{run_client, ClientInput};
 use mish_quic::transport;
 use mish_ssp::clock::SystemClock;
+use mish_terminal::predict::PredictMode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -57,10 +64,11 @@ fn escape_key() -> u8 {
 /// Leave raw mode + the alternate screen, stop ourselves (SIGTSTP), and — once
 /// resumed (SIGCONT) — the installed handler re-enters raw mode and repaints.
 #[cfg(unix)]
-fn suspend() {
+fn suspend(no_init: bool) {
     use std::io::Write;
     let _ = crossterm::terminal::disable_raw_mode();
-    print!("\x1b[?1049l\x1b[?25h");
+    // Show the cursor, and leave the alternate screen unless we never entered it.
+    print!("{}\x1b[?25h", if no_init { "" } else { "\x1b[?1049l" });
     std::io::stdout().flush().ok();
     // Stop the whole process; execution resumes here on SIGCONT (`fg`).
     unsafe {
@@ -70,17 +78,48 @@ fn suspend() {
 
 struct Options {
     local: bool,
-    ssh_cmd: String,
+    /// The ssh command, shell-split (e.g. `["ssh", "-p", "2222"]`).
+    ssh_argv: Vec<String>,
+    /// Allocate a remote PTY (`ssh -tt`); cleared by `--no-ssh-pty`.
+    ssh_pty: bool,
     server_cmd: Option<String>,
+    /// Speculative-echo mode (`--predict` / `-a` / `-n` / `MOSH_PREDICTION_DISPLAY`).
+    predict: PredictMode,
+    /// Suppress terminal initialization — don't enter the alternate screen
+    /// (`--no-init` / `MOSH_NO_TERM_INIT`, mosh's smcup/rmcup suppression).
+    no_init: bool,
     host: Option<String>,
     command: Option<String>,
+}
+
+/// Resolve a `--predict` / `MOSH_PREDICTION_DISPLAY` mode name. `experimental`
+/// is accepted but maps to `adaptive` (the aggressive mode isn't implemented).
+fn parse_predict(name: &str) -> Result<PredictMode> {
+    match name {
+        "adaptive" => Ok(PredictMode::Adaptive),
+        "always" => Ok(PredictMode::Always),
+        "never" => Ok(PredictMode::Never),
+        "experimental" => {
+            eprintln!("[mish-client] --predict=experimental not implemented; using adaptive");
+            Ok(PredictMode::Adaptive)
+        }
+        other => bail!("unknown --predict mode {other:?} (adaptive|always|never|experimental)"),
+    }
 }
 
 fn parse_args() -> Result<Options> {
     let mut opts = Options {
         local: false,
-        ssh_cmd: "ssh".into(),
+        ssh_argv: vec!["ssh".into()],
+        ssh_pty: true,
         server_cmd: None,
+        // Default adaptive, overridable by env then by an explicit flag (mosh's
+        // precedence: --predict > MOSH_PREDICTION_DISPLAY > adaptive).
+        predict: match std::env::var("MOSH_PREDICTION_DISPLAY") {
+            Ok(v) => parse_predict(&v).context("MOSH_PREDICTION_DISPLAY")?,
+            Err(_) => PredictMode::Adaptive,
+        },
+        no_init: std::env::var_os("MOSH_NO_TERM_INIT").is_some(),
         host: None,
         command: None,
     };
@@ -88,8 +127,26 @@ fn parse_args() -> Result<Options> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--local" => opts.local = true,
-            "--ssh" => opts.ssh_cmd = args.next().context("--ssh needs a value")?,
+            "--ssh" => {
+                let val = args.next().context("--ssh needs a value")?;
+                opts.ssh_argv = shell_split(&val)?;
+                if opts.ssh_argv.is_empty() {
+                    bail!("--ssh value is empty");
+                }
+            }
+            "--no-ssh-pty" => opts.ssh_pty = false,
             "--server" => opts.server_cmd = Some(args.next().context("--server needs a value")?),
+            "--predict" => {
+                let m = args.next().context("--predict needs a mode")?;
+                opts.predict = parse_predict(&m)?;
+            }
+            "-a" | "--predict-always" => opts.predict = PredictMode::Always,
+            "-n" | "--predict-never" => opts.predict = PredictMode::Never,
+            "--no-init" => opts.no_init = true,
+            "--version" => {
+                println!("mish-client (mish) {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--" => {
                 let rest: Vec<String> = args.by_ref().collect();
                 if !rest.is_empty() {
@@ -113,7 +170,19 @@ fn parse_args() -> Result<Options> {
 
 fn print_usage() {
     eprintln!(
-        "usage: mish-client [user@]host [-- command]\n       mish-client --local [-- command]\n\noptions: --local  --ssh <cmd>  --server <cmd>"
+        "usage: mish-client [user@]host [-- command]\n\
+         \x20      mish-client --local [-- command]\n\n\
+         options:\n\
+         \x20 --local              run mish-server as a local child (no SSH)\n\
+         \x20 --ssh <cmd>          ssh command, shell-split (default: ssh)\n\
+         \x20 --no-ssh-pty         don't allocate a remote PTY (no ssh -tt)\n\
+         \x20 --server <cmd>       mish-server command to run (default: mish-server)\n\
+         \x20 --predict <mode>     adaptive|always|never|experimental (default: adaptive)\n\
+         \x20 -a, --predict-always always echo locally; -n, --predict-never  disable\n\
+         \x20 --no-init            don't enter the alternate screen (MOSH_NO_TERM_INIT)\n\
+         \x20 --version            print version and exit\n\
+         \x20 -h, --help           show this help\n\n\
+         env: MOSH_PREDICTION_DISPLAY, MOSH_NO_TERM_INIT, MOSH_ESCAPE_KEY"
     );
 }
 
@@ -142,10 +211,16 @@ async fn main() -> Result<()> {
     } else {
         let host = opts.host.clone().unwrap();
         let server = opts.server_cmd.unwrap_or_else(|| "mish-server".into());
-        eprintln!("[mish-client] {} {host} {server}…", opts.ssh_cmd);
-        bootstrap::ssh(&opts.ssh_cmd, &host, &server, opts.command.as_deref())
-            .await
-            .context("ssh bootstrap")?
+        eprintln!("[mish-client] {} {host} {server}…", opts.ssh_argv.join(" "));
+        bootstrap::ssh(
+            &opts.ssh_argv,
+            opts.ssh_pty,
+            &host,
+            &server,
+            opts.command.as_deref(),
+        )
+        .await
+        .context("ssh bootstrap")?
     };
     eprintln!("[mish-client] connecting to {} …", boot.addr);
 
@@ -163,7 +238,7 @@ async fn main() -> Result<()> {
         .context("connecting to server")?;
 
     // 3. Drive the local terminal.
-    run_terminal(t).await;
+    run_terminal(t, opts.predict, opts.no_init).await;
 
     // Dropping `boot` tears down the server / ssh channel.
     drop(boot);
@@ -171,18 +246,21 @@ async fn main() -> Result<()> {
 }
 
 /// Put the TTY in raw mode and run the client session until detach or close.
-async fn run_terminal(t: transport::QuicTransport) {
+async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init: bool) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
     if crossterm::terminal::enable_raw_mode().is_err() {
         eprintln!("[mish-client] not a terminal; cannot enter raw mode");
         return;
     }
-    // Enter alternate screen so we don't clobber the user's scrollback.
-    print!("\x1b[?1049h");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    let _guard = TerminalGuard;
+    // Enter alternate screen so we don't clobber the user's scrollback — unless
+    // --no-init (MOSH_NO_TERM_INIT) asks us to leave the main screen alone.
+    if !no_init {
+        print!("\x1b[?1049h");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+    }
+    let _guard = TerminalGuard { no_init };
 
     let (in_tx, in_rx) = mpsc::channel::<ClientInput>(256);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -240,7 +318,7 @@ async fn run_terminal(t: transport::QuicTransport) {
                                     .await;
                             }
                             #[cfg(unix)]
-                            suspend();
+                            suspend(no_init);
                         }
                         // Unknown escape command: ignore it (no passthrough).
                         _ => {}
@@ -280,7 +358,7 @@ async fn run_terminal(t: transport::QuicTransport) {
             };
             while sig.recv().await.is_some() {
                 let _ = crossterm::terminal::enable_raw_mode();
-                {
+                if !no_init {
                     use std::io::Write;
                     print!("\x1b[?1049h");
                     std::io::stdout().flush().ok();
@@ -317,17 +395,8 @@ async fn run_terminal(t: transport::QuicTransport) {
 
     // Run until the session ends or the user detaches (Ctrl-] → ClientInput::
     // Detach, which triggers a clean shutdown handshake inside run_client).
-    // Predictive echo is adaptive (mosh's default --predict=adaptive).
-    run_client(
-        Arc::new(t),
-        cols,
-        rows,
-        clock,
-        mish_terminal::predict::PredictMode::Adaptive,
-        in_rx,
-        out_tx,
-    )
-    .await;
+    // Predictive echo mode comes from --predict / MOSH_PREDICTION_DISPLAY.
+    run_client(Arc::new(t), cols, rows, clock, predict, in_rx, out_tx).await;
 
     drop(_guard);
     writer.abort();
@@ -336,16 +405,22 @@ async fn run_terminal(t: transport::QuicTransport) {
 /// Restores cooked mode and the main screen on drop, and resets the input modes
 /// a remote program may have left enabled so the local terminal isn't wedged
 /// (mouse reporting, bracketed paste, reverse video) after the session ends.
-struct TerminalGuard;
+struct TerminalGuard {
+    /// Whether we entered the alternate screen (so we know to leave it).
+    no_init: bool,
+}
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
-        // Disable mouse modes, bracketed paste, screen-reverse; show cursor;
-        // leave the alternate screen.
+        // Disable mouse modes, bracketed paste, screen-reverse; show cursor.
         print!(
             "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
-             \x1b[?2004l\x1b[?5l\x1b[?25h\x1b[?1049l"
+             \x1b[?2004l\x1b[?5l\x1b[?25h"
         );
+        // Leave the alternate screen only if we entered it.
+        if !self.no_init {
+            print!("\x1b[?1049l");
+        }
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }

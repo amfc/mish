@@ -89,25 +89,41 @@ pub async fn local(server_cmd: &str, command: Option<&str>) -> Result<Bootstrap>
 }
 
 /// SSH to `host`, run `mish-server` there, and read its `MISH CONNECT` line.
+///
+/// `ssh_argv` is the (already shell-split) ssh command, e.g. `["ssh"]` or
+/// `["ssh", "-p", "2222"]`. We append mosh's standard ssh options — `-n` (no
+/// stdin, so the local TTY stays with us) and, unless `ssh_pty` is false, `-tt`
+/// (force remote PTY allocation, needed for the login shell to behave) — then
+/// `host -- <server …>`, matching upstream `mosh`'s wrapper.
 pub async fn ssh(
-    ssh_cmd: &str,
+    ssh_argv: &[String],
+    ssh_pty: bool,
     host: &str,
     server_cmd: &str,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
+    let (prog, base) = ssh_argv
+        .split_first()
+        .ok_or_else(|| anyhow!("empty --ssh command"))?;
     // Over SSH: detach the server so it survives SSH closing (real mosh does
     // this). The `ssh` process exits once the server's parent returns; the
     // daemon keeps serving over UDP.
-    let mut child = Command::new(ssh_cmd)
-        .arg(host)
+    let mut cmd = Command::new(prog);
+    cmd.args(base).arg("-n");
+    if ssh_pty {
+        cmd.arg("-tt");
+    }
+    cmd.arg(host)
+        .arg("--")
         .arg(server_cmd)
-        .args(server_args(true, "0", command))
+        .args(server_args(true, "0", command));
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawning `{ssh_cmd} {host} {server_cmd}`"))?;
+        .with_context(|| format!("spawning `{} {host} {server_cmd}`", ssh_argv.join(" ")))?;
 
     let creds = read_connect(&mut child).await?;
 
@@ -210,6 +226,78 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Split a command string into words like a POSIX shell (mosh's wrapper uses
+/// Perl's `shellwords` on `--ssh`), honouring single quotes, double quotes, and
+/// backslash escapes. Used so `--ssh "ssh -p 2222 -i key"` becomes separate argv
+/// entries rather than one opaque program name. Returns an error on an unbalanced
+/// quote.
+pub fn shell_split(s: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                let mut closed = false;
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    cur.push(q);
+                }
+                if !closed {
+                    return Err(anyhow!("unbalanced single quote in {s:?}"));
+                }
+            }
+            '"' => {
+                in_word = true;
+                let mut closed = false;
+                while let Some(q) = chars.next() {
+                    if q == '"' {
+                        closed = true;
+                        break;
+                    }
+                    if q == '\\' {
+                        // In double quotes, backslash escapes only " and \.
+                        match chars.peek() {
+                            Some('"') | Some('\\') => cur.push(chars.next().unwrap()),
+                            _ => cur.push('\\'),
+                        }
+                    } else {
+                        cur.push(q);
+                    }
+                }
+                if !closed {
+                    return Err(anyhow!("unbalanced double quote in {s:?}"));
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Ok(words)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +326,34 @@ mod tests {
         assert!(parse_connect("MISH CONNECT notaport ff ee dd").is_none());
         // A legacy single-cert line is rejected (no silent downgrade).
         assert!(parse_connect("MISH CONNECT 51234 dead").is_none());
+    }
+
+    #[test]
+    fn shell_split_basic_and_quoted() {
+        assert_eq!(shell_split("ssh").unwrap(), vec!["ssh"]);
+        assert_eq!(
+            shell_split("ssh -p 2222 -i key").unwrap(),
+            vec!["ssh", "-p", "2222", "-i", "key"]
+        );
+        // Quotes group words and are stripped.
+        assert_eq!(
+            shell_split("ssh -o 'ProxyCommand=nc %h %p'").unwrap(),
+            vec!["ssh", "-o", "ProxyCommand=nc %h %p"]
+        );
+        assert_eq!(
+            shell_split(r#"ssh -o "User Name=a b""#).unwrap(),
+            vec!["ssh", "-o", "User Name=a b"]
+        );
+        // Backslash escapes a space.
+        assert_eq!(
+            shell_split(r"ssh /path/with\ space").unwrap(),
+            vec!["ssh", "/path/with space"]
+        );
+        // Extra whitespace collapses; empty string yields no words.
+        assert_eq!(shell_split("  ssh   host ").unwrap(), vec!["ssh", "host"]);
+        assert!(shell_split("").unwrap().is_empty());
+        // Unbalanced quotes are an error.
+        assert!(shell_split("ssh 'oops").is_err());
+        assert!(shell_split(r#"ssh "oops"#).is_err());
     }
 }

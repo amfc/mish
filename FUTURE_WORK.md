@@ -108,9 +108,13 @@ overlay) are all done. These are the remaining parity polish:
   *Remaining (lower value):* syslog connection logging, `-s`/`SSH_CONNECTION`
   interface binding, and `STY`/`PWD` unsetting. utmp/wtmp stays deferred (blocked
   by portable-pty hiding the pts name).
-- **CLI/bootstrap: `--predict`/`-a`/`-n` + `MOSH_PREDICTION_*` env, `-p`/range
-  plumbing, `--ssh` shell-split + `ssh -tt`/`-n`/`--no-ssh-pty`, server
-  `--version`/`--help`, `--no-init` (`MOSH_NO_TERM_INIT`), `-c` color advertise.**
+- **CLI/bootstrap** — *client done.* `mish-client` now has `--predict`/`-a`/`-n`
+  + `MOSH_PREDICTION_DISPLAY`, `--ssh` shell-splitting with `ssh -n`/`-tt` +
+  `--no-ssh-pty`, `--no-init` (`MOSH_NO_TERM_INIT`, suppresses the alternate
+  screen), and `--version` (`bootstrap::shell_split`, `client_cli.rs` tests).
+  *Remaining (lower value):* server `--version`/`--help`/banner, `-c` color
+  advertisement, and `--predict-overwrite` (needs the unimplemented
+  `predict_overwrite` engine path).
 - **Initial window size from `TIOCGWINSZ` + PTY `IUTF8` input flag.** (The client
   already reports the real size via `crossterm::size()`; IUTF8 may be blocked by
   portable-pty.) Three-leg shutdown-handshake parity.

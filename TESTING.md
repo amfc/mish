@@ -186,8 +186,12 @@ All lower-value polish — no correctness or security stakes remain. Ranked:
    `quick_confirmations_cure_glitch_trigger`) and exercised by `fuzz_predict.rs`.
    *Deferred: `predict_overwrite` (insert-vs-overwrite shift) and
    `PredictMode::Experimental`.*
-2. **`#37` CLI/bootstrap parity** — `--ssh` shell-splitting + `ssh -tt`/`-n`,
-   `--version`/`--help`, `--predict`/`MOSH_PREDICTION_*`, `--no-init`.
+2. **`#37` CLI/bootstrap parity** — *client done.* `--ssh` shell-splitting +
+   `ssh -n`/`-tt` + `--no-ssh-pty`, `--predict`/`-a`/`-n` +
+   `MOSH_PREDICTION_DISPLAY`, `--no-init` (`MOSH_NO_TERM_INIT`), `--version`.
+   `bootstrap::shell_split` (unit-tested) + `client_cli.rs` (version/help/bad-
+   predict/missing-host). *Remaining: server `--version`/`--help`, `-c` color
+   advertise.*
 3. **`#38`** — PTY `IUTF8` flag (may be blocked by portable-pty), three-leg
    shutdown-handshake parity. (Initial winsize is already taken from the real
    terminal.)
