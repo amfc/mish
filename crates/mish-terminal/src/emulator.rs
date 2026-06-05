@@ -128,9 +128,18 @@ pub struct Emulator {
     listener: TermListener,
 }
 
+/// Clamp a reported terminal size to at least 1×1. The grid backing the emulator
+/// computes row/column deltas with unsigned subtraction, which underflows (panic
+/// in debug, garbage in release) for a zero dimension — so a client that hasn't
+/// learned its window size yet, or a malicious one, can't crash the session.
+fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.max(1), rows.max(1))
+}
+
 impl Emulator {
     /// Create an emulator with the given screen size.
     pub fn new(cols: u16, rows: u16) -> Self {
+        let (cols, rows) = clamp_size(cols, rows);
         let listener = TermListener::default();
         *listener.size.lock().unwrap() = (cols, rows);
         let size = TermSize::new(cols as usize, rows as usize);
@@ -155,8 +164,11 @@ impl Emulator {
         std::mem::take(&mut *buf)
     }
 
-    /// Resize the emulated screen.
+    /// Resize the emulated screen. A zero dimension (an unconfigured or hostile
+    /// client reporting a 0×0 window) is clamped to 1: the backing grid's resize
+    /// math underflows on a zero size and would otherwise panic the session.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = clamp_size(cols, rows);
         *self.listener.size.lock().unwrap() = (cols, rows);
         self.term
             .resize(TermSize::new(cols as usize, rows as usize));
@@ -362,6 +374,23 @@ mod tests {
             "DA1 reply should be a CSI ? … c sequence, got {:?}",
             String::from_utf8_lossy(&reply)
         );
+    }
+
+    /// A 0-dimension size (a client that hasn't learned its window size, or a
+    /// hostile one) must not panic: the backing grid's resize underflows on a
+    /// zero size. Regression for a server crash when the client reported 0×0.
+    #[test]
+    fn zero_size_does_not_panic() {
+        // Construction with a zero dimension is clamped, not panicked.
+        let mut emu = Emulator::new(0, 0);
+        assert_eq!((emu.cols(), emu.rows()), (1, 1));
+        // …and a resize to a zero dimension is likewise survivable.
+        emu.resize(80, 0);
+        emu.resize(0, 24);
+        emu.resize(0, 0);
+        emu.feed(b"x"); // still usable afterward
+        emu.resize(80, 24);
+        assert_eq!((emu.cols(), emu.rows()), (80, 24));
     }
 
     /// CSI 18 t (text-area size in cells) is answered from the current size.
