@@ -199,8 +199,12 @@ All lower-value polish — no correctness or security stakes remain. Ranked:
    taken from the real terminal.
 4. **`#35`** — SSP ECN throttle / prospective-resend / conditional idle shutdown.
    Largely subsumed by QUIC's congestion control; low value.
-5. **`#39`** — real-terminal (PTY-driven) reference harness + diff-engine
-   throughput benchmark (mosh's `benchmark.cc`). Dev tooling.
+5. **`#39`** — *done.* Diff-engine throughput benchmark
+   (`mish-terminal/examples/diff_bench.rs`, mosh's `benchmark.cc` equivalent —
+   times `new_frame` + `apply_diff` round-trip) and a real-PTY reference harness
+   (`mosh/tests/real_terminal_reference.rs` — real program on a real kernel PTY,
+   cross-checked against the independent `vt100` renderer). A true tmux/xterm
+   oracle is an optional future extension where those are installed.
 
 Deferred sub-items inside finished work: DECSCNM reverse-video + legacy mouse
 encodings (alacritty doesn't model them well); **zeroize the in-memory client

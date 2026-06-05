@@ -123,5 +123,14 @@ overlay) are all done. These are the remaining parity polish:
   is in place and loss-tolerant — the core resends `SHUTDOWN_NUM` at the frame
   rate until acked, so both sides reach a clean close even under datagram loss
   (`core_unit::shutdown_converges_under_loss`).
-- **Test harnesses: real-terminal reference (PTY-driven, beyond vt100) and a
-  diff-engine throughput benchmark (mosh's `benchmark.cc`).**
+- **Test harnesses** — *done.* A **diff-engine throughput benchmark** (mosh's
+  `benchmark.cc` equivalent) at `mish-terminal/examples/diff_bench.rs` times
+  `display::new_frame` + the `apply_diff` round-trip across scrolling/typing/
+  full-repaint workloads (`cargo run -p mish-terminal --release --example
+  diff_bench`). A **real-PTY reference harness**
+  (`mosh/tests/real_terminal_reference.rs`) feeds the output of a real program
+  on a real kernel PTY to our emulator *and* the independent `vt100` renderer
+  and asserts they agree — real bytes, independent oracle, beyond the synthetic
+  differential grammar. *Optional future extension:* a tmux/xterm-driven oracle
+  (a true terminal) where those are installed; `vt100` is the portable
+  always-available independent renderer used here.

@@ -764,6 +764,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vt100",
 ]
 
 [[package]]

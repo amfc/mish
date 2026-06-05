@@ -143,12 +143,16 @@ TLS verification" line is stale, but the *client-auth* direction is the real gap
 ## 4. Test-harness gaps (mosh tests with no Rust equivalent)
 
 **Medium value:**
-- **No tmux/real-terminal reference harness** — rendering is never validated end-to-end
-  against an *independent real terminal* (the differential test uses the `vt100` crate, not a
-  real emulator). mosh's whole e2e suite is tmux-driven.
+- **Real-terminal reference harness** — *partly resolved.* `mosh/tests/real_terminal_reference.rs`
+  now feeds the output of a real program on a real kernel PTY to our emulator and the
+  independent `vt100` renderer and asserts they agree (real bytes + independent oracle).
+  A *true terminal* oracle (tmux/xterm pane diffing) remains an optional extension where
+  those are installed.
 - **No negative security test** — nothing asserts that a client trusting the wrong cert, or an
   unauthenticated client, is rejected. (Pairs with §1.6.)
-- **No performance/throughput benchmark** equivalent to `benchmark.cc` (diff-engine hot loop).
+- **Performance/throughput benchmark** — *resolved.* `mish-terminal/examples/diff_bench.rs`
+  times the diff-engine hot loop (`new_frame` + `apply_diff` round-trip), mosh's `benchmark.cc`
+  equivalent.
 
 **Low value:**
 - No round-trip test for region/downward scroll, reverse-video, bell, or blink.

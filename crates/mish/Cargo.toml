@@ -27,6 +27,8 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
+# Independent reference emulator for the real-PTY differential harness.
+vt100 = "0.16.2"
 
 [[bin]]
 name = "mish-server"
