@@ -66,6 +66,29 @@ const GLITCH_REPAIR_MININTERVAL_MS: u64 = 150;
 /// `GLITCH_FLAG_THRESHOLD`).
 const GLITCH_FLAG_THRESHOLD_MS: u64 = 5000;
 
+/// A glyph that reads as blank when measuring a line's content extent (a space
+/// or the default/empty cell), so trailing blanks aren't treated as content to
+/// shift on an insert.
+fn is_blank_glyph(c: char) -> bool {
+    c == ' ' || c == '\0'
+}
+
+/// Parse state for an in-progress input escape sequence, so we can predict the
+/// cursor-moving arrow keys (`ESC [ C/D`, `ESC O C/D`) instead of abandoning
+/// prediction the moment an escape byte appears. Persists across input batches
+/// (a sequence may be split across reads).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EscPhase {
+    /// Not inside an escape sequence.
+    None,
+    /// Saw `ESC`.
+    Esc,
+    /// Saw `ESC [` (CSI).
+    Csi,
+    /// Saw `ESC O` (SS3, application-cursor-keys form).
+    Ss3,
+}
+
 #[derive(Clone)]
 struct CellPrediction {
     row: u16,
@@ -99,6 +122,8 @@ pub struct PredictionEngine {
     /// for the rest of the current input batch (the escape sequence's remaining
     /// bytes must not be echoed as text).
     suppress: bool,
+    /// In-progress input escape-sequence parse (for arrow-key prediction).
+    esc: EscPhase,
     /// Latest SRTT estimate (ms), for adaptive gating.
     srtt_ms: f64,
     /// Underline tentative (unconfirmed) predictions so they read as speculative
@@ -135,6 +160,7 @@ impl PredictionEngine {
             have_cursor: false,
             utf8: Vec::new(),
             suppress: false,
+            esc: EscPhase::None,
             srtt_ms: 0.0,
             flagging: true,
             resync_suppress: false,
@@ -263,6 +289,12 @@ impl PredictionEngine {
     }
 
     fn predict_char(&mut self, ch: char, input_index: u64, base: &Screen, now_ms: u64) {
+        // Continue an in-progress escape sequence (arrow-key prediction). Persists
+        // across batches, so check it before the per-batch `suppress` gate.
+        if self.esc != EscPhase::None {
+            self.continue_escape(ch, input_index, now_ms);
+            return;
+        }
         if self.suppress {
             return; // inside an unpredictable (escape) sequence
         }
@@ -300,9 +332,15 @@ impl PredictionEngine {
                 self.cursor_index = input_index;
                 self.cursor_at_ms = now_ms;
             }
-            // Any other control character or escape: we can't safely predict the
-            // effect, so abandon speculation and fall back to the real screen.
-            c if (c as u32) < 0x20 || c == '\u{1b}' => {
+            // Escape: begin an escape sequence — it may be an arrow key we can
+            // predict (handled by `continue_escape`); we only abandon if it turns
+            // out to be something else.
+            '\u{1b}' => {
+                self.esc = EscPhase::Esc;
+            }
+            // Any other control character: we can't safely predict the effect, so
+            // abandon speculation and fall back to the real screen.
+            c if (c as u32) < 0x20 => {
                 self.reset();
                 self.suppress = true;
             }
@@ -334,11 +372,10 @@ impl PredictionEngine {
                         self.advance_cursor();
                     }
                     _ => {
-                        let cell = Cell {
-                            c,
-                            ..Cell::default()
-                        };
-                        self.push_cell(cell, input_index, base, now_ms);
+                        // Insert mode (shells' default readline): typing in the
+                        // middle of a line shifts the rest right, so predict that
+                        // shift before placing the glyph.
+                        self.insert_char(c, input_index, base, now_ms);
                         self.advance_cursor();
                     }
                 }
@@ -348,18 +385,32 @@ impl PredictionEngine {
         }
     }
 
+    /// Push a prediction at the cursor (used for backspace/wide-char glyphs).
     fn push_cell(&mut self, cell: Cell, input_index: u64, base: &Screen, now_ms: u64) {
-        let (row, col) = (self.cursor_row, self.cursor_col);
-        // Credit this prediction only if it changes what's displayed there: an
-        // earlier prediction at the same cell if present, else the server cell.
-        let displayed = self
-            .cells
-            .iter()
-            .find(|p| p.row == row && p.col == col)
-            .map(|p| p.cell.c)
-            .or_else(|| base.cell(row, col).map(|c| c.c));
-        let credit = displayed != Some(cell.c);
-        // Replace any existing prediction at this position.
+        self.set_prediction(
+            self.cursor_row,
+            self.cursor_col,
+            cell,
+            input_index,
+            base,
+            now_ms,
+        );
+    }
+
+    /// Place (or replace) a cell prediction at an explicit position.
+    fn set_prediction(
+        &mut self,
+        row: u16,
+        col: u16,
+        cell: Cell,
+        input_index: u64,
+        base: &Screen,
+        now_ms: u64,
+    ) {
+        // Credit this prediction only if it changes what's displayed there
+        // (mosh's `CorrectNoCredit`): a prediction that merely re-asserts the
+        // existing glyph is no evidence speculation is working.
+        let credit = self.displayed_cell(row, col, base).c != cell.c;
         self.cells.retain(|p| !(p.row == row && p.col == col));
         self.cells.push(CellPrediction {
             row,
@@ -369,6 +420,91 @@ impl PredictionEngine {
             credit,
             predicted_at_ms: now_ms,
         });
+    }
+
+    /// The cell currently shown at `(row, col)`: an active prediction if present,
+    /// else the server's cell, else a blank.
+    fn displayed_cell(&self, row: u16, col: u16, base: &Screen) -> Cell {
+        if let Some(p) = self.cells.iter().find(|p| p.row == row && p.col == col) {
+            p.cell.clone()
+        } else {
+            base.cell(row, col).cloned().unwrap_or_default()
+        }
+    }
+
+    /// Insert `c` at the cursor in insert mode: shift the line's existing content
+    /// from the cursor rightward by one, then place the glyph. Only the actual
+    /// content (up to the rightmost non-blank cell) is shifted, so typing at the
+    /// end of a line stays a single-cell prediction (no whole-row churn).
+    fn insert_char(&mut self, c: char, input_index: u64, base: &Screen, now_ms: u64) {
+        let (row, col) = (self.cursor_row, self.cursor_col);
+        if let Some(end) = self.line_content_end(row, base) {
+            // Only shift when there is content *strictly to the right* of the
+            // cursor — a genuine mid-line insert. Typing at (or past) the end of a
+            // line, or over the single cell under the cursor, is an overwrite: the
+            // server replaces that cell rather than inserting, so shifting there
+            // would just cause a misprediction.
+            if col < end {
+                // Shift [col, end] right by one (dropping anything past the edge);
+                // process right-to-left so each source is read before it's moved.
+                let last = (end + 1).min(self.cols - 1);
+                for p in (col + 1..=last).rev() {
+                    let src = self.displayed_cell(row, p - 1, base);
+                    self.set_prediction(row, p, src, input_index, base, now_ms);
+                }
+            }
+        }
+        let cell = Cell {
+            c,
+            ..Cell::default()
+        };
+        self.set_prediction(row, col, cell, input_index, base, now_ms);
+    }
+
+    /// Column of the rightmost non-blank cell on `row` (predictions over base), or
+    /// `None` if the row is blank.
+    fn line_content_end(&self, row: u16, base: &Screen) -> Option<u16> {
+        (0..self.cols)
+            .rev()
+            .find(|&p| !is_blank_glyph(self.displayed_cell(row, p, base).c))
+    }
+
+    /// Continue parsing an input escape sequence, predicting the left/right arrow
+    /// keys (which just move the cursor) and abandoning prediction for anything
+    /// else (as before — we can't safely predict arbitrary escape effects).
+    fn continue_escape(&mut self, ch: char, input_index: u64, now_ms: u64) {
+        match (self.esc, ch) {
+            (EscPhase::Esc, '[') => self.esc = EscPhase::Csi,
+            (EscPhase::Esc, 'O') => self.esc = EscPhase::Ss3,
+            (EscPhase::Csi | EscPhase::Ss3, 'C') => {
+                self.esc = EscPhase::None;
+                self.predict_cursor_h(true, input_index, now_ms); // right
+            }
+            (EscPhase::Csi | EscPhase::Ss3, 'D') => {
+                self.esc = EscPhase::None;
+                self.predict_cursor_h(false, input_index, now_ms); // left
+            }
+            _ => {
+                // Not an arrow key — abandon prediction for the rest of the batch.
+                self.esc = EscPhase::None;
+                self.reset();
+                self.suppress = true;
+            }
+        }
+    }
+
+    /// Predict a one-column cursor move (right if `right`, else left), clamped to
+    /// the screen — no cell changes.
+    fn predict_cursor_h(&mut self, right: bool, input_index: u64, now_ms: u64) {
+        if right {
+            if self.cursor_col + 1 < self.cols {
+                self.cursor_col += 1;
+            }
+        } else {
+            self.cursor_col = self.cursor_col.saturating_sub(1);
+        }
+        self.cursor_index = input_index;
+        self.cursor_at_ms = now_ms;
     }
 
     fn advance_cursor(&mut self) {
@@ -824,8 +960,73 @@ mod tests {
         let base = screen_with_ack(20, 3, 0);
         p.new_user_bytes(b"a", &base, 1, 0);
         assert_eq!(p.active_predictions(), 1);
-        p.new_user_bytes(b"\x1b[A", &base, 2, 10); // arrow key → unpredictable
+        p.new_user_bytes(b"\x1b[A", &base, 2, 10); // up arrow → still unpredictable
         assert_eq!(p.active_predictions(), 0, "escape flushes predictions");
+    }
+
+    /// Left/right arrow keys (CSI and SS3 forms) are predicted as cursor moves,
+    /// instead of abandoning the overlay — so line editing stays snappy on a
+    /// laggy link.
+    #[test]
+    fn predicts_arrow_key_cursor_moves() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 3, 0);
+        p.new_user_bytes(b"abc", &base, 3, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 3);
+
+        // Left arrow (CSI form): cursor moves left, overlay kept.
+        p.new_user_bytes(b"\x1b[D", &base, 4, 0);
+        let shown = p.predicted_screen(&base);
+        assert_eq!(shown.cursor_col, 2, "left arrow moved the cursor");
+        assert_eq!(shown.cell(0, 0).unwrap().c, 'a', "typed glyphs survive the arrow");
+
+        // Right arrow (SS3 / application-cursor-keys form): back to col 3.
+        p.new_user_bytes(b"\x1bOC", &base, 5, 0);
+        assert_eq!(
+            p.predicted_screen(&base).cursor_col,
+            3,
+            "right arrow moved the cursor"
+        );
+    }
+
+    /// Typing in the *middle* of a line is predicted as an insert that shifts the
+    /// rest of the line right (shells' default readline insert mode), not an
+    /// overwrite.
+    #[test]
+    fn predicts_insert_shift_mid_line() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let mut base = screen_with_ack(20, 2, 0);
+        base.cells[0].c = 'X';
+        base.cells[1].c = 'Y';
+        base.cells[2].c = 'Z';
+        base.cursor_col = 1; // between X and Y
+
+        p.new_user_bytes(b"a", &base, 1, 0);
+        let shown = p.predicted_screen(&base);
+        assert_eq!(shown.cell(0, 0).unwrap().c, 'X', "before the cursor: unchanged");
+        assert_eq!(shown.cell(0, 1).unwrap().c, 'a', "glyph inserted at the cursor");
+        assert_eq!(shown.cell(0, 2).unwrap().c, 'Y', "rest of the line shifted right");
+        assert_eq!(shown.cell(0, 3).unwrap().c, 'Z', "…and Z too");
+        assert_eq!(shown.cursor_col, 2, "cursor advanced past the insert");
+    }
+
+    /// Typing at the end of a line stays a single-cell overwrite (no spurious
+    /// whole-row shift), so the common case is cheap and never mispredicts.
+    #[test]
+    fn end_of_line_typing_does_not_shift() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let mut base = screen_with_ack(20, 2, 0);
+        base.cells[0].c = 'X';
+        base.cells[1].c = 'Y';
+        base.cursor_col = 2; // just past the content
+
+        p.new_user_bytes(b"z", &base, 1, 0);
+        assert_eq!(
+            p.active_predictions(),
+            1,
+            "appending at the end is a single prediction, not a row shift"
+        );
+        assert_eq!(p.predicted_screen(&base).cell(0, 2).unwrap().c, 'z');
     }
 
     /// A prediction left unconfirmed past GLITCH_THRESHOLD escalates the glitch
