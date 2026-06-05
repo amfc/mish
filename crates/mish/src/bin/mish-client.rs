@@ -12,8 +12,8 @@
 //!
 //! Usage:
 //! ```text
-//! mish-client [user@]host [-- command]      # SSH bootstrap (like `mosh host`)
-//! mish-client --local [-- command]          # run the server locally (testing)
+//! mish-client [user@]host [-- command]    # SSH bootstrap (like `mosh host`)
+//! mish-client --local [-- command]        # run the server locally (testing)
 //!
 //! Options:
 //!   --local            start mish-server as a local child (no SSH)
@@ -38,6 +38,10 @@ use mish_ssp::clock::SystemClock;
 use mish_terminal::predict::PredictMode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+/// Name of the server binary this client bootstraps (locally or over SSH).
+/// Change this one constant to rebrand the server process name.
+const SERVER_BIN: &str = "mish-server";
 
 /// Quick-detach key: Ctrl-] (0x1d), same as telnet's escape.
 const DETACH: u8 = 0x1d;
@@ -186,15 +190,15 @@ fn print_usage() {
     );
 }
 
-/// Default `mish-server` command for local mode: the sibling binary next to this
-/// executable, falling back to `mish-server` on PATH.
+/// Default `mish-server` command for local mode: the sibling binary next to
+/// this executable, falling back to `mish-server` on PATH.
 fn default_local_server() -> String {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("mish-server")))
+        .and_then(|p| p.parent().map(|d| d.join(SERVER_BIN)))
         .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "mish-server".into())
+        .unwrap_or_else(|| SERVER_BIN.into())
 }
 
 #[tokio::main]
@@ -210,7 +214,7 @@ async fn main() -> Result<()> {
             .context("local bootstrap")?
     } else {
         let host = opts.host.clone().unwrap();
-        let server = opts.server_cmd.unwrap_or_else(|| "mish-server".into());
+        let server = opts.server_cmd.unwrap_or_else(|| SERVER_BIN.into());
         eprintln!("[mish-client] {} {host} {server}…", opts.ssh_argv.join(" "));
         bootstrap::ssh(
             &opts.ssh_argv,
