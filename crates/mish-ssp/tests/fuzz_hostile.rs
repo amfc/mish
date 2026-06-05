@@ -82,6 +82,17 @@ proptest! {
         let _ = core.tick(now + 1);
     }
 
+    /// The instruction codec (now deflate-compressed behind a flag byte) round-
+    /// trips any instruction: encode then decode reproduces it exactly. Arbitrary
+    /// bytes fed to `decode` already exercise the inflate path in the safety tests
+    /// below; this pins the happy path including the compressed branch.
+    #[test]
+    fn codec_roundtrips(inst in arb_instruction()) {
+        let encoded = inst.encode();
+        let decoded = Instruction::decode(&encoded);
+        prop_assert_eq!(decoded.as_ref(), Some(&inst));
+    }
+
     /// Arbitrary datagram bytes through the full reassemble->decode->recv pipeline
     /// never panic.
     #[test]

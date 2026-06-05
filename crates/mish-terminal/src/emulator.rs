@@ -147,7 +147,8 @@ impl Emulator {
     /// (terminal query replies the server must write back to the child PTY).
     /// Empties the buffer.
     pub fn take_answerback(&self) -> Vec<u8> {
-        std::mem::take(&mut self.listener.answerback.lock().unwrap())
+        let mut buf = self.listener.answerback.lock().unwrap();
+        std::mem::take(&mut *buf)
     }
 
     /// Resize the emulated screen.
