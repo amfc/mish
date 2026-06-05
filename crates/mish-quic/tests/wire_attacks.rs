@@ -178,3 +178,46 @@ async fn off_path_injection_does_not_disrupt() {
     .expect("off-path junk must neither disrupt nor hijack the session");
     task.abort();
 }
+
+/// A pre-handshake junk flood (garbage UDP arriving before any legitimate
+/// connection) must not exhaust or crash the server: a real client can still
+/// connect and converge afterwards. (QUIC's 3x anti-amplification limit — the
+/// server never reflects more than 3x an unvalidated peer's bytes — is enforced
+/// by quinn and isn't re-tested here; that would require spoofed-Initial packet
+/// crafting against the QUIC stack itself.)
+#[tokio::test]
+async fn server_survives_pre_handshake_junk_flood() {
+    let (server_ep, addr, _cert) = transport::loopback_server().unwrap();
+    let clk = clock();
+    let (tx, rx) = oneshot::channel::<Handle>();
+    let srv_clk = clk.clone();
+    let task = tokio::spawn(async move {
+        if let Ok(t) = transport::accept(&server_ep).await {
+            let _ = tx.send(spawn_driver(t, srv_clk));
+        }
+        std::future::pending::<()>().await;
+    });
+
+    // Flood the server port with garbage *before* any handshake.
+    let attacker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for i in 0..500u32 {
+        let junk = [(i & 0xff) as u8; 200];
+        let _ = attacker.send_to(&junk, addr);
+    }
+
+    // A legitimate client still connects and converges.
+    let client_ep = transport::loopback_client().unwrap();
+    let t = transport::connect(&client_ep, addr, "localhost")
+        .await
+        .expect("server still accepts a real client after the junk flood");
+    let mut client = spawn_driver(t, clk);
+    let server = rx.await.expect("server handle");
+    server.set_local(BytesState::new(b"alive after flood".to_vec()));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        await_state(&mut client, b"alive after flood"),
+    )
+    .await
+    .expect("server must remain usable after a pre-handshake junk flood");
+    task.abort();
+}
