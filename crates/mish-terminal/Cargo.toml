@@ -16,3 +16,4 @@ unicode-width = "0.2"
 
 [dev-dependencies]
 proptest = { workspace = true }
+vt100 = "0.16.2"

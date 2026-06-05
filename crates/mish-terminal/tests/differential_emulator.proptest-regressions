@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d67707f2caf82a5dcb7e924d081725a2d76cb04c67cf25b96b57acbc9f41d9ef # shrinks to cmds = [Place { row: 0, col: 0, text: "!" }, Place { row: 1, col: 0, text: "" }, Erasedisplay(1)]

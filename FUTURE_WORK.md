@@ -55,5 +55,10 @@ Today `PredictMode::Adaptive` gates display purely on SRTT
 - **Diff: full mosh scroll-region optimization** — we detect whole-screen
   scroll-up; mosh also handles scroll *regions* (DECSTBM) and downward scroll.
   Minor bandwidth, not correctness.
-- **e2e adversarial fuzzing** — we fuzz decode/apply; a full session fuzzer
-  (random datagrams against a live `Driver`) would harden the integration layer.
+- **`CSI 1 J` (erase-above) divergence from vt100** — *small, inherited.* The
+  differential emulator test (`tests/differential_emulator.rs`) found that our
+  alacritty backend, on `CSI 1 J` with the cursor on row 1, leaves row 0 intact,
+  whereas vt100/xterm clear it ("erase above, inclusive"). alacritty is correct
+  for cursor rows >= 2 and for `CSI 0 J`/`CSI 2 J`. Repro:
+  `\x1b[1;1H!\x1b[2;1H\x1b[1J`. Rare in practice; a fix would live in (or be
+  worked around above) the alacritty dependency.
