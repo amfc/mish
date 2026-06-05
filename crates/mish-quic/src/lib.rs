@@ -34,3 +34,7 @@ pub use rustls::pki_types::CertificateDer;
 /// Re-exported so `mish-server` can hold a pre-built config across a fork
 /// without depending on `quinn` directly.
 pub use quinn::ServerConfig;
+
+/// Re-exported so downstream crates can name the side-channel stream halves
+/// (from [`QuicTransport::open_side_channel`]) without depending on `quinn`.
+pub use quinn::{RecvStream, SendStream};

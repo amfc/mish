@@ -170,6 +170,45 @@ impl Emulator {
         self.term.screen_lines() as u16
     }
 
+    /// Wrap a fresh emulator in a shareable `Arc<Mutex<…>>` — the form the server
+    /// session and the scrollback side-channel both hold (the server feeds it;
+    /// the history server reads its scrollback). Locks are always brief.
+    pub fn shared(cols: u16, rows: u16) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self::new(cols, rows)))
+    }
+
+    /// Number of scrollback (history) lines currently retained *above* the
+    /// visible screen — how far back a client can scroll.
+    pub fn history_size(&self) -> u32 {
+        self.term.grid().history_size() as u32
+    }
+
+    /// Read a window of `count` rows for scrollback display, starting
+    /// `top_above` lines above the top visible row (`top_above == 0` starts at
+    /// the live top row; larger values reach further into history). The window
+    /// may straddle history and the visible screen; rows outside the available
+    /// range (older than the oldest history line, or below the screen) are
+    /// omitted. Each row is the same `Cell` vector as a [`Screen`] row.
+    pub fn history_lines(&self, top_above: u32, count: u16) -> Vec<Vec<Cell>> {
+        let grid = self.term.grid();
+        let cols = self.term.columns();
+        let screen_rows = self.term.screen_lines() as i64;
+        let history = grid.history_size() as i64;
+
+        // First requested grid line: negative = history, >= 0 = visible screen.
+        let start = -(top_above as i64);
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count as i64 {
+            let line = start + i;
+            if line < -history || line >= screen_rows {
+                continue; // outside the retained range
+            }
+            let row = &grid[Line(line as i32)];
+            out.push((0..cols).map(|c| convert_cell(&row[Column(c)])).collect());
+        }
+        out
+    }
+
     /// Capture the current visible screen as a synchronizable [`Screen`].
     pub fn snapshot(&self) -> Screen {
         let cols = self.term.columns();

@@ -6,7 +6,7 @@
 //! over the in-memory transport with a fake PTY (see `tests/loopback.rs`). The
 //! binary wires a real `portable-pty` child into these channels.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mish_ssp::clock::Clock;
 use mish_ssp::core::SspConfig;
@@ -28,12 +28,16 @@ pub enum PtyControl {
 
 /// Run a server session until the PTY closes (child exits) or the peer leaves.
 ///
+/// * `emu` is the shared emulator the server feeds; it is held in an
+///   `Arc<Mutex<…>>` so a concurrent **scrollback** server
+///   ([`crate::scrollback::serve_history`]) can read its history. Locks here are
+///   always brief and never span an `.await`, so there's no contention with the
+///   live session loop.
 /// * `pty_output` yields raw bytes produced by the child process.
 /// * `pty_input` receives [`PtyControl`] messages to apply to the child.
 pub async fn run_server<T: Transport>(
     transport: Arc<T>,
-    cols: u16,
-    rows: u16,
+    emu: Arc<Mutex<Emulator>>,
     clock: Arc<dyn Clock>,
     network_timeout: Option<std::time::Duration>,
     mut pty_output: mpsc::Receiver<Vec<u8>>,
@@ -43,7 +47,6 @@ pub async fn run_server<T: Transport>(
         Driver::<T, Screen, UserStream>::with(transport, clock, SspConfig::default());
     driver.spawn();
 
-    let mut emu = Emulator::new(cols, rows);
     // How many user events we've already applied to the PTY (the echo ack).
     let mut processed: u64 = 0;
     let publish = |emu: &Emulator, processed: u64| {
@@ -51,7 +54,7 @@ pub async fn run_server<T: Transport>(
         screen.echo_ack = processed;
         screen
     };
-    handle.set_local(publish(&emu, processed));
+    handle.set_local(publish(&emu.lock().unwrap(), processed));
 
     let mut remote = handle.subscribe_remote();
     // Idle watchdog: if we don't hear from the client (no inbound state, not
@@ -70,17 +73,23 @@ pub async fn run_server<T: Transport>(
             out = pty_output.recv() => {
                 match out {
                     Some(bytes) => {
-                        emu.feed(&bytes);
-                        // Host answerbacks (DA/DSR/CPR/OSC color/size replies) the
-                        // child's query sequences produced must go back to its
-                        // input, or programs that probe the terminal hang.
-                        let reply = emu.take_answerback();
-                        if !reply.is_empty()
-                            && pty_input.send(PtyControl::Input(reply)).is_err()
-                        {
-                            return;
-                        }
-                        handle.set_local(publish(&emu, processed));
+                        // Brief lock: feed, drain answerbacks, snapshot — all
+                        // synchronous, no .await held across the guard.
+                        let screen = {
+                            let mut e = emu.lock().unwrap();
+                            e.feed(&bytes);
+                            // Host answerbacks (DA/DSR/CPR/OSC color/size replies)
+                            // the child's query sequences produced must go back to
+                            // its input, or programs that probe the terminal hang.
+                            let reply = e.take_answerback();
+                            if !reply.is_empty()
+                                && pty_input.send(PtyControl::Input(reply)).is_err()
+                            {
+                                return;
+                            }
+                            publish(&e, processed)
+                        };
+                        handle.set_local(screen);
                     }
                     None => break, // child exited
                 }
@@ -93,28 +102,32 @@ pub async fn run_server<T: Transport>(
                 // Heard from the client (input or keepalive) — reset the watchdog.
                 last_heard = tokio::time::Instant::now();
                 let stream = remote.borrow_and_update().clone();
-                for ev in stream.events_since(processed) {
-                    match ev {
-                        UserEvent::Keystroke(b) => {
-                            if pty_input.send(PtyControl::Input(b.clone())).is_err() {
-                                return;
+                let screen = {
+                    let mut e = emu.lock().unwrap();
+                    for ev in stream.events_since(processed) {
+                        match ev {
+                            UserEvent::Keystroke(b) => {
+                                if pty_input.send(PtyControl::Input(b.clone())).is_err() {
+                                    return;
+                                }
                             }
-                        }
-                        UserEvent::Resize { cols, rows } => {
-                            if pty_input
-                                .send(PtyControl::Resize { cols: *cols, rows: *rows })
-                                .is_err()
-                            {
-                                return;
+                            UserEvent::Resize { cols, rows } => {
+                                if pty_input
+                                    .send(PtyControl::Resize { cols: *cols, rows: *rows })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                e.resize(*cols, *rows);
                             }
-                            emu.resize(*cols, *rows);
                         }
                     }
-                }
-                processed = stream.total();
-                // Publish the new echo ack (and any geometry change) so the
-                // client can validate its predictions.
-                handle.set_local(publish(&emu, processed));
+                    processed = stream.total();
+                    // Publish the new echo ack (and any geometry change) so the
+                    // client can validate its predictions.
+                    publish(&e, processed)
+                };
+                handle.set_local(screen);
             }
         }
     }

@@ -19,6 +19,7 @@ pub mod bootstrap;
 pub mod client;
 pub mod locale;
 pub mod pty;
+pub mod scrollback;
 pub mod server;
 
 pub use bootstrap::Bootstrap;

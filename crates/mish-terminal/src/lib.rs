@@ -19,6 +19,7 @@
 
 pub mod display;
 pub mod emulator;
+pub mod history;
 pub mod notification;
 pub mod predict;
 pub mod render;

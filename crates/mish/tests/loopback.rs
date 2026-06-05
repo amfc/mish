@@ -25,8 +25,7 @@ async fn server_exits_after_network_timeout() {
 
     let server = tokio::spawn(run_server(
         Arc::new(server_t),
-        80,
-        24,
+        mish_terminal::emulator::Emulator::shared(80, 24),
         clock,
         Some(Duration::from_secs(10)),
         pty_out_rx,
@@ -64,8 +63,7 @@ async fn answerback_written_back_to_pty() {
     let (pty_in_tx, mut pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
     tokio::spawn(run_server(
         Arc::new(server_t),
-        80,
-        24,
+        mish_terminal::emulator::Emulator::shared(80, 24),
         clock,
         None,
         pty_out_rx,
@@ -100,8 +98,7 @@ async fn server_output_reaches_client_and_input_reaches_server() {
     let (pty_in_tx, mut pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
     tokio::spawn(run_server(
         Arc::new(ta),
-        80,
-        24,
+        mish_terminal::emulator::Emulator::shared(80, 24),
         clock.clone(),
         None,
         pty_out_rx,
@@ -163,8 +160,7 @@ async fn redraw_forces_full_repaint() {
     let (pty_in_tx, _pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
     tokio::spawn(run_server(
         Arc::new(ta),
-        80,
-        24,
+        mish_terminal::emulator::Emulator::shared(80, 24),
         clock.clone(),
         None,
         pty_out_rx,
@@ -218,8 +214,7 @@ async fn client_resize_propagates_to_server_pty() {
     let (pty_in_tx, mut pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
     tokio::spawn(run_server(
         Arc::new(ta),
-        80,
-        24,
+        mish_terminal::emulator::Emulator::shared(80, 24),
         clock.clone(),
         None,
         pty_out_rx,

@@ -26,8 +26,7 @@ async fn real_shell_output_reaches_client() {
     let pty = PtyProcess::spawn("/bin/sh", 80, 24).expect("spawn shell on PTY");
     tokio::spawn(run_server(
         Arc::new(ta),
-        80,
-        24,
+        mish_terminal::emulator::Emulator::shared(80, 24),
         clock.clone(),
         None,
         pty.output,
@@ -77,8 +76,7 @@ async fn flow_control_does_not_deadlock() {
     let pty = PtyProcess::spawn("/bin/sh", 80, 24).expect("spawn shell on PTY");
     tokio::spawn(run_server(
         Arc::new(ta),
-        80,
-        24,
+        mish_terminal::emulator::Emulator::shared(80, 24),
         clock.clone(),
         None,
         pty.output,

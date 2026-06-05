@@ -211,10 +211,18 @@ async fn serve(
     let clock = Arc::new(SystemClock::new());
     let network_timeout = Some(env_secs("MOSH_SERVER_NETWORK_TMOUT", 300));
 
+    // Shared emulator: the session loop feeds it; the scrollback server reads its
+    // history. Spawn the history server alongside the live session.
+    let transport = Arc::new(t);
+    let emu = mish_terminal::emulator::Emulator::shared(cols, rows);
+    tokio::spawn(mish::scrollback::serve_history(
+        transport.clone(),
+        emu.clone(),
+    ));
+
     run_server(
-        Arc::new(t),
-        cols,
-        rows,
+        transport,
+        emu,
         clock,
         network_timeout,
         pty.output,
