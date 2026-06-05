@@ -75,3 +75,22 @@ jobs:
       # than unit-coverable.
       - name: Coverage
         run: cargo llvm-cov --workspace --fail-under-lines 85
+
+  fuzz:
+    name: fuzz smoke (libFuzzer + ASan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+      # Coverage-guided smoke run of each target: a bounded fresh-corpus pass that
+      # gates regressions (a reintroduced panic surfaces within seconds — this is
+      # how the screen_apply zero-dimension crash was caught). Not a substitute
+      # for a long out-of-band fuzzing campaign.
+      - name: Fuzz targets
+        run: |
+          for t in instruction_decode screen_apply diff_roundtrip; do
+            cargo fuzz run "$t" -- -max_total_time=40 -print_final_stats=1
+          done

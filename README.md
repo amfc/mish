@@ -107,7 +107,8 @@ the independent UDP/QUIC path.
 | Terminal | screen-diff & user-stream PBTs, emulator VT parsing, client/server convergence over the sim (incl. 40% loss) | `mish-terminal/tests/*` |
 | Fragmentation | split/reassemble round-trip, out-of-order, lost-fragment | `mish-ssp/src/frag.rs` |
 | Full stack | headless loopback, real PTY shell, daemonization, SSH/local bootstrap, real QUIC + real PTY end-to-end | `mosh/tests/*` |
-| Fuzz/robustness | no-panic on arbitrary wire bytes / screen diffs / VT input; hostile-peer instructions (bounded, no-panic) + prediction-engine fuzz; `cargo-fuzz` scaffold | `*/tests/fuzz_*.rs`, `fuzz/` |
+| Fuzz/robustness | no-panic on arbitrary wire bytes / screen diffs / VT input; hostile-peer instructions (bounded, no-panic) + prediction-engine fuzz | `*/tests/fuzz_*.rs` |
+| Coverage-guided fuzz | libFuzzer + ASan targets (decode, screen-diff apply, emulator-driven diff round-trip) run as a CI smoke gate | `fuzz/` |
 | Diff round-trip fuzz | structured-VT sequences + real-shell PTY replay, asserting the wire diff reproduces every screen transition | `mish-terminal/tests/fuzz_diff.rs`, `mosh/tests/replay.rs` |
 | Transparency | client's reconstructed screen == server's emulator screen, over the full stack + deterministically under loss | `mosh/tests/transparency.rs` |
 | Live-Driver fuzz | the async event loop survives a sustained garbage-datagram flood interleaved with honest traffic and still converges | `mish-ssp/tests/fuzz_driver_live.rs` |
@@ -118,8 +119,10 @@ the independent UDP/QUIC path.
 The fuzz/round-trip harnesses earned their keep: they found and fixed several
 real bugs — a Driver CPU spin on a closed handle, a screen-diff OOM on a
 malformed header, control-character and scroll-with-pen diff corruption, the
-wide-char model, a panic on a malformed `BytesState` diff, and an out-of-bounds
-in the prediction UTF-8 decoder.
+wide-char model, a panic on a malformed `BytesState` diff, an out-of-bounds in
+the prediction UTF-8 decoder, and (via the libFuzzer `screen_apply` target) a
+zero-dimension diff header that slipped past the cell-count guard and panicked
+the emulator grid.
 
 ```sh
 cargo test          # everything
@@ -198,9 +201,9 @@ mish equivalents.
       minimal-SGR** diff; `mish-server` **`-p` port range / `-l` locale /
       signal-timeout**; a **`madsim`** deterministic engine (`mish-madsim`,
       `--cfg madsim`) alongside turmoil; **fuzz/robustness** tests (proptest
-      no-panic on arbitrary wire/diff bytes, plus a `cargo-fuzz` scaffold in
-      `fuzz/`); builds on **stable** Rust with a **GitHub Actions CI**
-      (fmt/clippy/test + madsim). *(done)*
+      no-panic on arbitrary wire/diff bytes, plus **coverage-guided `cargo-fuzz`**
+      targets run under ASan in CI); builds on **stable** Rust with a **GitHub
+      Actions CI** (fmt/clippy/test + madsim + Miri + coverage + fuzz). *(done)*
 
 ## Toolchain, fuzzing & CI
 

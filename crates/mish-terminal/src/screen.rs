@@ -234,9 +234,12 @@ impl SyncState for Screen {
         let rows = u16::from_le_bytes([diff[10], diff[11]]);
         let ansi = &diff[DIFF_HEADER..];
 
-        // Reject implausibly large geometries from a malformed/hostile diff,
-        // which would otherwise allocate an enormous grid.
-        if cols as u32 * rows as u32 > MAX_SCREEN_CELLS {
+        // Reject degenerate or implausibly large geometries from a malformed/
+        // hostile diff. A zero dimension slips past the product check (0 × huge ==
+        // 0) yet makes the emulator's grid panic building a zero-width/height row;
+        // an enormous product would allocate an absurd grid. A real screen is
+        // always at least 1×1 (the initial 0×0 state never reaches apply_diff).
+        if cols == 0 || rows == 0 || cols as u32 * rows as u32 > MAX_SCREEN_CELLS {
             return;
         }
 
@@ -258,5 +261,40 @@ impl SyncState for Screen {
 
     fn equals(&self, other: &Self) -> bool {
         self == other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (found by the `screen_apply` cargo-fuzz target): a diff header
+    /// declaring a zero dimension slips past the cell-count guard (0 × huge == 0)
+    /// but makes the emulator's grid panic building a zero-width row. apply_diff
+    /// must reject degenerate and oversized geometries without panicking.
+    #[test]
+    fn malformed_diff_geometry_does_not_panic() {
+        let make = |cols: u16, rows: u16| {
+            let mut d = Vec::new();
+            d.extend_from_slice(&0u64.to_le_bytes()); // echo_ack
+            d.extend_from_slice(&cols.to_le_bytes());
+            d.extend_from_slice(&rows.to_le_bytes());
+            d.push(b'\n'); // some escape-stream payload
+            d
+        };
+        for (cols, rows) in [(0, 0xe6e6), (0xe6e6, 0), (0, 0), (u16::MAX, u16::MAX)] {
+            let mut s = Screen::blank(80, 24);
+            s.apply_diff(&make(cols, rows)); // must not panic
+                                             // Degenerate/oversized geometry is rejected → screen left unchanged.
+            assert_eq!((s.cols, s.rows), (80, 24));
+        }
+    }
+
+    #[test]
+    fn short_diff_is_noop() {
+        let mut s = Screen::blank(80, 24);
+        s.apply_diff(&[]); // empty
+        s.apply_diff(&[1, 2, 3]); // shorter than the header
+        assert_eq!((s.cols, s.rows), (80, 24));
     }
 }
