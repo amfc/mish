@@ -192,9 +192,11 @@ All lower-value polish — no correctness or security stakes remain. Ranked:
    `bootstrap::shell_split` (unit-tested) + `client_cli.rs` (version/help/bad-
    predict/missing-host). *Remaining: server `--version`/`--help`, `-c` color
    advertise.*
-3. **`#38`** — PTY `IUTF8` flag (may be blocked by portable-pty), three-leg
-   shutdown-handshake parity. (Initial winsize is already taken from the real
-   terminal.)
+3. **`#38`** — *done.* PTY `IUTF8` flag set via the master fd
+   (`pty::enable_iutf8`, `iutf8_set_via_master_reaches_slave`); three-leg
+   shutdown handshake confirmed loss-tolerant
+   (`core_unit::shutdown_converges_under_loss`). Initial winsize was already
+   taken from the real terminal.
 4. **`#35`** — SSP ECN throttle / prospective-resend / conditional idle shutdown.
    Largely subsumed by QUIC's congestion control; low value.
 5. **`#39`** — real-terminal (PTY-driven) reference harness + diff-engine

@@ -115,8 +115,13 @@ overlay) are all done. These are the remaining parity polish:
   *Remaining (lower value):* server `--version`/`--help`/banner, `-c` color
   advertisement, and `--predict-overwrite` (needs the unimplemented
   `predict_overwrite` engine path).
-- **Initial window size from `TIOCGWINSZ` + PTY `IUTF8` input flag.** (The client
-  already reports the real size via `crossterm::size()`; IUTF8 may be blocked by
-  portable-pty.) Three-leg shutdown-handshake parity.
+- **Initial window size from `TIOCGWINSZ` + PTY `IUTF8` input flag** — *done.*
+  The client already reports the real size via `crossterm::size()`, and the
+  server now sets `IUTF8` on the PTY (via the master fd, which shares the
+  line-discipline termios on Linux) so cooked-mode erase deletes whole multibyte
+  characters (`pty::enable_iutf8`, tested). The **three-leg shutdown handshake**
+  is in place and loss-tolerant — the core resends `SHUTDOWN_NUM` at the frame
+  rate until acked, so both sides reach a clean close even under datagram loss
+  (`core_unit::shutdown_converges_under_loss`).
 - **Test harnesses: real-terminal reference (PTY-driven, beyond vt100) and a
   diff-engine throughput benchmark (mosh's `benchmark.cc`).**

@@ -120,14 +120,17 @@ TLS verification" line is stale, but the *client-auth* direction is the real gap
 - Icon name (OSC 1) collapsed into window title; no title stack; **no `[mosh]` title prefix**
   (the prefix is undocumented as a gap).
 - Scroll optimization is whole-screen-up only; no DECSTBM sub-region/downward scroll (DOC'd).
-- Shutdown handshake completion weaker than upstream's three legs.
+- Shutdown handshake — *resolved.* The three-leg handshake (initiate → mirror+ack →
+  ack) is in place and loss-tolerant: the core resends `SHUTDOWN_NUM` until acked, so
+  both sides close cleanly even under datagram loss (`core_unit::shutdown_converges_under_loss`).
 - `apply_diff` doesn't enforce `echo_ack` monotonicity / `diff_from` invariant.
 - `PredictMode::Experimental` not implemented; adaptive SRTT gate uses a single RTT threshold
   instead of `send_interval` with hysteresis; underline flagging static not latency-driven;
   `MOSH_PREDICTION_OVERWRITE` (insert vs overwrite) absent.
 - No client `-v` verbose / diff self-check mode; **Ctrl-L** does not force a full repaint.
-- Initial window size hardcoded **80x24** instead of `TIOCGWINSZ` from stdin; child PTY
-  `IUTF8` input flag never set (kernel erase of multibyte chars in cooked mode).
+- Initial window size hardcoded **80x24** instead of `TIOCGWINSZ` from stdin — *resolved*
+  (client reports the real `crossterm::size()`); child PTY `IUTF8` input flag — *resolved*
+  (`pty::enable_iutf8`, kernel erase of multibyte chars in cooked mode).
 - `mish-server` lacks `--version`/`--help`/banner; no `-v`.
 - No `--family`/`-4`/`-6`; no `--no-init` (`MOSH_NO_TERM_INIT`, suppress smcup/rmcup); no
   `--experimental-remote-ip`; no `-c` color advertisement (TERM hardcoded).

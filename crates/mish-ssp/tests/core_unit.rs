@@ -142,6 +142,55 @@ fn shutdown_handshake_both_sides_close() {
     assert!(b.peer_is_shutting_down());
 }
 
+/// The three-leg shutdown handshake completes even when shutdown datagrams are
+/// lost: the core resends SHUTDOWN_NUM at the frame rate until acked, so both
+/// sides still reach a clean close (mosh's SHUTDOWN_RETRIES robustness). Run
+/// across several drop patterns for confidence.
+#[test]
+fn shutdown_converges_under_loss() {
+    for seed in [1u64, 7, 42, 1234, 99999] {
+        let mut a = Core::new(0);
+        let mut b = Core::new(0);
+        a.start_shutdown();
+
+        // Deterministic ~40%-loss xorshift, distinct per seed.
+        let mut rng = seed.wrapping_mul(2654435761).wrapping_add(1);
+        let mut drop = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % 5 < 2 // ~40%
+        };
+
+        let mut now = 0u64;
+        let mut closed = false;
+        for _ in 0..2000 {
+            now += 20;
+            for inst in a.tick(now) {
+                if !drop() {
+                    b.recv(now, &inst);
+                }
+            }
+            if b.peer_is_shutting_down() {
+                b.start_shutdown();
+            }
+            for inst in b.tick(now) {
+                if !drop() {
+                    a.recv(now, &inst);
+                }
+            }
+            if a.is_shutdown_acked() && b.is_shutdown_acked() {
+                closed = true;
+                break;
+            }
+        }
+        assert!(
+            closed,
+            "shutdown handshake should converge under loss (seed {seed})"
+        );
+    }
+}
+
 #[test]
 fn malformed_diff_does_not_panic() {
     // A diff that isn't a valid BytesState diff: recv must not panic in release;

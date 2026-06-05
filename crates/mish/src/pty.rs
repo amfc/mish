@@ -43,6 +43,15 @@ impl PtyProcess {
             pixel_height: 0,
         })?;
 
+        // Tell the line discipline the child's input is UTF-8 so a cooked-mode
+        // erase (backspace) deletes a whole multibyte character, not one byte
+        // (mosh sets IUTF8 on the slave). On Linux the pty's termios is shared,
+        // so setting it via the master fd reaches the slave. Best-effort.
+        #[cfg(unix)]
+        if let Some(fd) = pair.master.as_raw_fd() {
+            enable_iutf8(fd);
+        }
+
         let mut cmd = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
         cmd.env("TERM", "xterm-256color");
         let mut child = pair.slave.spawn_command(cmd)?;
@@ -110,6 +119,22 @@ fn login_argv_for(shell: &str) -> Vec<String> {
     vec![shell.to_string(), "-l".to_string()]
 }
 
+/// Set the `IUTF8` input flag on the terminal behind `fd`. Used so the kernel's
+/// canonical-mode line editor erases whole UTF-8 characters. Best-effort: a
+/// `tcgetattr`/`tcsetattr` failure (e.g. not a tty) is ignored.
+#[cfg(unix)]
+fn enable_iutf8(fd: std::os::unix::io::RawFd) {
+    use std::mem::MaybeUninit;
+    unsafe {
+        let mut termios = MaybeUninit::<libc::termios>::uninit();
+        if libc::tcgetattr(fd, termios.as_mut_ptr()) == 0 {
+            let mut termios = termios.assume_init();
+            termios.c_iflag |= libc::IUTF8;
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +143,44 @@ mod tests {
     fn login_argv_invokes_shell_with_dash_l() {
         assert_eq!(login_argv_for("/bin/bash"), vec!["/bin/bash", "-l"]);
         assert_eq!(login_argv_for("/usr/bin/zsh"), vec!["/usr/bin/zsh", "-l"]);
+    }
+
+    /// `enable_iutf8` on the pty master sets IUTF8 on the slave's line discipline
+    /// (they share termios on Linux). Verifies our mosh-parity IUTF8 plumbing.
+    #[cfg(unix)]
+    #[test]
+    fn iutf8_set_via_master_reaches_slave() {
+        use std::mem::MaybeUninit;
+        unsafe {
+            let (mut master, mut slave) = (0, 0);
+            let rc = libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert_eq!(rc, 0, "openpty failed");
+
+            // Start from a known state: clear IUTF8 on the slave.
+            let mut t = MaybeUninit::<libc::termios>::uninit();
+            assert_eq!(libc::tcgetattr(slave, t.as_mut_ptr()), 0);
+            let mut t = t.assume_init();
+            t.c_iflag &= !libc::IUTF8;
+            assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &t), 0);
+
+            // Our helper, applied to the master fd.
+            enable_iutf8(master);
+
+            // The slave now sees IUTF8 set.
+            let mut t2 = MaybeUninit::<libc::termios>::uninit();
+            assert_eq!(libc::tcgetattr(slave, t2.as_mut_ptr()), 0);
+            let t2 = t2.assume_init();
+            let set = t2.c_iflag & libc::IUTF8 != 0;
+
+            libc::close(master);
+            libc::close(slave);
+            assert!(set, "IUTF8 should be set on the slave via the master fd");
+        }
     }
 }
