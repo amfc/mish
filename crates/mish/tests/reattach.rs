@@ -5,7 +5,7 @@
 //! was attached.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mish::persist::{AttachEnd, PersistentSession};
 use mish::server::PtyControl;
@@ -16,7 +16,7 @@ use mish_ssp::session::{Driver, Session, SessionError, SessionHandle};
 use mish_terminal::emulator::Emulator;
 use mish_terminal::screen::Screen;
 use mish_terminal::user::UserStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 /// A minimal client over the in-memory transport: a Driver that syncs the
@@ -88,7 +88,7 @@ async fn session_persists_across_reattach() {
 
     // --- Client A attaches: must see the pre-attach output (full resync). ---
     let (sa, ca) = memory::pair();
-    let a_end = tokio::spawn(session.clone().attach(Arc::new(sa), net));
+    let a_end = tokio::spawn(session.clone().attach(Arc::new(sa), net, std::future::pending::<()>()));
     let mut a = Client::spawn(ca, clock.clone());
     a.expect_contains("LINE_ONE").await;
 
@@ -109,11 +109,69 @@ async fn session_persists_across_reattach() {
 
     // --- Client B reattaches on a fresh connection: must see ALL three lines. ---
     let (sb, cb) = memory::pair();
-    let b_end = tokio::spawn(session.clone().attach(Arc::new(sb), net));
+    let b_end = tokio::spawn(session.clone().attach(Arc::new(sb), net, std::future::pending::<()>()));
     let mut b = Client::spawn(cb, clock.clone());
     b.expect_contains("LINE_ONE").await; // survived the whole time
     b.expect_contains("LINE_THREE").await; // produced during the disconnect gap
 
     b.disconnect();
     let _ = b_end.await;
+}
+
+/// A new connection must be able to *preempt* a still-attached client, instead of
+/// waiting out the idle timeout. This is the "reattach after a hard drop" case:
+/// the old client's connection never closed (laptop slept, Wi-Fi vanished — no
+/// close frame), so `attach` would otherwise sit in its idle watchdog for the
+/// full `network_timeout` (up to 5 minutes by default) before the daemon loops
+/// back to `accept()` — blocking the reattach the whole time.
+///
+/// We use a long idle timeout so *only* preemption — not the timeout — can end
+/// the attachment promptly, and signal the preempt the way `serve_persistent`
+/// does when its `accept()` yields a newcomer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_connection_preempts_live_attachment() {
+    let (pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (pty_in_tx, _pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let emu = Emulator::shared(80, 24);
+    let session = Arc::new(PersistentSession::spawn(
+        emu,
+        clock.clone(),
+        pty_out_rx,
+        pty_in_tx,
+    ));
+
+    // A long idle timeout: if preemption didn't work, the attachment could only
+    // end via this 30s timeout (the client below stays live), so a prompt return
+    // proves the preempt path, not the fallback.
+    let net = Some(Duration::from_secs(30));
+    let (sa, ca) = memory::pair();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let a_end = tokio::spawn(session.clone().attach(Arc::new(sa), net, async move {
+        let _ = cancel_rx.await;
+    }));
+    // Client A is live and active — it is NOT disconnecting.
+    let mut a = Client::spawn(ca, clock.clone());
+    pty_out_tx.send(b"ATTACHED\r\n".to_vec()).await.unwrap();
+    a.expect_contains("ATTACHED").await;
+
+    // A new client arrives; `serve_persistent` accepts it and preempts A.
+    let t0 = Instant::now();
+    cancel_tx.send(()).unwrap();
+
+    let end = tokio::time::timeout(Duration::from_secs(2), a_end)
+        .await
+        .expect("preempt must end the attachment promptly, not wait the 30s idle timeout")
+        .expect("attach task joined");
+    assert_eq!(
+        end,
+        AttachEnd::Disconnected,
+        "a preempted attachment ends as Disconnected so the session lives on for the newcomer"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "preempt should be near-instant, got {:?}",
+        t0.elapsed()
+    );
+    drop(a);
 }

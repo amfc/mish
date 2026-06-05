@@ -108,10 +108,17 @@ impl PersistentSession {
     /// child exits. The (re)attaching client gets a full repaint of the current
     /// screen automatically (a fresh SSP session re-syncs from scratch). Takes
     /// `Arc<Self>` so it can be spawned concurrently (the binary loops over it).
+    /// `cancel` lets the caller **preempt** this attachment: when it resolves,
+    /// `attach` returns [`AttachEnd::Disconnected`] promptly without waiting out
+    /// `network_timeout`. The binary fires it when a *new* connection arrives, so
+    /// a reattach (e.g. after a hard drop that never closed the old connection)
+    /// takes over immediately instead of blocking for up to 5 minutes. Pass
+    /// `std::future::pending()` to opt out.
     pub async fn attach<T: Transport>(
         self: Arc<Self>,
         transport: Arc<T>,
         network_timeout: Option<Duration>,
+        cancel: impl std::future::Future<Output = ()> + Send,
     ) -> AttachEnd {
         let (driver, handle) =
             Driver::<T, Screen, UserStream>::with(transport, self.clock.clone(), SspConfig::default());
@@ -133,13 +140,26 @@ impl PersistentSession {
             return AttachEnd::ChildExited;
         }
 
+        tokio::pin!(cancel);
         let mut last_heard = tokio::time::Instant::now();
         loop {
             let idle = network_timeout.map(|t| tokio::time::sleep_until(last_heard + t));
             tokio::select! {
+                // A new connection is taking over (see the `cancel` doc above).
+                // Drop this attachment now — don't wait out the idle timeout — and
+                // abort its now-orphaned driver. The session lives on for the
+                // newcomer, so this is a Disconnected, not a ChildExited.
+                _ = &mut cancel => {
+                    tracing::info!(target: "mish::persist", "attachment preempted by a new connection");
+                    driver_task.abort();
+                    return AttachEnd::Disconnected;
+                }
                 _ = async { idle.unwrap().await }, if network_timeout.is_some() => {
                     // Client quiet too long: end this attachment but keep the
-                    // session alive for a later reattach.
+                    // session alive for a later reattach. Abort the driver, whose
+                    // connection is gone.
+                    tracing::info!(target: "mish::persist", "client idle past network timeout; awaiting reattach");
+                    driver_task.abort();
                     return AttachEnd::Disconnected;
                 }
                 _ = done_rx.changed() => {
@@ -161,8 +181,11 @@ impl PersistentSession {
                 changed = remote.changed() => {
                     if changed.is_err() {
                         // Driver stopped — the connection is gone. Keep the
-                        // session for reattach.
+                        // session for reattach. (The driver has already exited;
+                        // abort is a harmless no-op that keeps every Disconnected
+                        // path symmetric.)
                         tracing::info!(target: "mish::persist", "client connection dropped; awaiting reattach");
+                        driver_task.abort();
                         return AttachEnd::Disconnected;
                     }
                     last_heard = tokio::time::Instant::now();

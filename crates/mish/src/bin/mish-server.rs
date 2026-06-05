@@ -343,7 +343,37 @@ async fn serve_persistent(
             transport.clone(),
             emu.clone(),
         ));
-        let end = session.clone().attach(transport, network_timeout).await;
+
+        // Run this attachment, but let a *new* incoming connection preempt it. A
+        // fresh connect is a strong signal the current client is gone — including
+        // the hard-drop case where the old connection never closed (a sleeping
+        // laptop, vanished Wi-Fi), which would otherwise pin `attach` in its idle
+        // watchdog for up to `network_timeout` and block the reattach that whole
+        // time. We race the attachment against `accept()`; whichever fires first
+        // wins, and a newcomer cancels the attachment cleanly.
+        let (preempt_tx, preempt_rx) = tokio::sync::oneshot::channel::<()>();
+        let attaching = session
+            .clone()
+            .attach(transport, network_timeout, async move {
+                let _ = preempt_rx.await;
+            });
+        tokio::pin!(attaching);
+
+        let end = tokio::select! {
+            end = &mut attaching => end,
+            incoming = mish_quic::transport::accept(&endpoint) => {
+                // A new client arrived while we were still attached → preempt the
+                // current one and switch to the newcomer.
+                let next = incoming.context("accepting reattach (preempt)")?;
+                let _ = preempt_tx.send(());
+                let _ = (&mut attaching).await; // let `attach` abort its driver
+                hist.abort();
+                eprintln!("client reattached from {} (preempting previous)", next.remote_address());
+                tracing::info!(target: "mish::server", remote = %next.remote_address(), "reattach preempts current client");
+                conn = next;
+                continue;
+            }
+        };
         hist.abort();
 
         match end {
@@ -352,6 +382,9 @@ async fn serve_persistent(
                 return Ok(());
             }
             AttachEnd::Disconnected => {
+                // Clean detach (the old connection closed): wait for a reattach
+                // within the window. A hard drop is handled by the preempt arm
+                // above, so this path is the graceful case.
                 eprintln!("client detached; awaiting reattach…");
                 conn = match tokio::time::timeout(
                     reattach_timeout,
