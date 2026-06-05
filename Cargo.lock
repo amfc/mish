@@ -734,6 +734,7 @@ dependencies = [
  "mish-ssp",
  "mish-terminal",
  "portable-pty",
+ "proptest",
  "tokio",
  "tracing",
  "tracing-subscriber",
