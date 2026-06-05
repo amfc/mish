@@ -70,6 +70,58 @@ async fn clean_shutdown_closes_both_sides() {
     drop((ha, hb));
 }
 
+/// Regression: a shutdown *responder* must close as soon as it has acked the
+/// peer's shutdown — it must NOT wait to have its *own* shutdown acked. In the
+/// real world the initiator (the server, once its shell exits) closes the
+/// instant it sees the responder's ack and is then gone, so it never acks back.
+/// Before the fix the responder (the user's client) sat for the entire 5s grace
+/// deadline — the "won't disconnect after Ctrl-D" hang.
+///
+/// We play the initiator by hand: frame a single SHUTDOWN instruction, send it,
+/// then go silent forever. The responding driver must still exit promptly.
+#[tokio::test]
+async fn shutdown_responder_closes_without_being_acked() {
+    use mish_ssp::frag::Fragmenter;
+    use mish_ssp::instruction::{Instruction, PROTOCOL_VERSION, SHUTDOWN_NUM};
+
+    let (ta, tb) = memory::pair();
+    let clock = Arc::new(SystemClock::new());
+    let (da, ha) = Driver::<_, BytesState, BytesState>::with(Arc::new(ta), clock, fast_cfg());
+    let task_a = da.spawn();
+
+    // The peer's SHUTDOWN frame: new_num = SHUTDOWN_NUM is all the core needs to
+    // register `peer_is_shutting_down`. Frame it the way the driver expects, since
+    // it defragments every inbound datagram.
+    let shutdown = Instruction {
+        protocol_version: PROTOCOL_VERSION,
+        old_num: 0,
+        new_num: SHUTDOWN_NUM,
+        ack_num: 0,
+        throwaway_num: 0,
+        diff: Vec::new(),
+        timestamp: 0,
+        timestamp_reply: None,
+    };
+    let mut frag = Fragmenter::new();
+    for fragment in frag.fragment(&shutdown.encode(), tb.max_datagram_size()) {
+        tb.send(fragment).await.expect("send shutdown frame");
+    }
+    // ...and now stay silent: never ack the responder's own shutdown.
+
+    // Must close well under the 5s grace deadline. Without the fix this waits the
+    // full grace period and the timeout fails.
+    tokio::time::timeout(Duration::from_secs(2), task_a)
+        .await
+        .expect("responder must close promptly after acking, not wait the 5s grace")
+        .expect("driver task joined")
+        .expect("clean shutdown");
+
+    // Keep `tb` alive to the end: dropping it early would close the link and let
+    // the driver exit via `TransportError::Closed` — a different path that would
+    // mask the bug.
+    drop((ha, tb));
+}
+
 async fn await_state(handle: &mut Handle, want: &[u8]) {
     if handle.remote().as_slice() == want {
         return;

@@ -201,6 +201,10 @@ where
         // by never letting it go idle).
         let mut local_open = true;
         let mut shutting_down = false;
+        // True when the *peer* initiated the shutdown and we are merely mirroring
+        // it — i.e. we're the responder, not the initiator. A responder doesn't
+        // wait for its own shutdown to be acked (see the completion check below).
+        let mut peer_initiated = false;
         let mut shutdown_deadline = crate::clock::NEVER;
         loop {
             let now = self.clock.now_ms();
@@ -213,12 +217,21 @@ where
             // 2. Publish remote-state changes to subscribers.
             self.publish_remote();
 
-            // 3. Clean-shutdown completion: the peer acknowledged our shutdown
-            //    (we sent our final ack-bearing frame in the tick above), or the
-            //    grace period elapsed.
-            if shutting_down && (self.core.is_shutdown_acked() || now >= shutdown_deadline) {
+            // 3. Clean-shutdown completion. Two roles:
+            //    * Initiator (the app called shutdown): leave once the peer acks
+            //      our shutdown — or at the grace deadline if that ack is lost.
+            //    * Responder (the peer initiated; we mirrored it): the tick above
+            //      just flushed our ack of the peer's shutdown. The initiator
+            //      closes the instant it sees that ack and will never ack *ours*
+            //      back, so waiting on `is_shutdown_acked` would stall the
+            //      responder for the whole grace period (the user-visible "won't
+            //      disconnect after Ctrl-D" hang). Having sent our ack, leave now.
+            if shutting_down
+                && (peer_initiated || self.core.is_shutdown_acked() || now >= shutdown_deadline)
+            {
                 tracing::debug!(
                     target: "mish::ssp",
+                    responder = peer_initiated,
                     acked = self.core.is_shutdown_acked(),
                     "driver: shutdown complete; exiting"
                 );
@@ -251,6 +264,7 @@ where
                                     if self.core.peer_is_shutting_down() && !shutting_down {
                                         tracing::debug!(target: "mish::ssp", "driver: peer is shutting down; mirroring");
                                         shutting_down = true;
+                                        peer_initiated = true;
                                         self.core.start_shutdown();
                                         shutdown_deadline = now + 5000;
                                     }
