@@ -108,7 +108,10 @@ impl SyncState for UserStream {
         let total = self.total();
         for (i, ev) in diff.suffix.into_iter().enumerate() {
             // Idempotent: only append events we don't already have.
-            let abs = diff.start + i as u64;
+            // `start` comes off the wire untrusted; saturate so a hostile
+            // `start` near u64::MAX can't overflow the index (stays huge ⇒ the
+            // `abs >= total` guard still holds and the event is appended).
+            let abs = diff.start.saturating_add(i as u64);
             if abs >= total {
                 self.events.push_back(ev);
             }
