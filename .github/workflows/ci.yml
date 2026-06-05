@@ -37,3 +37,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: madsim tests
         run: cargo test -p mish-madsim
+
+  miri:
+    name: miri (UB / aliasing on the sans-IO core)
+    runs-on: ubuntu-latest
+    env:
+      # Miri can't perform real I/O; the pure tests we run don't need it, but
+      # disabling isolation keeps any incidental clock/getrandom calls happy.
+      MIRIFLAGS: "-Zmiri-disable-isolation"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      # Pure, sans-IO code only — no tokio I/O, real threads, or PTY. This is the
+      # index/buffer-heavy logic where UB would hide: fragmentation, instruction
+      # codec, state diffing, the SSP core, and the prediction overlay.
+      - name: Miri (mish-ssp core)
+        run: cargo miri test -p mish-ssp --lib --test core_unit
+      - name: Miri (mish-terminal prediction)
+        run: cargo miri test -p mish-terminal --lib

@@ -110,7 +110,10 @@ the independent UDP/QUIC path.
 | Fuzz/robustness | no-panic on arbitrary wire bytes / screen diffs / VT input; hostile-peer instructions (bounded, no-panic) + prediction-engine fuzz; `cargo-fuzz` scaffold | `*/tests/fuzz_*.rs`, `fuzz/` |
 | Diff round-trip fuzz | structured-VT sequences + real-shell PTY replay, asserting the wire diff reproduces every screen transition | `mish-terminal/tests/fuzz_diff.rs`, `mosh/tests/replay.rs` |
 | Transparency | client's reconstructed screen == server's emulator screen, over the full stack + deterministically under loss | `mosh/tests/transparency.rs` |
+| Live-Driver fuzz | the async event loop survives a sustained garbage-datagram flood interleaved with honest traffic and still converges | `mish-ssp/tests/fuzz_driver_live.rs` |
+| Fault soak | loss + duplication + corruption + reorder together, across many seeds, asserting convergence and bounded memory | `mish-ssp/tests/sim_convergence.rs` |
 | madsim sim | sans-IO core, and full stack (scripted shell) over madsim's simulated UDP — reproducible by seed | `mish-madsim/tests/` |
+| Miri (UB) | the sans-IO core (frag/codec/diff/SSP) and prediction overlay run clean under Miri — no UB or aliasing violations | CI `miri` job |
 
 The fuzz/round-trip harnesses earned their keep: they found and fixed several
 real bugs — a Driver CPU spin on a closed handle, a screen-diff OOM on a
@@ -208,6 +211,7 @@ Builds on stable Rust (pinned in `rust-toolchain.toml`). CI
 cargo test                                   # everything (stable)
 RUSTFLAGS="--cfg madsim" cargo test -p mish-madsim   # deterministic madsim sim
 cargo +nightly fuzz run screen_apply         # cargo-fuzz target (needs cargo-fuzz)
+cargo +nightly miri test -p mish-ssp --lib   # UB/aliasing check on the sans-IO core
 ```
 
 ## License
