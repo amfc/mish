@@ -98,6 +98,11 @@ struct Options {
     /// across disconnects and reattaches to it on a later run (the "never lose
     /// your shell" mode). Opt-in; without it, a fresh session each time.
     session: Option<String>,
+    /// Raw attach (`--attach IP PORT`): connect directly to an already-running
+    /// server (no SSH/local bootstrap), with credentials in `$MISH_CONNECT`
+    /// (the hex `<server-cert> <client-cert> <client-key>` from its MISH CONNECT
+    /// line). Mirrors `mosh-client IP PORT` + `$MOSH_KEY`; used by test harnesses.
+    attach: Option<(String, u16)>,
     host: Option<String>,
     command: Option<String>,
     /// Write a JSON event log here (`--log-file`); `None` disables logging.
@@ -135,6 +140,7 @@ fn parse_args() -> Result<Options> {
         },
         no_init: std::env::var_os("MOSH_NO_TERM_INIT").is_some(),
         session: None,
+        attach: None,
         host: None,
         command: None,
         log_file: None,
@@ -161,6 +167,15 @@ fn parse_args() -> Result<Options> {
             "-n" | "--predict-never" => opts.predict = PredictMode::Never,
             "--no-init" => opts.no_init = true,
             "--session" => opts.session = Some(args.next().context("--session needs a NAME")?),
+            "--attach" => {
+                let ip = args.next().context("--attach needs IP PORT")?;
+                let port: u16 = args
+                    .next()
+                    .context("--attach needs IP PORT")?
+                    .parse()
+                    .context("--attach PORT must be a number")?;
+                opts.attach = Some((ip, port));
+            }
             "--log-file" => {
                 opts.log_file = Some(args.next().context("--log-file needs a PATH")?.into());
             }
@@ -205,6 +220,7 @@ fn print_usage() {
          \x20 -a, --predict-always always echo locally; -n, --predict-never  disable\n\
          \x20 --no-init            don't enter the alternate screen (MOSH_NO_TERM_INIT)\n\
          \x20 --session <name>     reattachable persistent session (never lose your shell)\n\
+         \x20 --attach IP PORT     attach to a running server ($MISH_CONNECT creds; for testing)\n\
          \x20 --log-file <path>    write a JSON event log (for debugging)\n\
          \x20 --log-level <lvl>    log verbosity: error|warn|info|debug|trace (default debug)\n\
          \x20 --version            print version and exit\n\
@@ -236,6 +252,13 @@ async fn main() -> Result<()> {
         }
     }
     tracing::info!(target: "mish::client", local = opts.local, "client starting");
+
+    // Raw attach (--attach IP PORT): connect directly to a running server with
+    // credentials from $MISH_CONNECT, no bootstrap. (Used by test harnesses;
+    // mirrors `mosh-client IP PORT` + $MOSH_KEY.)
+    if let Some((ip, port)) = opts.attach.clone() {
+        return attach_session(&ip, port, opts.predict, opts.no_init).await;
+    }
 
     // 1. Bootstrap: get (udp addr, cert) by starting mish-server locally or via SSH.
     let boot: Bootstrap = if opts.local {
@@ -281,6 +304,39 @@ async fn main() -> Result<()> {
 
     // Dropping `boot` tears down the server / ssh channel.
     drop(boot);
+    Ok(())
+}
+
+/// Attach directly to a running server at `ip:port`, with the credential triple
+/// (hex `server-cert client-cert client-key`) in `$MISH_CONNECT`. No bootstrap.
+async fn attach_session(ip: &str, port: u16, predict: PredictMode, no_init: bool) -> Result<()> {
+    let creds = std::env::var("MISH_CONNECT").context(
+        "--attach requires $MISH_CONNECT = hex `<server-cert> <client-cert> <client-key>`",
+    )?;
+    let mut it = creds.split_whitespace();
+    let mut next_der = |what: &str| -> Result<Vec<u8>> {
+        let tok = it.next().with_context(|| format!("MISH_CONNECT: missing {what}"))?;
+        bootstrap::from_hex(tok).with_context(|| format!("MISH_CONNECT: bad {what} hex"))
+    };
+    let server_cert = next_der("server cert")?;
+    let client_cert = next_der("client cert")?;
+    let client_key = next_der("client key")?;
+
+    let addr: std::net::SocketAddr = format!("{ip}:{port}")
+        .parse()
+        .with_context(|| format!("bad --attach address {ip}:{port}"))?;
+    let endpoint = transport::authenticated_client_endpoint(
+        "0.0.0.0:0".parse().unwrap(),
+        &server_cert,
+        &client_cert,
+        &client_key,
+    )
+    .context("creating QUIC client endpoint")?;
+    eprintln!("[mish-client] attaching to {addr} …");
+    let t = transport::connect(&endpoint, addr, "localhost")
+        .await
+        .context("connecting to server")?;
+    run_terminal(t, predict, no_init).await;
     Ok(())
 }
 
