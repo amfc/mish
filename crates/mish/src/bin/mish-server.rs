@@ -98,9 +98,24 @@ fn bind_in_range(ports: &[u16]) -> Result<std::net::UdpSocket> {
 fn main() -> Result<()> {
     let opts = parse_args()?;
 
-    // Export locale/env for the child shell.
+    // Export locale/env overrides for the child shell.
     for (k, v) in &opts.locale {
         std::env::set_var(k, v);
+    }
+    // Ensure the child runs under a UTF-8 locale: the emulator decodes its output
+    // as UTF-8, so a non-UTF-8 locale would render (and synchronize) corrupted
+    // text. Done after the -l overrides so an explicit locale is respected.
+    eprintln!("mish: {}", mish::locale::ensure_utf8_locale());
+
+    // Running as root is unusual in the normal SSH-launch model (the server runs
+    // as the connecting user); flag it since a root shell over the network is a
+    // sharp edge and there's no target uid to drop to here.
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!(
+            "mish: warning: running as root — mish-server normally runs as the \
+             connecting user (launched over SSH)"
+        );
     }
 
     mish_quic::config::init_crypto();

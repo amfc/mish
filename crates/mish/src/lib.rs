@@ -17,6 +17,7 @@
 
 pub mod bootstrap;
 pub mod client;
+pub mod locale;
 pub mod pty;
 pub mod server;
 

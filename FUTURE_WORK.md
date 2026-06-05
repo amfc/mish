@@ -35,11 +35,28 @@ trigger. Tested in `predict.rs` (`confidence_enables_adaptive_below_srtt_trigger
 
 ## Server ops plumbing (mish-server)
 
-- **utmp/wtmp accounting, motd, setuid drop, locale validation** — *moderate,
-  OS-specific.* Real session/login plumbing the daemon would do in production;
-  orthogonal to the protocol.
-- **SSH-bootstrapped real cert pinning** — *small.* The demo trusts the cert
-  printed over SSH; production could pin it via known_hosts-style storage.
+- **Locale validation** — *done.* `mish::locale` resolves the effective locale
+  (LC_ALL > LC_CTYPE > LANG) and, if it isn't UTF-8, forces `LC_ALL=C.UTF-8` for
+  the child and warns — the emulator decodes child output as UTF-8, so a
+  non-UTF-8 locale would corrupt the rendered (and synchronized) screen. Pure
+  decision logic, unit-tested.
+- **Root warning** — *done.* The server warns if started as root, which is
+  unusual in the SSH-launch model (it normally runs as the connecting user).
+
+Deliberately not done (with rationale):
+
+- **setuid privilege drop** — *not applicable here.* mish-server is launched over
+  SSH **as the target user**, so there is no elevated privilege to drop and no
+  target uid to drop to. Relevant only to a setuid/root-launched deployment,
+  which this isn't.
+- **utmp/wtmp accounting** — *blocked + low value.* Recording the session in
+  `who`/`w`/`last` needs the slave PTY's device name, which `portable-pty`
+  abstracts away, plus write access to `/var/run/utmp` (typically root/utmp-group
+  only). Best-effort and untestable here; deferred.
+- **motd** — the login shell already prints it; not the server's job.
+- **SSH-bootstrapped cert pinning** — *low value.* The cert is exchanged over the
+  already-authenticated SSH channel, so it's trusted at handshake time. Pinning
+  would only add defense-in-depth against a post-handshake swap; deferred.
 
 ## Misc
 
