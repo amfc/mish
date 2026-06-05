@@ -18,6 +18,7 @@
 pub mod bootstrap;
 pub mod client;
 pub mod locale;
+pub mod persist;
 pub mod pty;
 pub mod scrollback;
 pub mod server;

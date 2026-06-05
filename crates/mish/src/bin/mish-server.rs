@@ -9,13 +9,17 @@
 //! so the fork happens in a single-threaded process. The child then builds the
 //! runtime and constructs the Quinn endpoint from the inherited socket.
 //!
-//! Usage: `mish-server [--detach] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [bind-port] [-- command]`
+//! Usage: `mish-server [--detach] [--persist] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [bind-port] [-- command]`
 //!
 //! With no `-- command`, the user's `$SHELL` is started as a **login shell**
 //! (`-l`). `-4`/`-6` select the bind address family (default IPv4 `0.0.0.0`).
+//! With `--persist` the PTY + terminal state survive client disconnects and the
+//! server accepts **reattach** connections (until the shell exits or no client
+//! reattaches within `MISH_SERVER_REATTACH_TMOUT`).
 //!
 //! Env: `MOSH_SERVER_NETWORK_TMOUT` (mid-session idle, default 300s),
-//! `MOSH_SERVER_SIGNAL_TMOUT` (wait for the first connection, default 60s).
+//! `MOSH_SERVER_SIGNAL_TMOUT` (wait for the first connection, default 60s),
+//! `MISH_SERVER_REATTACH_TMOUT` (`--persist`: wait for a reattach, default 24h).
 
 use std::io::Write;
 use std::sync::Arc;
@@ -34,6 +38,9 @@ struct Options {
     locale: Vec<(String, String)>,
     /// Address to bind: IPv4 `0.0.0.0` (default) or IPv6 `::`.
     bind_ip: String,
+    /// Keep the session alive across client disconnects and accept reattaches
+    /// (`--persist`), instead of exiting when the client leaves.
+    persist: bool,
     command: Option<String>,
 }
 
@@ -43,12 +50,14 @@ fn parse_args() -> Result<Options> {
         ports: Vec::new(),
         locale: Vec::new(),
         bind_ip: "0.0.0.0".to_string(),
+        persist: false,
         command: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--detach" => opts.detach = true,
+            "--persist" => opts.persist = true,
             "-4" => opts.bind_ip = "0.0.0.0".to_string(),
             "-6" => opts.bind_ip = "::".to_string(),
             "--family" => {
@@ -176,13 +185,14 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(serve(socket, server_config, opts.command))
+    runtime.block_on(serve(socket, server_config, opts.command, opts.persist))
 }
 
 async fn serve(
     socket: std::net::UdpSocket,
     server_config: mish_quic::ServerConfig,
     command: Option<String>,
+    persist: bool,
 ) -> Result<()> {
     let (cols, rows) = (80u16, 24u16);
 
@@ -210,16 +220,19 @@ async fn serve(
     .context("spawning PTY child")?;
     let clock = Arc::new(SystemClock::new());
     let network_timeout = Some(env_secs("MOSH_SERVER_NETWORK_TMOUT", 300));
-
-    // Shared emulator: the session loop feeds it; the scrollback server reads its
-    // history. Spawn the history server alongside the live session.
-    let transport = Arc::new(t);
+    // Shared emulator: the session loop feeds it; the scrollback server reads it.
     let emu = mish_terminal::emulator::Emulator::shared(cols, rows);
+
+    if persist {
+        return serve_persistent(endpoint, t, emu, clock, network_timeout, pty).await;
+    }
+
+    // Non-persistent (default): one connection, exit when the client or shell goes.
+    let transport = Arc::new(t);
     tokio::spawn(mish::scrollback::serve_history(
         transport.clone(),
         emu.clone(),
     ));
-
     run_server(
         transport,
         emu,
@@ -231,6 +244,63 @@ async fn serve(
     .await;
     eprintln!("session ended");
     Ok(())
+}
+
+/// Persistent mode (`--persist`): keep the PTY + emulator alive across client
+/// disconnects and accept reattaches, until the shell exits or no client
+/// reattaches within the window (`MISH_SERVER_REATTACH_TMOUT`, default 24h).
+async fn serve_persistent(
+    endpoint: mish_quic::Endpoint,
+    first: mish_quic::transport::QuicTransport,
+    emu: std::sync::Arc<std::sync::Mutex<mish_terminal::emulator::Emulator>>,
+    clock: Arc<SystemClock>,
+    network_timeout: Option<Duration>,
+    pty: PtyProcess,
+) -> Result<()> {
+    use mish::persist::{AttachEnd, PersistentSession};
+
+    let session = Arc::new(PersistentSession::spawn(
+        emu.clone(),
+        clock,
+        pty.output,
+        pty.control,
+    ));
+    let reattach_timeout = env_secs("MISH_SERVER_REATTACH_TMOUT", 86_400);
+
+    let mut conn = first;
+    loop {
+        let transport = Arc::new(conn);
+        // Scrollback for this connection (aborted when the attachment ends).
+        let hist = tokio::spawn(mish::scrollback::serve_history(
+            transport.clone(),
+            emu.clone(),
+        ));
+        let end = session.clone().attach(transport, network_timeout).await;
+        hist.abort();
+
+        match end {
+            AttachEnd::ChildExited => {
+                eprintln!("session ended (shell exited)");
+                return Ok(());
+            }
+            AttachEnd::Disconnected => {
+                eprintln!("client detached; awaiting reattach…");
+                conn = match tokio::time::timeout(
+                    reattach_timeout,
+                    mish_quic::transport::accept(&endpoint),
+                )
+                .await
+                {
+                    Ok(c) => c.context("accepting reattach")?,
+                    Err(_) => {
+                        eprintln!("no reattach within the window; ending session");
+                        return Ok(());
+                    }
+                };
+                eprintln!("client reattached from {}", conn.remote_address());
+            }
+        }
+    }
 }
 
 fn env_secs(var: &str, default: u64) -> Duration {

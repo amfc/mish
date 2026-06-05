@@ -38,3 +38,7 @@ pub use quinn::ServerConfig;
 /// Re-exported so downstream crates can name the side-channel stream halves
 /// (from [`QuicTransport::open_side_channel`]) without depending on `quinn`.
 pub use quinn::{RecvStream, SendStream};
+
+/// Re-exported so the server binary can hold the listening endpoint (to accept
+/// reattach connections) without depending on `quinn` directly.
+pub use quinn::Endpoint;

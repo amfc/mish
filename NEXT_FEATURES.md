@@ -80,7 +80,17 @@ primitive that #4/#6 reuse, and delivers the headline win.
 
 ---
 
-## 2. Session persistence + reattach
+## 2. Session persistence + reattach  🟡 core done
+
+> **Status:** the persistent-session **core is implemented** (`mish::persist`):
+> `mish-server --persist` keeps the PTY + emulator alive across client
+> disconnects and accepts **reattach** connections, each re-syncing the full
+> current screen automatically (a fresh SSP session syncs from scratch) —
+> including output produced while no client was attached
+> (`mosh/tests/reattach.rs`). *Remaining:* the client-side reattach CLI + a
+> host-side session registry so re-running `mish host` finds your existing
+> detached session (Phase 2 below), and optional 0-RTT for instant reattach.
+
 
 **Why.** mosh sessions die with the client process. A persistent server + reattach
 (abduco/tmux style), *combined with roaming*, is the complete "never lose your
