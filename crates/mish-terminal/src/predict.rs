@@ -32,6 +32,18 @@ pub enum PredictMode {
 /// notion that prediction helps once the round-trip is perceptible.
 const ADAPTIVE_SRTT_TRIGGER_MS: f64 = 50.0;
 
+/// Number of *credited-correct* predictions (correct AND they changed the
+/// screen) that must accumulate before [`PredictMode::Adaptive`] will display
+/// predictions on a link whose SRTT is below the trigger. This is mosh's
+/// "earn confidence from the track record" idea: don't speculate on a link/app
+/// we have no evidence is predictable, but once a run of predictions has proven
+/// correct, show them even on a marginal link. A misprediction resets it to 0.
+const CONFIDENCE_TRIGGER: u32 = 10;
+
+/// Cap so confidence can't grow unboundedly (and so a recent misprediction's
+/// reset meaningfully delays re-enabling, rather than being instantly refilled).
+const CONFIDENCE_CAP: u32 = 20;
+
 #[derive(Clone)]
 struct CellPrediction {
     row: u16,
@@ -39,6 +51,11 @@ struct CellPrediction {
     cell: Cell,
     /// Client input index (`UserStream::total()`) at which this was predicted.
     input_index: u64,
+    /// Whether this prediction *changed* the displayed cell (vs. matching what
+    /// was already there). Only credited predictions build confidence — a
+    /// prediction that merely re-asserts the existing glyph is no evidence that
+    /// speculation is working (mosh's `CorrectNoCredit`).
+    credit: bool,
 }
 
 /// Speculative overlay of unconfirmed local input.
@@ -63,6 +80,8 @@ pub struct PredictionEngine {
     /// After a misprediction, briefly suppress the overlay until the next clean
     /// server update, to avoid flicker (mosh's glitch trigger).
     glitch: bool,
+    /// Accumulated credited-correct predictions (see [`CONFIDENCE_TRIGGER`]).
+    confidence: u32,
     cols: u16,
     rows: u16,
 }
@@ -81,6 +100,7 @@ impl PredictionEngine {
             srtt_ms: 0.0,
             flagging: true,
             glitch: false,
+            confidence: 0,
             cols: 0,
             rows: 0,
         }
@@ -104,7 +124,12 @@ impl PredictionEngine {
         match self.mode {
             PredictMode::Never => false,
             PredictMode::Always => true,
-            PredictMode::Adaptive => self.srtt_ms >= ADAPTIVE_SRTT_TRIGGER_MS,
+            // Show on a laggy link (immediate benefit), OR once we've built a
+            // track record of correct predictions on this link/app — so a
+            // borderline-latency link still gets snappy echo once we're confident.
+            PredictMode::Adaptive => {
+                self.srtt_ms >= ADAPTIVE_SRTT_TRIGGER_MS || self.confidence >= CONFIDENCE_TRIGGER
+            }
         }
     }
 
@@ -146,7 +171,7 @@ impl PredictionEngine {
                     let chars: Vec<char> = s.chars().collect();
                     self.utf8.clear();
                     for ch in chars {
-                        self.predict_char(ch, input_index);
+                        self.predict_char(ch, input_index, base);
                     }
                     break;
                 }
@@ -158,7 +183,7 @@ impl PredictionEngine {
                             .chars()
                             .collect();
                         for ch in chars {
-                            self.predict_char(ch, input_index);
+                            self.predict_char(ch, input_index, base);
                         }
                     }
                     match e.error_len() {
@@ -178,7 +203,7 @@ impl PredictionEngine {
         }
     }
 
-    fn predict_char(&mut self, ch: char, input_index: u64) {
+    fn predict_char(&mut self, ch: char, input_index: u64, base: &Screen) {
         if self.suppress {
             return; // inside an unpredictable (escape) sequence
         }
@@ -203,7 +228,7 @@ impl PredictionEngine {
                     c: ' ',
                     ..Cell::default()
                 };
-                self.push_cell(cell, input_index);
+                self.push_cell(cell, input_index, base);
                 self.cursor_index = input_index;
             }
             // Tab: advance to the next multiple of 8.
@@ -236,13 +261,13 @@ impl PredictionEngine {
                             c,
                             ..Cell::default()
                         };
-                        self.push_cell(wide, input_index);
+                        self.push_cell(wide, input_index, base);
                         self.advance_cursor();
                         let spacer = Cell {
                             c: ' ',
                             ..Cell::default()
                         };
-                        self.push_cell(spacer, input_index);
+                        self.push_cell(spacer, input_index, base);
                         self.advance_cursor();
                     }
                     _ => {
@@ -250,7 +275,7 @@ impl PredictionEngine {
                             c,
                             ..Cell::default()
                         };
-                        self.push_cell(cell, input_index);
+                        self.push_cell(cell, input_index, base);
                         self.advance_cursor();
                     }
                 }
@@ -259,8 +284,17 @@ impl PredictionEngine {
         }
     }
 
-    fn push_cell(&mut self, cell: Cell, input_index: u64) {
+    fn push_cell(&mut self, cell: Cell, input_index: u64, base: &Screen) {
         let (row, col) = (self.cursor_row, self.cursor_col);
+        // Credit this prediction only if it changes what's displayed there: an
+        // earlier prediction at the same cell if present, else the server cell.
+        let displayed = self
+            .cells
+            .iter()
+            .find(|p| p.row == row && p.col == col)
+            .map(|p| p.cell.c)
+            .or_else(|| base.cell(row, col).map(|c| c.c));
+        let credit = displayed != Some(cell.c);
         // Replace any existing prediction at this position.
         self.cells.retain(|p| !(p.row == row && p.col == col));
         self.cells.push(CellPrediction {
@@ -268,6 +302,7 @@ impl PredictionEngine {
             col,
             cell,
             input_index,
+            credit,
         });
     }
 
@@ -305,17 +340,35 @@ impl PredictionEngine {
         if mispredict {
             self.reset();
             self.glitch = true; // suppress overlay until the next clean update
+            self.confidence = 0; // track record broken — re-earn confidence
             return;
         }
 
         // A clean update clears any glitch suppression.
         self.glitch = false;
 
+        // Confirmed predictions (input_index <= ack) all matched the server, so
+        // each *credited* one (it actually changed the screen) is evidence that
+        // speculation is working: build confidence (capped). CorrectNoCredit
+        // confirmations — predictions that just re-asserted the existing glyph —
+        // contribute nothing.
+        let credited = self
+            .cells
+            .iter()
+            .filter(|p| p.input_index <= ack && p.credit)
+            .count() as u32;
+        self.confidence = (self.confidence + credited).min(CONFIDENCE_CAP);
+
         // Drop confirmed-correct predictions (the real screen now shows them).
         self.cells.retain(|p| p.input_index > ack);
         if self.cursor_index <= ack {
             self.have_cursor = false;
         }
+    }
+
+    /// Accumulated confidence (credited-correct predictions); for tests/observability.
+    pub fn confidence(&self) -> u32 {
+        self.confidence
     }
 
     /// The screen to display: the server screen with active predictions overlaid.
@@ -514,6 +567,85 @@ mod tests {
         assert_eq!(shown.cell(0, 1).unwrap().c, ' '); // spacer
                                                       // Cursor advanced by the full display width.
         assert_eq!(shown.cursor_col, 2);
+    }
+
+    /// Confidence built from a track record of credited-correct predictions lets
+    /// Adaptive mode display predictions even on a link below the SRTT trigger.
+    #[test]
+    fn confidence_enables_adaptive_below_srtt_trigger() {
+        let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        p.set_srtt(5.0); // SRTT gate closed
+        let (cols, rows) = (40u16, 2u16);
+
+        for i in 1..=CONFIDENCE_TRIGGER as u64 {
+            // Type a char into a fresh (blank) cell → a screen-changing prediction.
+            let mut server = Screen::blank(cols, rows);
+            server.echo_ack = i - 1;
+            server.cursor_col = (i - 1) as u16;
+            p.new_user_bytes(b"a", &server, i);
+
+            // Server confirms it: that cell really shows 'a' now.
+            let mut confirmed = Screen::blank(cols, rows);
+            confirmed.echo_ack = i;
+            confirmed.cells[(i - 1) as usize].c = 'a';
+            confirmed.cursor_col = i as u16;
+            p.new_server_screen(&confirmed);
+        }
+        assert!(
+            p.confidence() >= CONFIDENCE_TRIGGER,
+            "confidence should accumulate from credited-correct predictions"
+        );
+
+        // SRTT still below the trigger, yet a fresh prediction now displays.
+        let mut server = Screen::blank(cols, rows);
+        server.echo_ack = CONFIDENCE_TRIGGER as u64;
+        p.new_user_bytes(b"Z", &server, CONFIDENCE_TRIGGER as u64 + 1);
+        assert_eq!(
+            p.predicted_screen(&server).cell(0, 0).unwrap().c,
+            'Z',
+            "confidence enables the overlay despite low SRTT"
+        );
+    }
+
+    /// A prediction that merely re-asserts the glyph already on screen earns no
+    /// credit (mosh's CorrectNoCredit), so it doesn't build confidence.
+    #[test]
+    fn correct_no_credit_does_not_build_confidence() {
+        let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        let mut server = Screen::blank(20, 2);
+        server.cells[0].c = 'a';
+        p.new_user_bytes(b"a", &server, 1); // predict 'a' where 'a' already is
+        let mut confirmed = server.clone();
+        confirmed.echo_ack = 1; // still shows 'a' — correct, but no visible change
+        p.new_server_screen(&confirmed);
+        assert_eq!(
+            p.confidence(),
+            0,
+            "matching the existing glyph earns no confidence"
+        );
+    }
+
+    /// A misprediction wipes the accumulated confidence (the track record is gone).
+    #[test]
+    fn misprediction_resets_confidence() {
+        let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        // Earn one credit.
+        let mut server = Screen::blank(20, 2);
+        server.cursor_col = 0;
+        p.new_user_bytes(b"a", &server, 1);
+        let mut good = Screen::blank(20, 2);
+        good.echo_ack = 1;
+        good.cells[0].c = 'a';
+        p.new_server_screen(&good);
+        assert_eq!(p.confidence(), 1);
+
+        // Now mispredict: type 'b', but the server shows 'X'.
+        p.new_user_bytes(b"b", &good, 2);
+        let mut bad = Screen::blank(20, 2);
+        bad.echo_ack = 2;
+        bad.cells[1].c = 'X';
+        p.new_server_screen(&bad);
+        assert_eq!(p.confidence(), 0, "misprediction resets confidence");
     }
 
     #[test]

@@ -28,19 +28,17 @@ relative to that established pattern.
   a title stack separately, so this would need emulator-side work or is simply
   not representable. Probably skip.
 
-## Prediction adaptiveness (mosh parity)
+## Prediction adaptiveness (mosh parity) — done
 
-Today `PredictMode::Adaptive` gates display purely on SRTT
-(`ADAPTIVE_SRTT_TRIGGER_MS`). mosh additionally builds confidence from a
-*prediction track record* before showing predictions on a marginal link.
-
-- **`CorrectNoCredit` accounting + confidence trigger** — *moderate.* In
-  `predict.rs`, when culling a confirmed-correct prediction, distinguish "correct
-  and changed the screen" (credit) from "matched what was already there"
-  (no credit), and only enable the overlay once enough credited-correct
-  predictions have accumulated (combined with the SRTT gate). Mirrors mosh's
-  `OverlayManager` `srtt_trigger` + glitch hysteresis. Mechanics are otherwise
-  already present (validation, flagging, glitch).
+`PredictMode::Adaptive` now combines the SRTT gate with a confidence score built
+from the prediction track record (`predict.rs`): each `CellPrediction` records
+whether it changed the displayed cell (`credit`) vs. merely re-asserting the
+existing glyph (mosh's `CorrectNoCredit`). On confirmation, only credited-correct
+predictions raise `confidence`; a misprediction resets it to 0 (alongside the
+existing glitch suppression). Once `CONFIDENCE_TRIGGER` credited-correct
+predictions accumulate, the overlay displays even on a link below the SRTT
+trigger. Tested in `predict.rs` (`confidence_enables_adaptive_below_srtt_trigger`,
+`correct_no_credit_does_not_build_confidence`, `misprediction_resets_confidence`).
 
 ## Server ops plumbing (mish-server)
 
