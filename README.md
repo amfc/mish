@@ -107,8 +107,16 @@ the independent UDP/QUIC path.
 | Terminal | screen-diff & user-stream PBTs, emulator VT parsing, client/server convergence over the sim (incl. 40% loss) | `mish-terminal/tests/*` |
 | Fragmentation | split/reassemble round-trip, out-of-order, lost-fragment | `mish-ssp/src/frag.rs` |
 | Full stack | headless loopback, real PTY shell, daemonization, SSH/local bootstrap, real QUIC + real PTY end-to-end | `mosh/tests/*` |
-| Fuzz/robustness | no-panic on arbitrary wire bytes / screen diffs / VT input (proptest) + `cargo-fuzz` scaffold | `*/tests/fuzz_*.rs`, `fuzz/` |
-| madsim sim | sans-IO core over madsim's simulated UDP (latency/loss), reproducible by seed | `mish-madsim/tests/` |
+| Fuzz/robustness | no-panic on arbitrary wire bytes / screen diffs / VT input; hostile-peer instructions (bounded, no-panic) + prediction-engine fuzz; `cargo-fuzz` scaffold | `*/tests/fuzz_*.rs`, `fuzz/` |
+| Diff round-trip fuzz | structured-VT sequences + real-shell PTY replay, asserting the wire diff reproduces every screen transition | `mish-terminal/tests/fuzz_diff.rs`, `mosh/tests/replay.rs` |
+| Transparency | client's reconstructed screen == server's emulator screen, over the full stack + deterministically under loss | `mosh/tests/transparency.rs` |
+| madsim sim | sans-IO core, and full stack (scripted shell) over madsim's simulated UDP — reproducible by seed | `mish-madsim/tests/` |
+
+The fuzz/round-trip harnesses earned their keep: they found and fixed several
+real bugs — a Driver CPU spin on a closed handle, a screen-diff OOM on a
+malformed header, control-character and scroll-with-pen diff corruption, the
+wide-char model, a panic on a malformed `BytesState` diff, and an out-of-bounds
+in the prediction UTF-8 decoder.
 
 ```sh
 cargo test          # everything
