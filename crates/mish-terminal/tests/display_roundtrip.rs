@@ -167,14 +167,10 @@ fn focus_mode_roundtrips() {
     emu.feed(b"\x1b[?1004h");
     let on = emu.snapshot();
     assert!(on.focus_event, "emulator tracks focus-event mode");
-    assert_eq!(apply(&off0, &on).focus_event, true, "1004 set round-trips");
+    assert!(apply(&off0, &on).focus_event, "1004 set round-trips");
     emu.feed(b"\x1b[?1004l");
     let off1 = emu.snapshot();
-    assert_eq!(
-        apply(&on, &off1).focus_event,
-        false,
-        "1004 reset round-trips"
-    );
+    assert!(!apply(&on, &off1).focus_event, "1004 reset round-trips");
 }
 
 /// Alternate-scroll mode (DECSET 1007) — default on in the emulator — round-trips.
@@ -186,14 +182,10 @@ fn alternate_scroll_mode_roundtrips() {
     emu.feed(b"\x1b[?1007l");
     let off = emu.snapshot();
     assert!(!off.alternate_scroll, "1007l turns it off");
-    assert_eq!(
-        apply(&on, &off).alternate_scroll,
-        false,
-        "reset round-trips"
-    );
+    assert!(!apply(&on, &off).alternate_scroll, "reset round-trips");
     emu.feed(b"\x1b[?1007h");
     let on2 = emu.snapshot();
-    assert_eq!(apply(&off, &on2).alternate_scroll, true, "set round-trips");
+    assert!(apply(&off, &on2).alternate_scroll, "set round-trips");
 }
 
 /// OSC 52 clipboard is decoded by the emulator and re-emitted (base64) by the
