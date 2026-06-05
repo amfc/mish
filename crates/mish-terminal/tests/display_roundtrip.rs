@@ -93,6 +93,8 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
                 focus_event: false,
                 alternate_scroll: true,
                 clipboard: None,
+                app_cursor_keys: false,
+                bell_count: 0,
             })
     })
 }
@@ -135,6 +137,8 @@ fn scroll_up_is_minimal_and_correct() {
             focus_event: false,
             alternate_scroll: true,
             clipboard: None,
+            app_cursor_keys: false,
+            bell_count: 0,
         }
     };
     let old = mk(["row0", "row1", "row2", "row3", "row4", "row5"]);
@@ -186,6 +190,41 @@ fn alternate_scroll_mode_roundtrips() {
     emu.feed(b"\x1b[?1007h");
     let on2 = emu.snapshot();
     assert!(apply(&off, &on2).alternate_scroll, "set round-trips");
+}
+
+/// Application-cursor-keys mode (DECCKM / DECSET 1) round-trips both ways — this
+/// is what makes the client's arrow keys send the SS3 form inside vim/less.
+#[test]
+fn app_cursor_keys_roundtrips() {
+    let mut emu = Emulator::new(10, 3);
+    let off = emu.snapshot();
+    assert!(!off.app_cursor_keys, "default off");
+    emu.feed(b"\x1b[?1h");
+    let on = emu.snapshot();
+    assert!(on.app_cursor_keys, "DECSET 1 enables app cursor keys");
+    assert!(apply(&off, &on).app_cursor_keys, "set round-trips");
+    emu.feed(b"\x1b[?1l");
+    let off2 = emu.snapshot();
+    assert!(!apply(&on, &off2).app_cursor_keys, "reset round-trips");
+}
+
+/// Terminal bells are counted and the diff replays the delta as BEL bytes.
+#[test]
+fn bell_roundtrips() {
+    let mut emu = Emulator::new(10, 2);
+    let before = emu.snapshot();
+    assert_eq!(before.bell_count, 0);
+    emu.feed(b"\x07\x07"); // two beeps
+    let after = emu.snapshot();
+    assert_eq!(after.bell_count, 2, "emulator counts bells");
+    // The diff carries exactly two BELs and reconstructs the count.
+    let diff = new_frame(&before, &after, true);
+    assert_eq!(diff.iter().filter(|&&b| b == 0x07).count(), 2, "delta BELs");
+    assert_eq!(
+        apply(&before, &after).bell_count,
+        2,
+        "bell count round-trips"
+    );
 }
 
 /// OSC 52 clipboard is decoded by the emulator and re-emitted (base64) by the
@@ -249,6 +288,8 @@ fn lines_to_screen(cols: u16, labels: &[&str]) -> Screen {
         focus_event: false,
         alternate_scroll: true,
         clipboard: None,
+        app_cursor_keys: false,
+        bell_count: 0,
     }
 }
 
@@ -350,8 +391,8 @@ proptest! {
         let n = cols as usize * rows as usize;
         let mut a_cells = cells_a; a_cells.resize(n, Cell::default());
         let mut b_cells = cells_b; b_cells.resize(n, Cell::default());
-        let old = Screen { cols, rows, cells: a_cells, cursor_row: ca.min(rows-1), cursor_col: cb.min(cols-1), cursor_visible: true, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, clipboard: None };
-        let new = Screen { cols, rows, cells: b_cells, cursor_row: (rows-1).min(ca), cursor_col: (cols-1).min(cb), cursor_visible: false, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, clipboard: None };
+        let old = Screen { cols, rows, cells: a_cells, cursor_row: ca.min(rows-1), cursor_col: cb.min(cols-1), cursor_visible: true, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, clipboard: None, app_cursor_keys: false, bell_count: 0 };
+        let new = Screen { cols, rows, cells: b_cells, cursor_row: (rows-1).min(ca), cursor_col: (cols-1).min(cb), cursor_visible: false, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, clipboard: None, app_cursor_keys: false, bell_count: 0 };
         let got = apply(&old, &new);
         if !screen_eq(&got, &new) {
             let fd = (0..new.cells.len()).find(|&i| got.cells.get(i) != new.cells.get(i));

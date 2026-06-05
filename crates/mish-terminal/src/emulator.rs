@@ -34,6 +34,8 @@ struct TermListener {
     answerback: Arc<Mutex<Vec<u8>>>,
     /// Current screen size `(cols, rows)`, for text-area-size replies.
     size: Arc<Mutex<(u16, u16)>>,
+    /// Monotonic count of terminal bells (BEL) seen.
+    bell_count: Arc<Mutex<u64>>,
 }
 
 impl TermListener {
@@ -61,6 +63,8 @@ impl EventListener for TermListener {
             Event::ColorRequest(index, format) => {
                 self.push_answerback(&format(default_palette_rgb(index)));
             }
+            // Terminal bell (BEL / ^G) — counted; the diff replays the delta.
+            Event::Bell => *self.bell_count.lock().unwrap() += 1,
             // CSI 14/18 t text-area size: answer in cells (we have no pixel size).
             Event::TextAreaSizeRequest(format) => {
                 let (cols, rows) = *self.size.lock().unwrap();
@@ -218,6 +222,8 @@ impl Emulator {
             focus_event: mode.contains(TermMode::FOCUS_IN_OUT),
             alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
             clipboard: self.listener.clipboard.lock().unwrap().clone(),
+            app_cursor_keys: mode.contains(TermMode::APP_CURSOR),
+            bell_count: *self.listener.bell_count.lock().unwrap(),
         }
     }
 }

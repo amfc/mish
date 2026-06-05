@@ -87,6 +87,8 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
                     // unreachable transition; covered by dedicated directional
                     // tests in display_roundtrip.rs instead.
                     clipboard: None,
+                    app_cursor_keys: false,
+                    bell_count: 0,
                 },
             )
     })

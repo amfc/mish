@@ -123,6 +123,13 @@ pub struct Screen {
     /// Latest OSC 52 clipboard contents set by the remote application
     /// (latest-wins; `None` until something sets it). Server→client.
     pub clipboard: Option<String>,
+    /// Application-cursor-keys mode (DECCKM, DECSET 1) is active. Replayed onto
+    /// the client's terminal so its arrow keys send the SS3 form the remote app
+    /// expects (e.g. inside vim/less).
+    pub app_cursor_keys: bool,
+    /// Monotonic count of terminal bells (BEL). The diff emits the delta as BEL
+    /// bytes, so the client rings once per remote beep.
+    pub bell_count: u64,
 }
 
 impl Screen {
@@ -144,6 +151,8 @@ impl Screen {
             focus_event: false,
             alternate_scroll: true,
             clipboard: None,
+            app_cursor_keys: false,
+            bell_count: 0,
         }
     }
 
@@ -221,6 +230,8 @@ impl SyncState for Screen {
             focus_event: false,
             alternate_scroll: true,
             clipboard: None,
+            app_cursor_keys: false,
+            bell_count: 0,
         }
     }
 

@@ -332,6 +332,9 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
     if !initialized || old.bracketed_paste != new.bracketed_paste {
         set(frame, 2004, new.bracketed_paste);
     }
+    if !initialized || old.app_cursor_keys != new.app_cursor_keys {
+        set(frame, 1, new.app_cursor_keys); // DECCKM (application cursor keys)
+    }
     if !initialized || old.focus_event != new.focus_event {
         set(frame, 1004, new.focus_event);
     }
@@ -371,6 +374,15 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
         };
         let n = base + if new.cursor_blink { 0 } else { 1 };
         frame.push(&format!("\x1b[{n} q"));
+    }
+
+    // Terminal bell: emit one BEL (^G) per beep that happened since `old`. The
+    // count is monotonic and the receiver's emulator re-counts these, so the diff
+    // round-trips exactly. (A full repaint re-rings any accumulated bells, which
+    // is bounded and rare.) BEL doesn't move the cursor, so emitting it here is safe.
+    let beeps = new.bell_count.saturating_sub(old.bell_count);
+    for _ in 0..beeps {
+        frame.out.push(0x07);
     }
 }
 
