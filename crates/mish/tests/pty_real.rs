@@ -42,6 +42,7 @@ async fn real_shell_output_reaches_client() {
         24,
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
+        None,
         cin_rx,
         cout_tx,
     ));
@@ -91,6 +92,7 @@ async fn flow_control_does_not_deadlock() {
         24,
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
+        None,
         cin_rx,
         cout_tx,
     ));

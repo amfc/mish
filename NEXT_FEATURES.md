@@ -12,6 +12,13 @@ substrate**.
 These are deliberately *not* in `NOT_IMPLEMENTING.md`: that file is for legacy
 cruft we decline to port. This is net-new capability.
 
+> **Status (updated):** the enabling primitive (#0) and server-side scrollback
+> with the client scroll UX (#1) are **implemented** — see the
+> `feat(transport)`/`feat(scrollback)`/`feat(client)` commits, `mish-ssp::framing`,
+> `mish-quic` side-channels, `mish-terminal::history`, `mish::scrollback`, and the
+> client's Shift-PageUp/PageDown scroll mode. The remaining features (#2–#6)
+> below are still proposals.
+
 ## The one enabling primitive: turn on a reliable QUIC stream
 
 Today the QUIC connection is **datagram-only** — streams are explicitly disabled
@@ -42,7 +49,7 @@ Concretely this means:
 
 ---
 
-## 1. Server-side scrollback the client can scroll into  ⭐ do first
+## 1. Server-side scrollback the client can scroll into  ✅ done
 
 **Why.** mosh's single biggest real-world complaint is *no scrollback* — you're
 told to run tmux. Fixing it is a genuine leapfrog and a natural fit for our

@@ -114,6 +114,7 @@ async fn server_output_reaches_client_and_input_reaches_server() {
         24,
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
+        None,
         cin_rx,
         cout_tx,
     ));
@@ -174,6 +175,7 @@ async fn redraw_forces_full_repaint() {
         24,
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
+        None,
         cin_rx,
         cout_tx,
     ));
@@ -229,6 +231,7 @@ async fn client_resize_propagates_to_server_pty() {
         24,
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
+        None,
         cin_rx,
         cout_tx,
     ));

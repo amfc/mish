@@ -13,6 +13,7 @@ mish-quic = { path = "../mish-quic" }
 mish-terminal = { path = "../mish-terminal" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "signal", "process"] }
 bytes = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

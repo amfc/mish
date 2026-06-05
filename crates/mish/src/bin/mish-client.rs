@@ -8,7 +8,9 @@
 //! tracks SIGWINCH resizes. Quick-detach with `Ctrl-]`. The escape prefix
 //! `Ctrl-^` (configurable via `MOSH_ESCAPE_KEY`) then `.` quits, the prefix again
 //! sends it literally, and `Ctrl-Z` suspends; on resume (`fg`/SIGCONT) raw mode
-//! is restored and the screen repainted.
+//! is restored and the screen repainted. **Shift-PageUp / Shift-PageDown** scroll
+//! into the server's scrollback history (fetched over a reliable side-channel);
+//! any other keystroke returns to the live screen.
 //!
 //! Usage:
 //! ```text
@@ -298,6 +300,21 @@ async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init
                 }
                 Ok(n) => n,
             };
+            // Scrollback keys: Shift-PageUp / Shift-PageDown (xterm modifier
+            // encoding) drive the history viewer instead of being sent to the
+            // shell. These arrive as one atomic read in practice; checking the
+            // whole read keeps it out of the per-byte escape state machine.
+            match &buf[..n] {
+                b"\x1b[5;2~" => {
+                    let _ = key_tx.send(ClientInput::ScrollUp).await;
+                    continue;
+                }
+                b"\x1b[6;2~" => {
+                    let _ = key_tx.send(ClientInput::ScrollDown).await;
+                    continue;
+                }
+                _ => {}
+            }
             let mut batch: Vec<u8> = Vec::with_capacity(n);
             for &b in &buf[..n] {
                 if escaping {
@@ -397,13 +414,46 @@ async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init
 
     let clock = Arc::new(SystemClock::new());
 
+    // Share the transport with a scrollback fetcher (Shift-PgUp/PgDn pull history
+    // over a reliable side-channel).
+    let transport = Arc::new(t);
+    let history: Arc<dyn mish::client::HistoryFetcher> =
+        Arc::new(QuicHistory(transport.clone()));
+
     // Run until the session ends or the user detaches (Ctrl-] → ClientInput::
     // Detach, which triggers a clean shutdown handshake inside run_client).
     // Predictive echo mode comes from --predict / MOSH_PREDICTION_DISPLAY.
-    run_client(Arc::new(t), cols, rows, clock, predict, in_rx, out_tx).await;
+    run_client(
+        transport,
+        cols,
+        rows,
+        clock,
+        predict,
+        Some(history),
+        in_rx,
+        out_tx,
+    )
+    .await;
 
     drop(_guard);
     writer.abort();
+}
+
+/// Scrollback history fetcher backed by the session's QUIC connection: each
+/// fetch opens a reliable side-channel and asks the server for a window of
+/// history (see [`mish::scrollback::fetch_history`]).
+struct QuicHistory(Arc<transport::QuicTransport>);
+
+#[async_trait::async_trait]
+impl mish::client::HistoryFetcher for QuicHistory {
+    async fn fetch(
+        &self,
+        top_above: u32,
+        count: u16,
+    ) -> Option<mish_terminal::history::HistoryResponse> {
+        let req = mish_terminal::history::HistoryRequest { top_above, count };
+        mish::scrollback::fetch_history(&self.0, &req).await
+    }
 }
 
 /// Restores cooked mode and the main screen on drop, and resets the input modes

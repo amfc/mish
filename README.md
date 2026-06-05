@@ -78,10 +78,18 @@ mish-client user@host -- tmux attach     # run a specific command
 mish-client --local
 mish-client --local -- /bin/bash
 
-# Options: --ssh <cmd>  --server <cmd>
+# Options: --ssh <cmd>  --server <cmd>  --predict <mode>  --no-init
 # Keys: Ctrl-] quick-detach; escape prefix Ctrl-^ (MOSH_ESCAPE_KEY) then
 #       `.` quit / Ctrl-Z suspend (resumes cleanly on `fg`).
+#       Shift-PageUp / Shift-PageDown scroll into server-held scrollback.
 ```
+
+**Scrollback (better than mosh).** Unlike upstream mosh — which has no
+scrollback and tells you to run tmux — `mish-client` can scroll into the
+server's terminal history with **Shift-PageUp / Shift-PageDown**. The live screen
+keeps riding loss-tolerant datagrams; history is fetched on demand over a
+**reliable QUIC side-channel** and shown as a paused viewport (any keystroke
+returns to live). See [`NEXT_FEATURES.md`](NEXT_FEATURES.md).
 
 A blue status banner ("mish: Last contact N seconds ago…") appears when the link
 stalls, and the window title is prefixed `[mish]`.
@@ -121,6 +129,8 @@ the independent UDP/QUIC path.
 | Coverage-guided fuzz | libFuzzer + ASan targets (instruction decode, screen-diff apply, emulator-driven diff round-trip, fragment reassembler, UserStream decode, differential-vs-vt100) run as a CI smoke gate; checked-in regression seeds replayed first | `fuzz/` |
 | Differential emulator | identical VT byte streams fed to our emulator and an independent one (`vt100`) must render the same screen + cursor | `mish-terminal/tests/differential_emulator.rs` |
 | Real-PTY reference | output of a real program on a real kernel PTY rendered by our emulator and the independent `vt100` must agree (real bytes, independent oracle) | `mosh/tests/real_terminal_reference.rs` |
+| Side-channel | reliable bidi-stream request/response over real QUIC: framed round-trip + a 256 KiB payload past the datagram limit | `mish-quic/tests/side_channel.rs`, `mish-ssp` `framing` |
+| Scrollback | client fetches a deep history window over QUIC and gets the scrolled-off rows; client scroll-mode renders the history viewport headlessly | `mosh/tests/scrollback_e2e.rs`, `mosh/tests/scroll_client.rs` |
 | Diff-engine benchmark | throughput of `new_frame` + `apply_diff` round-trip across scrolling/typing/full-repaint workloads (mosh's `benchmark.cc`) | `mish-terminal/examples/diff_bench.rs` |
 | Clock fuzz | non-monotonic / jumping / boundary clock values into the core's timer math: no panic, bounded memory, and forward jumps still converge | `mish-ssp/tests/fuzz_clock.rs` |
 | Roaming | a client that migrates its source address mid-session keeps converging (server re-pins the peer) | `mish-madsim/tests/madsim_fullstack.rs` |
