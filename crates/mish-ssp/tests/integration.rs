@@ -122,6 +122,54 @@ async fn shutdown_responder_closes_without_being_acked() {
     drop((ha, tb));
 }
 
+/// Shutdown must still converge — and reasonably promptly — over a lossy,
+/// reordering link. The clean-link tests can't see this; the grace deadline
+/// exists precisely for lost handshake frames, yet nothing exercised it under
+/// loss. Measures convergence across several deterministic drop patterns and
+/// prints each, so a seed that falls back to the full 5s grace is visible.
+#[tokio::test]
+async fn shutdown_converges_under_loss() {
+    use mish_ssp::memory::Impairments;
+    use std::time::Instant;
+
+    for seed in [1u64, 2, 7, 42, 1234, 99999] {
+        let imp = Impairments {
+            loss: 0.3,
+            min_delay_ms: 2,
+            max_delay_ms: 20,
+            seed,
+            ..Default::default()
+        };
+        let (ta, tb) = mish_ssp::memory::pair_with(imp);
+        let clock = Arc::new(SystemClock::new());
+        let (da, ha) =
+            Driver::<_, BytesState, BytesState>::with(Arc::new(ta), clock.clone(), fast_cfg());
+        let (db, hb) = Driver::<_, BytesState, BytesState>::with(Arc::new(tb), clock, fast_cfg());
+        let task_a = da.spawn();
+        let task_b = db.spawn();
+
+        // Establish, then A initiates the shutdown.
+        ha.set_local(BytesState::new(b"hi".to_vec()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let start = Instant::now();
+        ha.shutdown();
+
+        let both = async {
+            let _ = task_a.await;
+            let _ = task_b.await;
+        };
+        // Liveness floor: grace (5s) + margin for retransmits and link delay.
+        tokio::time::timeout(Duration::from_secs(8), both)
+            .await
+            .unwrap_or_else(|_| panic!("seed {seed}: shutdown did not converge under loss"));
+        eprintln!(
+            "shutdown_converges_under_loss: seed {seed} converged in {} ms",
+            start.elapsed().as_millis()
+        );
+        drop((ha, hb));
+    }
+}
+
 async fn await_state(handle: &mut Handle, want: &[u8]) {
     if handle.remote().as_slice() == want {
         return;

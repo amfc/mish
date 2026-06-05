@@ -269,31 +269,64 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
         frame.push("\x1b[?25l");
     }
 
+    // Single O(N) pass over the grid: record which rows changed (old vs new) and
+    // the changed band `[band_top, band_bottom]`. The cell array is large, so this
+    // one scan — shared by scroll detection *and* put_row's redraw decision —
+    // replaces the two full-screen scans the old code did (one in scroll
+    // detection, one per-row in put_row), which dominated the cost of a typical
+    // small diff. (`initialized` already implies matching dimensions.)
+    let mut row_changed = vec![false; new.rows as usize];
+    let (mut band_top, mut band_bottom): (Option<u16>, u16) = (None, 0);
+    if initialized {
+        let w = new.cols as usize;
+        for y in 0..new.rows {
+            let yi = y as usize * w;
+            if old.cells[yi..yi + w] != new.cells[yi..yi + w] {
+                row_changed[y as usize] = true;
+                band_top.get_or_insert(y);
+                band_bottom = y;
+            }
+        }
+    }
+
     // Vertical-scroll detection: if `new` is `old` with a (sub-)region scrolled
     // up or down, emit a cheap scroll (a few line feeds / reverse-indexes, with a
-    // scroll region for sub-regions) and redraw only the exposed rows, instead of
-    // repainting every shifted row. The synthesized `baseline` models exactly
-    // what the emitted escapes do to the screen, so the put_row pass below
+    // scroll region for sub-regions) and redraw only the exposed rows. Only worth
+    // attempting when ≥2 rows changed (a scroll shifts a band); the k-search runs
+    // over the already-found band, not the whole screen. The synthesized
+    // `baseline` models exactly what the emitted escapes do, so the put_row pass
     // redraws only the genuine remainder — and the round-trip stays exact.
     let mut baseline_owned: Option<Screen> = None;
-    if initialized {
-        if let Some(op) = detect_scroll(old, new) {
-            // Scrolls fill newly-exposed lines with the *current* pen's background
-            // (BCE). Reset to the default pen first so exposed rows match the
-            // default-blank scrolled baseline.
-            frame.update_rendition(
-                Color::Named(NAMED_FOREGROUND),
-                Color::Named(NAMED_BACKGROUND),
-                0,
-            );
-            emit_scroll(&mut frame, new.rows, op);
-            baseline_owned = Some(apply_scroll(old, op));
+    let mut scrolled = false;
+    if let Some(top) = band_top {
+        if band_bottom > top && new.rows >= 2 {
+            if let Some(op) = scroll_in_band(old, new, top, band_bottom) {
+                // Scrolls fill newly-exposed lines with the *current* pen's
+                // background (BCE). Reset to the default pen first so exposed rows
+                // match the default-blank scrolled baseline.
+                frame.update_rendition(
+                    Color::Named(NAMED_FOREGROUND),
+                    Color::Named(NAMED_BACKGROUND),
+                    0,
+                );
+                emit_scroll(&mut frame, new.rows, op);
+                baseline_owned = Some(apply_scroll(old, op));
+                scrolled = true;
+            }
         }
     }
     let baseline = baseline_owned.as_ref().unwrap_or(old);
 
     for y in 0..new.rows {
-        put_row(&mut frame, baseline, new, y, initialized);
+        // After a scroll the baseline differs from `old`, so the old-vs-new change
+        // bitmap no longer applies — have put_row re-diff against the baseline.
+        // Otherwise we already know which rows changed, so put_row skips its scan.
+        let known = if initialized && !scrolled {
+            Some(row_changed[y as usize])
+        } else {
+            None
+        };
+        put_row(&mut frame, baseline, new, y, initialized, known);
     }
 
     // Final cursor position.
@@ -387,13 +420,30 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
 }
 
 #[allow(clippy::too_many_arguments)]
-fn put_row(frame: &mut FrameState, old: &Screen, new: &Screen, y: u16, initialized: bool) {
+fn put_row(
+    frame: &mut FrameState,
+    old: &Screen,
+    new: &Screen,
+    y: u16,
+    initialized: bool,
+    known_changed: Option<bool>,
+) {
     let width = new.cols;
     let same_dims = old.cols == new.cols && old.rows == new.rows;
 
-    // Identical row (when comparable) needs nothing.
-    if initialized && same_dims && y < old.rows && row_eq(old, new, y) {
-        return;
+    // Identical row (when comparable) needs nothing. `known_changed` lets the
+    // caller skip this per-row scan when it already computed the change set in a
+    // single shared pass; `None` falls back to scanning the row here.
+    if initialized && same_dims && y < old.rows {
+        match known_changed {
+            Some(false) => return,
+            Some(true) => {}
+            None => {
+                if row_eq(old, new, y) {
+                    return;
+                }
+            }
+        }
     }
 
     let mut x: u16 = 0;
@@ -502,40 +552,18 @@ struct Scroll {
     down: bool,
 }
 
-/// Detect whether `new` is `old` with one contiguous region scrolled up or down.
-/// Returns the smallest-`k` scroll found, preferring up over down. `None` if the
-/// screens are identical, differently sized, or not related by a single scroll.
-fn detect_scroll(old: &Screen, new: &Screen) -> Option<Scroll> {
-    if old.cols != new.cols || old.rows != new.rows || old.rows < 2 {
-        return None;
-    }
-    if old.cells == new.cells {
-        return None;
-    }
-    let rows = new.rows;
+/// Detect whether the already-found changed band `[top, bottom]` (with
+/// `bottom > top`) is explained by a single vertical scroll within it. The caller
+/// finds the band in its own single grid pass; this does only the k-search, so
+/// the expensive full-screen scan isn't repeated. Returns the smallest-`k` scroll,
+/// preferring up over down. `None` if no single scroll explains the band.
+fn scroll_in_band(old: &Screen, new: &Screen, top: u16, bottom: u16) -> Option<Scroll> {
     let w = new.cols as usize;
     let row_eq = |a: u16, b: u16| {
         let ai = a as usize * w;
         let bi = b as usize * w;
         old.cells[ai..ai + w] == new.cells[bi..bi + w]
     };
-
-    // The band of rows that actually differ. Rows outside it are unchanged
-    // between old and new, so a scroll confined to [top, bottom] explains the
-    // whole frame.
-    let mut top = None;
-    let mut bottom = 0u16;
-    for y in 0..rows {
-        let yi = y as usize * w;
-        if old.cells[yi..yi + w] != new.cells[yi..yi + w] {
-            top.get_or_insert(y);
-            bottom = y;
-        }
-    }
-    let top = top?;
-    if bottom <= top {
-        return None; // a single changed row can't be a scroll
-    }
     let region_h = bottom - top + 1;
 
     // Scroll up by k within [top, bottom]: new[top+i] == old[top+i+k].
