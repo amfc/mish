@@ -320,7 +320,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
     /// which is what triggers retransmission of lost data.
     fn update_assumed_receiver_state(&mut self, now: Millis) {
         self.assumed_receiver_idx = 0;
-        let window = self.timeout() + self.cfg.ack_delay;
+        let window = self.timeout().saturating_add(self.cfg.ack_delay);
         for i in 1..self.sent_states.len() {
             let age = now.saturating_sub(self.sent_states[i].timestamp);
             if age < window {
@@ -348,37 +348,48 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         self.update_assumed_receiver_state(now);
         self.rationalize_states();
 
-        if self.pending_data_ack && self.next_ack_time > now + self.cfg.ack_delay {
-            self.next_ack_time = now + self.cfg.ack_delay;
+        if self.pending_data_ack && self.next_ack_time > now.saturating_add(self.cfg.ack_delay) {
+            self.next_ack_time = now.saturating_add(self.cfg.ack_delay);
         }
 
         let back = self.sent_states.back().expect("never empty");
         let front = self.sent_states.front().expect("never empty");
-        let active = self.last_heard + self.cfg.active_retry_timeout > now;
+        let active = self
+            .last_heard
+            .saturating_add(self.cfg.active_retry_timeout)
+            > now;
 
         if !self.current_state.equals(&back.state) {
             // We have new local data not yet sent.
             if self.mindelay_clock.is_none() {
                 self.mindelay_clock = Some(now);
             }
-            let mindelay = self.mindelay_clock.unwrap() + self.cfg.send_mindelay;
-            self.next_send_time = mindelay.max(back.timestamp + self.send_interval());
+            let mindelay = self
+                .mindelay_clock
+                .unwrap()
+                .saturating_add(self.cfg.send_mindelay);
+            self.next_send_time = mindelay.max(back.timestamp.saturating_add(self.send_interval()));
         } else if !self.current_state.equals(&self.assumed().state) && active {
             // Sent, but not yet (assumed) delivered — retransmit at frame rate.
-            self.next_send_time = back.timestamp + self.send_interval();
+            self.next_send_time = back.timestamp.saturating_add(self.send_interval());
             if let Some(mc) = self.mindelay_clock {
-                self.next_send_time = self.next_send_time.max(mc + self.cfg.send_mindelay);
+                self.next_send_time = self
+                    .next_send_time
+                    .max(mc.saturating_add(self.cfg.send_mindelay));
             }
         } else if !self.current_state.equals(&front.state) && active {
             // Unacked but assumed-delivered: wait a full timeout before re-poking.
-            self.next_send_time = back.timestamp + self.timeout() + self.cfg.ack_delay;
+            self.next_send_time = back
+                .timestamp
+                .saturating_add(self.timeout())
+                .saturating_add(self.cfg.ack_delay);
         } else {
             self.next_send_time = NEVER;
         }
 
         if self.ack_num == u64::MAX {
             // shutdown special-case (reserved)
-            self.next_ack_time = back.timestamp + self.send_interval();
+            self.next_ack_time = back.timestamp.saturating_add(self.send_interval());
         }
     }
 
@@ -414,7 +425,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             let mut out = Vec::new();
             if now >= self.next_send_time {
                 self.emit_shutdown(now, &mut out);
-                self.next_send_time = now + self.send_interval();
+                self.next_send_time = now.saturating_add(self.send_interval());
             }
             return out;
         }
@@ -461,7 +472,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         self.emit(now, diff, new_num, out);
 
         self.assumed_receiver_idx = self.sent_states.len() - 1;
-        self.next_ack_time = now + self.cfg.ack_interval;
+        self.next_ack_time = now.saturating_add(self.cfg.ack_interval);
         self.next_send_time = NEVER;
     }
 
@@ -469,7 +480,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         let new_num = self.sent_states.back().expect("never empty").num + 1;
         self.add_sent_state(now, new_num);
         self.emit(now, Vec::new(), new_num, out);
-        self.next_ack_time = now + self.cfg.ack_interval;
+        self.next_ack_time = now.saturating_add(self.cfg.ack_interval);
         self.next_send_time = NEVER;
     }
 

@@ -110,6 +110,8 @@ the independent UDP/QUIC path.
 | Fuzz/robustness | no-panic on arbitrary wire bytes / screen diffs / VT input; hostile-peer instructions (bounded, no-panic) + prediction-engine fuzz | `*/tests/fuzz_*.rs` |
 | Coverage-guided fuzz | libFuzzer + ASan targets (decode, screen-diff apply, emulator-driven diff round-trip) run as a CI smoke gate | `fuzz/` |
 | Differential emulator | identical VT byte streams fed to our emulator and an independent one (`vt100`) must render the same screen + cursor | `mish-terminal/tests/differential_emulator.rs` |
+| Clock fuzz | non-monotonic / jumping / boundary clock values into the core's timer math: no panic, bounded memory, and forward jumps still converge | `mish-ssp/tests/fuzz_clock.rs` |
+| Roaming | a client that migrates its source address mid-session keeps converging (server re-pins the peer) | `mish-madsim/tests/madsim_fullstack.rs` |
 | Diff round-trip fuzz | structured-VT sequences + real-shell PTY replay, asserting the wire diff reproduces every screen transition | `mish-terminal/tests/fuzz_diff.rs`, `mosh/tests/replay.rs` |
 | Transparency | client's reconstructed screen == server's emulator screen, over the full stack + deterministically under loss | `mosh/tests/transparency.rs` |
 | Live-Driver fuzz | the async event loop survives a sustained garbage-datagram flood interleaved with honest traffic and still converges | `mish-ssp/tests/fuzz_driver_live.rs` |
@@ -121,9 +123,10 @@ The fuzz/round-trip harnesses earned their keep: they found and fixed several
 real bugs — a Driver CPU spin on a closed handle, a screen-diff OOM on a
 malformed header, control-character and scroll-with-pen diff corruption, the
 wide-char model, a panic on a malformed `BytesState` diff, an out-of-bounds in
-the prediction UTF-8 decoder, and (via the libFuzzer `screen_apply` target) a
+the prediction UTF-8 decoder, (via the libFuzzer `screen_apply` target) a
 zero-dimension diff header that slipped past the cell-count guard and panicked
-the emulator grid.
+the emulator grid, and (via the clock fuzzer) timer-math add-overflows on
+boundary timestamps — all now fixed and regression-guarded.
 
 ```sh
 cargo test          # everything

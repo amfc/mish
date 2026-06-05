@@ -198,3 +198,96 @@ async fn full_stack_transparency_clean() {
 async fn full_stack_transparency_under_loss() {
     assert!(run(0.2).await, "transparency must hold under 20% loss");
 }
+
+/// Roaming client: types its input, then *migrates to a fresh source address*
+/// mid-session (mosh's headline feature — surviving an IP/port change). The
+/// server tracks the peer by the address it last heard from, so once the client
+/// sends from the new socket the session must continue and converge. Returns
+/// whether transparency held after the migration.
+async fn roaming_client_node(server: SocketAddr, input: Vec<u8>) -> bool {
+    let bind_ephemeral = || async {
+        UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap()
+    };
+    let mut sock = bind_ephemeral().await;
+    let mut core = SspCore::<UserStream, Screen>::with_config(0, cfg());
+    let mut frag = Fragmenter::new();
+    let mut defrag = Defragmenter::new();
+    let mut buf = vec![0u8; 65536];
+
+    let mut ref_emu = Emulator::new(80, 24);
+    ref_emu.feed(&shell_output(&input));
+    let expected = ref_emu.snapshot();
+
+    let mut stream = UserStream::new();
+    stream.push_resize(80, 24);
+    stream.push_keystroke(input);
+    core.set_current_state(stream);
+
+    let mut contacted = false;
+    let mut roamed = false;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(120) {
+        let now = start.elapsed().as_millis() as u64;
+        send_all(&sock, Some(server), &mut frag, core.tick(now)).await;
+
+        if screen_eq(core.remote_state(), &expected) {
+            // Require the migration to have actually happened before we pass.
+            return roamed;
+        }
+
+        // Once we've made contact, jump to a brand-new source address. The next
+        // tick-driven datagram (a keepalive ack within ack_interval) leaves from
+        // the new socket and the server re-pins the peer there.
+        if contacted && !roamed {
+            sock = bind_ephemeral().await;
+            roamed = true;
+        }
+
+        let wait = core.wait_time(now).unwrap_or(3_600_000).max(1);
+        if let Ok(Ok((n, _))) = timeout(Duration::from_millis(wait), sock.recv_from(&mut buf)).await
+        {
+            contacted = true;
+            if let Some(payload) = defrag.push(&buf[..n]) {
+                if let Some(inst) = Instruction::decode(&payload) {
+                    let now2 = start.elapsed().as_millis() as u64;
+                    core.recv(now2, &inst);
+                }
+            }
+        }
+    }
+    false
+}
+
+async fn run_roaming() -> bool {
+    let handle = Handle::current();
+    madsim::net::NetSim::current().update_config(|c| {
+        c.packet_loss_rate = 0.0;
+        c.send_latency = Duration::from_millis(5)..Duration::from_millis(40);
+    });
+    let server_ip = "10.0.0.1".parse().unwrap();
+    let server = handle.create_node().ip(server_ip).build();
+    let client = handle.create_node().ip("10.0.0.2".parse().unwrap()).build();
+    let saddr = SocketAddr::new(server_ip, PORT);
+    server.spawn(async move { server_node(saddr).await });
+
+    let mut input = Vec::new();
+    for i in 0..20 {
+        input.extend_from_slice(format!("roaming line {i}\r").as_bytes());
+    }
+    input.extend_from_slice(b"ROAM_OK\r");
+
+    client
+        .spawn(async move { roaming_client_node(saddr, input).await })
+        .await
+        .unwrap()
+}
+
+#[madsim::test]
+async fn full_stack_transparency_with_roaming() {
+    assert!(
+        run_roaming().await,
+        "session must survive a client source-address migration and converge"
+    );
+}
