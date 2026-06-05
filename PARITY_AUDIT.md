@@ -80,15 +80,19 @@ TLS verification" line is stale, but the *client-auth* direction is the real gap
   disconnected sessions is not implemented (also surfaces under server & build dims).
 
 **State sync / prediction**
-- **`ECHO_TIMEOUT` (50 ms late-ack)** + `input_history`/`set_echo_ack`/`wait_time` machinery
-  absent — affects prediction-ack timing fidelity.
-- No bulk-input/paste guard that disables prediction for large reads (mosh suppresses
-  prediction on big pastes to avoid flicker).
+- **`ECHO_TIMEOUT` (50 ms late-ack)** — *resolved.* The `late_ack`/`echo_ack` gate this
+  feeds is how we judge a prediction (`Screen::echo_ack`); the 50 ms `wait_time()` poll is
+  the client's repaint `advance(now)` aging. (`input_history` itself is unused by mosh's
+  `get_validity` — `early_ack` is `__attribute__((unused))`.)
+- Bulk-input/paste guard — *resolved.* A batch over `PASTE_THRESHOLD` (100 bytes) resets the
+  overlay and isn't predicted (`predict.rs`, mosh's `stmclient.cc` guard).
 - Prediction mode hardcoded `Adaptive`; no `--predict` / `MOSH_PREDICTION_DISPLAY`.
-- Cursor prediction not validated against the server cursor (no `ConditionalCursorMove`
-  `get_validity`) — mispredicted cursor can persist.
-- Glitch/long-pending trigger is a coarse boolean, missing the time-based
-  `GLITCH_THRESHOLD`/`GLITCH_FLAG_THRESHOLD` escalation (DOC'd).
+- Cursor prediction validated against the server cursor — *resolved.* A confirmed predicted
+  cursor that doesn't match the server's resyncs (mosh's `ConditionalCursorMove::get_validity`
+  → `IncorrectOrExpired`); no more lingering mispredicted cursor.
+- Glitch/long-pending trigger — *resolved.* Now a time-based counter: pending past
+  `GLITCH_THRESHOLD` (250 ms) forces display, past `GLITCH_FLAG_THRESHOLD` (5 s) also
+  underlines, cured by quick confirmations (mosh's `glitch_trigger`).
 
 **Server / bootstrap**
 - No **utmp/wtmp** login accounting (DOC'd), no **syslog** connection logging, no

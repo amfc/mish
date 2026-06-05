@@ -72,10 +72,13 @@ pub async fn run_client<T: Transport>(
     // a connection-status banner overlaid when the link has gone silent.
     macro_rules! repaint {
         () => {{
-            // Keep adaptive prediction in step with the measured link latency.
+            let now = clock.now_ms();
+            // Keep adaptive prediction in step with the measured link latency and
+            // let long-pending predictions escalate the glitch trigger over time.
             engine.set_srtt(handle.srtt_ms());
+            engine.advance(now);
             let predicted = engine.predicted_screen(&server_screen);
-            let silent_secs = clock.now_ms().saturating_sub(handle.last_recv_ms()) / 1000;
+            let silent_secs = now.saturating_sub(handle.last_recv_ms()) / 1000;
             let mut shown = mish_terminal::notification::stalled_overlay(&predicted, silent_secs)
                 .unwrap_or(predicted);
             // Prefix the window title so the user can tell they're in mosh (like
@@ -107,7 +110,7 @@ pub async fn run_client<T: Transport>(
                         stream.push_keystroke(b.clone());
                         handle.set_local(stream.clone());
                         // Speculatively echo the keystroke immediately.
-                        engine.new_user_bytes(&b, &server_screen, stream.total());
+                        engine.new_user_bytes(&b, &server_screen, stream.total(), clock.now_ms());
                         repaint!();
                     }
                     Some(ClientInput::Resize { cols, rows }) => {
@@ -131,7 +134,7 @@ pub async fn run_client<T: Transport>(
                 }
                 server_screen = remote.borrow_and_update().clone();
                 // Validate/cull predictions against the freshly-confirmed screen.
-                engine.new_server_screen(&server_screen);
+                engine.new_server_screen(&server_screen, clock.now_ms());
                 repaint!();
             }
         }

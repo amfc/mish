@@ -52,22 +52,27 @@ proptest! {
         eng.set_srtt(100.0); // above the adaptive trigger, so Adaptive shows
         let mut server = Screen::blank(24, 8);
         let mut idx = 0u64;
+        // A monotonic clock that advances a bit each op, so the time-based glitch
+        // aging is exercised (and asserted no-panic / bounded) too.
+        let mut now = 0u64;
 
         for op in ops {
+            now += 37;
             match op {
                 POp::Type(bytes) => {
                     idx += 1;
-                    eng.new_user_bytes(&bytes, &server, idx);
+                    eng.new_user_bytes(&bytes, &server, idx, now);
                 }
                 POp::Server { cols, rows, cur_r, cur_c, echo_ack } => {
                     let mut s = Screen::blank(cols, rows);
                     s.cursor_row = cur_r % rows;
                     s.cursor_col = cur_c % cols;
                     s.echo_ack = echo_ack;
-                    eng.new_server_screen(&s);
+                    eng.new_server_screen(&s, now);
                     server = s;
                 }
             }
+            eng.advance(now);
             // The displayed screen always matches the server's geometry.
             let shown = eng.predicted_screen(&server);
             prop_assert_eq!((shown.cols, shown.rows), (server.cols, server.rows));
@@ -77,7 +82,7 @@ proptest! {
         // No stuck state: confirming all input clears the overlay.
         let mut confirm = server.clone();
         confirm.echo_ack = u64::MAX;
-        eng.new_server_screen(&confirm);
+        eng.new_server_screen(&confirm, now);
         prop_assert_eq!(eng.active_predictions(), 0, "overlay must clear once fully confirmed");
     }
 }

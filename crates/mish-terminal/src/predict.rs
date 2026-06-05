@@ -44,6 +44,28 @@ const CONFIDENCE_TRIGGER: u32 = 10;
 /// reset meaningfully delays re-enabling, rather than being instantly refilled).
 const CONFIDENCE_CAP: u32 = 20;
 
+/// A single input batch larger than this is treated as a paste (or other bulk
+/// data) and **not** predicted: speculating on a hundreds-of-bytes blob just
+/// produces a flickery, usually-wrong overlay. Mirrors mosh's
+/// `bool paste = bytes_read > 100` in `stmclient.cc::process_user_input`.
+const PASTE_THRESHOLD: usize = 100;
+
+/// A prediction still unconfirmed this long (ms) is "glitchy": the link is slow
+/// enough that the user should see their speculative echo even on an otherwise
+/// quiet/fast-SRTT link. Forces the overlay on. (mosh `GLITCH_THRESHOLD`.)
+const GLITCH_THRESHOLD_MS: u64 = 250;
+/// Quick confirmations needed to cure the glitch trigger back to zero
+/// (mosh `GLITCH_REPAIR_COUNT`); also the level above which we additionally
+/// underline (a "really big glitch").
+const GLITCH_REPAIR_COUNT: u32 = 10;
+/// Minimum spacing (ms) between glitch-trigger decrements, so a burst of quick
+/// confirmations in one frame cures it gradually (mosh `GLITCH_REPAIR_MININTERVAL`).
+const GLITCH_REPAIR_MININTERVAL_MS: u64 = 150;
+/// A prediction unconfirmed this long (ms) is bad enough to both display *and*
+/// underline, signalling the user that the link has stalled (mosh
+/// `GLITCH_FLAG_THRESHOLD`).
+const GLITCH_FLAG_THRESHOLD_MS: u64 = 5000;
+
 #[derive(Clone)]
 struct CellPrediction {
     row: u16,
@@ -56,6 +78,9 @@ struct CellPrediction {
     /// prediction that merely re-asserts the existing glyph is no evidence that
     /// speculation is working (mosh's `CorrectNoCredit`).
     credit: bool,
+    /// Monotonic time (ms) this prediction was made, for the long-pending
+    /// "glitch" aging (mosh's `ConditionalOverlay::prediction_time`).
+    predicted_at_ms: u64,
 }
 
 /// Speculative overlay of unconfirmed local input.
@@ -65,6 +90,8 @@ pub struct PredictionEngine {
     cursor_row: u16,
     cursor_col: u16,
     cursor_index: u64,
+    /// Time (ms) the cursor prediction was last moved, for glitch aging.
+    cursor_at_ms: u64,
     have_cursor: bool,
     /// Buffer for an incomplete trailing UTF-8 sequence.
     utf8: Vec<u8>,
@@ -77,9 +104,19 @@ pub struct PredictionEngine {
     /// Underline tentative (unconfirmed) predictions so they read as speculative
     /// (mosh's prediction "flagging").
     flagging: bool,
-    /// After a misprediction, briefly suppress the overlay until the next clean
-    /// server update, to avoid flicker (mosh's glitch trigger).
-    glitch: bool,
+    /// After a misprediction, suppress the overlay until the next clean server
+    /// update, to avoid flicker. Approximates mosh's epoch/tentative resync:
+    /// once we've diverged, show the truth until the server agrees again.
+    resync_suppress: bool,
+    /// Long-pending-prediction trigger (mosh's `glitch_trigger`). A *counter*,
+    /// not a boolean: while > 0 the overlay is forced on even on a fast/quiet
+    /// link (the user's keystrokes are visibly queued); above
+    /// [`GLITCH_REPAIR_COUNT`] it also underlines. Quick confirmations decrement
+    /// it; a stalled prediction escalates it (see [`Self::advance`]).
+    glitch_trigger: u32,
+    /// Time (ms) of the last glitch-curing quick confirmation, to rate-limit
+    /// decrements (mosh's `last_quick_confirmation`).
+    last_quick_confirmation_ms: u64,
     /// Accumulated credited-correct predictions (see [`CONFIDENCE_TRIGGER`]).
     confidence: u32,
     cols: u16,
@@ -94,12 +131,15 @@ impl PredictionEngine {
             cursor_row: 0,
             cursor_col: 0,
             cursor_index: 0,
+            cursor_at_ms: 0,
             have_cursor: false,
             utf8: Vec::new(),
             suppress: false,
             srtt_ms: 0.0,
             flagging: true,
-            glitch: false,
+            resync_suppress: false,
+            glitch_trigger: 0,
+            last_quick_confirmation_ms: 0,
             confidence: 0,
             cols: 0,
             rows: 0,
@@ -118,19 +158,31 @@ impl PredictionEngine {
 
     /// Whether predictions should currently be displayed.
     fn showing(&self) -> bool {
-        if self.glitch {
+        if self.resync_suppress {
             return false; // suppressed after a recent misprediction
         }
         match self.mode {
             PredictMode::Never => false,
             PredictMode::Always => true,
-            // Show on a laggy link (immediate benefit), OR once we've built a
-            // track record of correct predictions on this link/app — so a
-            // borderline-latency link still gets snappy echo once we're confident.
+            // Show on a laggy link (immediate benefit), once we've built a track
+            // record of correct predictions on this link/app (so a borderline
+            // link still gets snappy echo), OR while a prediction has been
+            // pending long enough to look stalled (glitch trigger) — then we
+            // surface the speculation so typing doesn't appear to vanish.
             PredictMode::Adaptive => {
-                self.srtt_ms >= ADAPTIVE_SRTT_TRIGGER_MS || self.confidence >= CONFIDENCE_TRIGGER
+                self.srtt_ms >= ADAPTIVE_SRTT_TRIGGER_MS
+                    || self.confidence >= CONFIDENCE_TRIGGER
+                    || self.glitch_trigger > 0
             }
         }
+    }
+
+    /// Whether tentative predictions should be underlined right now: either the
+    /// user/link preference ([`Self::set_flagging`], default on) or a severe
+    /// glitch (a prediction pending past [`GLITCH_FLAG_THRESHOLD_MS`] pushed the
+    /// trigger above [`GLITCH_REPAIR_COUNT`]).
+    fn flag_predictions(&self) -> bool {
+        self.flagging || self.glitch_trigger > GLITCH_REPAIR_COUNT
     }
 
     fn reset(&mut self) {
@@ -143,10 +195,17 @@ impl PredictionEngine {
     }
 
     /// Register local keystroke `bytes`, typed at client input index
-    /// `input_index` (the `UserStream::total()` after appending them), against
-    /// the currently displayed `base` screen.
-    pub fn new_user_bytes(&mut self, bytes: &[u8], base: &Screen, input_index: u64) {
+    /// `input_index` (the `UserStream::total()` after appending them) at
+    /// monotonic time `now_ms`, against the currently displayed `base` screen.
+    pub fn new_user_bytes(&mut self, bytes: &[u8], base: &Screen, input_index: u64, now_ms: u64) {
         if self.mode == PredictMode::Never {
+            return;
+        }
+        // Bulk data (a paste) is not predicted: a large speculative overlay just
+        // flickers and is usually wrong. Drop any in-flight overlay and skip the
+        // batch entirely (mosh's `paste` guard) — the real screen shows the truth.
+        if bytes.len() > PASTE_THRESHOLD {
+            self.reset();
             return;
         }
         self.cols = base.cols;
@@ -171,7 +230,7 @@ impl PredictionEngine {
                     let chars: Vec<char> = s.chars().collect();
                     self.utf8.clear();
                     for ch in chars {
-                        self.predict_char(ch, input_index, base);
+                        self.predict_char(ch, input_index, base, now_ms);
                     }
                     break;
                 }
@@ -183,7 +242,7 @@ impl PredictionEngine {
                             .chars()
                             .collect();
                         for ch in chars {
-                            self.predict_char(ch, input_index, base);
+                            self.predict_char(ch, input_index, base, now_ms);
                         }
                     }
                     match e.error_len() {
@@ -203,7 +262,7 @@ impl PredictionEngine {
         }
     }
 
-    fn predict_char(&mut self, ch: char, input_index: u64, base: &Screen) {
+    fn predict_char(&mut self, ch: char, input_index: u64, base: &Screen, now_ms: u64) {
         if self.suppress {
             return; // inside an unpredictable (escape) sequence
         }
@@ -212,6 +271,7 @@ impl PredictionEngine {
             '\r' => {
                 self.cursor_col = 0;
                 self.cursor_index = input_index;
+                self.cursor_at_ms = now_ms;
             }
             // Line feed: next row (predicting scroll is unsafe, so clamp).
             '\n' => {
@@ -220,6 +280,7 @@ impl PredictionEngine {
                     self.cursor_row += 1;
                 }
                 self.cursor_index = input_index;
+                self.cursor_at_ms = now_ms;
             }
             // Backspace / delete: move left and predict an erased cell.
             '\u{8}' | '\u{7f}' => {
@@ -228,14 +289,16 @@ impl PredictionEngine {
                     c: ' ',
                     ..Cell::default()
                 };
-                self.push_cell(cell, input_index, base);
+                self.push_cell(cell, input_index, base, now_ms);
                 self.cursor_index = input_index;
+                self.cursor_at_ms = now_ms;
             }
             // Tab: advance to the next multiple of 8.
             '\t' => {
                 let next = ((self.cursor_col / 8) + 1) * 8;
                 self.cursor_col = next.min(self.cols - 1);
                 self.cursor_index = input_index;
+                self.cursor_at_ms = now_ms;
             }
             // Any other control character or escape: we can't safely predict the
             // effect, so abandon speculation and fall back to the real screen.
@@ -261,13 +324,13 @@ impl PredictionEngine {
                             c,
                             ..Cell::default()
                         };
-                        self.push_cell(wide, input_index, base);
+                        self.push_cell(wide, input_index, base, now_ms);
                         self.advance_cursor();
                         let spacer = Cell {
                             c: ' ',
                             ..Cell::default()
                         };
-                        self.push_cell(spacer, input_index, base);
+                        self.push_cell(spacer, input_index, base, now_ms);
                         self.advance_cursor();
                     }
                     _ => {
@@ -275,16 +338,17 @@ impl PredictionEngine {
                             c,
                             ..Cell::default()
                         };
-                        self.push_cell(cell, input_index, base);
+                        self.push_cell(cell, input_index, base, now_ms);
                         self.advance_cursor();
                     }
                 }
                 self.cursor_index = input_index;
+                self.cursor_at_ms = now_ms;
             }
         }
     }
 
-    fn push_cell(&mut self, cell: Cell, input_index: u64, base: &Screen) {
+    fn push_cell(&mut self, cell: Cell, input_index: u64, base: &Screen, now_ms: u64) {
         let (row, col) = (self.cursor_row, self.cursor_col);
         // Credit this prediction only if it changes what's displayed there: an
         // earlier prediction at the same cell if present, else the server cell.
@@ -303,6 +367,7 @@ impl PredictionEngine {
             cell,
             input_index,
             credit,
+            predicted_at_ms: now_ms,
         });
     }
 
@@ -318,10 +383,11 @@ impl PredictionEngine {
         }
     }
 
-    /// Incorporate a freshly received server screen: validate predictions the
-    /// server has now applied (`input_index <= screen.echo_ack`) and cull or, on
-    /// a misprediction, flush everything.
-    pub fn new_server_screen(&mut self, screen: &Screen) {
+    /// Incorporate a freshly received server screen received at `now_ms`:
+    /// validate predictions the server has now applied (`input_index <=
+    /// screen.echo_ack`, mosh's `late_ack`) and cull or, on a misprediction,
+    /// flush everything.
+    pub fn new_server_screen(&mut self, screen: &Screen, now_ms: u64) {
         if self.mode == PredictMode::Never {
             self.reset();
             return;
@@ -330,22 +396,29 @@ impl PredictionEngine {
 
         // A mispredicted, now-confirmed cell means our speculation diverged from
         // reality: drop all predictions and resync to the server.
-        let mispredict = self.cells.iter().any(|p| {
+        let cell_mispredict = self.cells.iter().any(|p| {
             p.input_index <= ack
                 && screen
                     .cell(p.row, p.col)
                     .map(|actual| actual.c != p.cell.c)
                     .unwrap_or(true)
         });
-        if mispredict {
+        // Likewise for the cursor: a confirmed cursor prediction that doesn't
+        // match the server's real cursor is a misprediction (mosh's
+        // `ConditionalCursorMove::get_validity` → `IncorrectOrExpired`). Without
+        // this a mispredicted cursor would silently linger until the next move.
+        let cursor_mispredict = self.have_cursor
+            && self.cursor_index <= ack
+            && (screen.cursor_row != self.cursor_row || screen.cursor_col != self.cursor_col);
+        if cell_mispredict || cursor_mispredict {
             self.reset();
-            self.glitch = true; // suppress overlay until the next clean update
+            self.resync_suppress = true; // suppress overlay until the next clean update
             self.confidence = 0; // track record broken — re-earn confidence
             return;
         }
 
-        // A clean update clears any glitch suppression.
-        self.glitch = false;
+        // A clean update clears the post-misprediction suppression.
+        self.resync_suppress = false;
 
         // Confirmed predictions (input_index <= ack) all matched the server, so
         // each *credited* one (it actually changed the screen) is evidence that
@@ -359,6 +432,21 @@ impl PredictionEngine {
             .count() as u32;
         self.confidence = (self.confidence + credited).min(CONFIDENCE_CAP);
 
+        // Quick confirmations slowly cure the glitch trigger: if any prediction
+        // was confirmed well within GLITCH_THRESHOLD, the link is keeping up, so
+        // step the trigger down (rate-limited, mosh's GLITCH_REPAIR_MININTERVAL).
+        let quick_confirm = self
+            .cells
+            .iter()
+            .any(|p| p.input_index <= ack && now_ms.saturating_sub(p.predicted_at_ms) < GLITCH_THRESHOLD_MS);
+        if quick_confirm
+            && self.glitch_trigger > 0
+            && now_ms.saturating_sub(GLITCH_REPAIR_MININTERVAL_MS) >= self.last_quick_confirmation_ms
+        {
+            self.glitch_trigger -= 1;
+            self.last_quick_confirmation_ms = now_ms;
+        }
+
         // Drop confirmed-correct predictions (the real screen now shows them).
         self.cells.retain(|p| p.input_index > ack);
         if self.cursor_index <= ack {
@@ -366,9 +454,40 @@ impl PredictionEngine {
         }
     }
 
+    /// Advance the engine's notion of time without new input or a server frame
+    /// (called each repaint, incl. the idle status-banner tick). This is where a
+    /// *pending* prediction that has gone unconfirmed too long escalates the
+    /// glitch trigger — mosh's `cull()` Pending case, driven by `wait_time()`'s
+    /// 50 ms poll. The effect: on a stalled link the user's speculative echo is
+    /// surfaced (and, past [`GLITCH_FLAG_THRESHOLD_MS`], underlined) so typing
+    /// never appears to vanish.
+    pub fn advance(&mut self, now_ms: u64) {
+        // Age of the oldest still-pending prediction (cells + cursor).
+        let oldest = self
+            .cells
+            .iter()
+            .map(|p| p.predicted_at_ms)
+            .chain(self.have_cursor.then_some(self.cursor_at_ms))
+            .min();
+        if let Some(t) = oldest {
+            let age = now_ms.saturating_sub(t);
+            if age >= GLITCH_FLAG_THRESHOLD_MS {
+                self.glitch_trigger = GLITCH_REPAIR_COUNT * 2; // display *and* underline
+            } else if age >= GLITCH_THRESHOLD_MS && self.glitch_trigger < GLITCH_REPAIR_COUNT {
+                self.glitch_trigger = GLITCH_REPAIR_COUNT; // just display
+            }
+        }
+    }
+
     /// Accumulated confidence (credited-correct predictions); for tests/observability.
     pub fn confidence(&self) -> u32 {
         self.confidence
+    }
+
+    /// Current glitch-trigger level (long-pending-prediction counter); for
+    /// tests/observability.
+    pub fn glitch_trigger(&self) -> u32 {
+        self.glitch_trigger
     }
 
     /// The screen to display: the server screen with active predictions overlaid.
@@ -383,7 +502,7 @@ impl PredictionEngine {
                     let idx = p.row as usize * s.cols as usize + p.col as usize;
                     let mut cell = p.cell.clone();
                     // Underline tentative predictions so they read as speculative.
-                    if self.flagging {
+                    if self.flag_predictions() {
                         cell.flags |= crate::screen::F_UNDERLINE;
                     }
                     s.cells[idx] = cell;
@@ -418,11 +537,20 @@ mod tests {
         s
     }
 
+    /// A blank server screen with a given echo_ack and cursor column — the
+    /// common shape for confirming a prediction that advanced the cursor.
+    fn confirmed_screen(cols: u16, rows: u16, ack: u64, cursor_col: u16) -> Screen {
+        let mut s = Screen::blank(cols, rows);
+        s.echo_ack = ack;
+        s.cursor_col = cursor_col;
+        s
+    }
+
     #[test]
     fn predicts_typed_char_immediately() {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 3, 0);
-        p.new_user_bytes(b"hi", &base, 2);
+        p.new_user_bytes(b"hi", &base, 2, 0);
         let shown = p.predicted_screen(&base);
         assert_eq!(shown.cell(0, 0).unwrap().c, 'h');
         assert_eq!(shown.cell(0, 1).unwrap().c, 'i');
@@ -434,13 +562,13 @@ mod tests {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 3, 0);
         // "ü" = 0xC3 0xBC; feed the bytes in two separate chunks.
-        p.new_user_bytes(&[0xC3], &base, 1);
+        p.new_user_bytes(&[0xC3], &base, 1, 0);
         assert_eq!(
             p.active_predictions(),
             0,
             "no glyph until the char is complete"
         );
-        p.new_user_bytes(&[0xBC], &base, 1);
+        p.new_user_bytes(&[0xBC], &base, 1, 0);
         let shown = p.predicted_screen(&base);
         assert_eq!(
             shown.cell(0, 0).unwrap().c,
@@ -453,13 +581,14 @@ mod tests {
     fn correct_prediction_culled_when_server_catches_up() {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 3, 0);
-        p.new_user_bytes(b"x", &base, 1);
+        p.new_user_bytes(b"x", &base, 1, 0);
         assert_eq!(p.active_predictions(), 1);
 
-        // Server confirms input index 1 with a screen that actually shows 'x'.
-        let mut confirmed = screen_with_ack(20, 3, 1);
+        // Server confirms input index 1 with a screen that shows 'x' and the
+        // cursor advanced to where we predicted it (col 1).
+        let mut confirmed = confirmed_screen(20, 3, 1, 1);
         confirmed.cells[0].c = 'x';
-        p.new_server_screen(&confirmed);
+        p.new_server_screen(&confirmed, 10);
         assert_eq!(p.active_predictions(), 0, "confirmed prediction removed");
     }
 
@@ -467,15 +596,55 @@ mod tests {
     fn misprediction_flushes_overlay() {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 3, 0);
-        p.new_user_bytes(b"x", &base, 1);
+        p.new_user_bytes(b"x", &base, 1, 0);
         // Server applied input 1 but the screen shows something else (e.g. the
         // app swallowed the key) → prediction was wrong.
         let mut confirmed = screen_with_ack(20, 3, 1);
         confirmed.cells[0].c = 'Z';
-        p.new_server_screen(&confirmed);
+        p.new_server_screen(&confirmed, 10);
         assert_eq!(p.active_predictions(), 0, "misprediction flushed");
         // Display falls back to the true server screen.
         assert_eq!(p.predicted_screen(&confirmed).cell(0, 0).unwrap().c, 'Z');
+    }
+
+    /// A correct cell prediction whose *cursor* the server placed elsewhere is a
+    /// misprediction (mosh's `ConditionalCursorMove::get_validity`): the overlay
+    /// is flushed so a stale predicted cursor can't linger.
+    #[test]
+    fn cursor_misprediction_triggers_resync() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 3, 0);
+        p.new_user_bytes(b"x", &base, 1, 0);
+        assert_eq!(p.active_predictions(), 1);
+        // The cell 'x' is right, but the server's cursor ended up at col 5, not
+        // the col 1 we predicted.
+        let mut confirmed = confirmed_screen(20, 3, 1, 5);
+        confirmed.cells[0].c = 'x';
+        p.new_server_screen(&confirmed, 10);
+        assert_eq!(
+            p.active_predictions(),
+            0,
+            "cursor misprediction flushes the overlay"
+        );
+    }
+
+    /// Bulk input (a paste) is not predicted and drops any existing overlay —
+    /// speculating on hundreds of bytes just flickers (mosh's paste guard).
+    #[test]
+    fn paste_guard_skips_bulk_input() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 4, 0);
+        p.new_user_bytes(b"x", &base, 1, 0);
+        assert_eq!(p.active_predictions(), 1);
+
+        let paste = vec![b'a'; PASTE_THRESHOLD + 1];
+        p.new_user_bytes(&paste, &base, 2, 1);
+        assert_eq!(p.active_predictions(), 0, "paste is not predicted");
+        assert_eq!(
+            p.predicted_screen(&base).cell(0, 0).unwrap().c,
+            ' ',
+            "paste leaves the real screen showing"
+        );
     }
 
     /// Port of mosh's prediction-unicode.test: typing multibyte UTF-8 with
@@ -489,7 +658,7 @@ mod tests {
         let input = "glück faĩl".as_bytes().to_vec();
         // Deliver one byte at a time — the worst case for UTF-8 splitting.
         for (i, b) in input.iter().enumerate() {
-            p.new_user_bytes(&[*b], &base, (i + 1) as u64);
+            p.new_user_bytes(&[*b], &base, (i + 1) as u64, 0);
         }
         let shown = p.predicted_screen(&base);
         let line: String = (0..10).map(|c| shown.cell(0, c).unwrap().c).collect();
@@ -508,7 +677,7 @@ mod tests {
     fn adaptive_mode_gates_on_srtt() {
         let mut p = PredictionEngine::new(PredictMode::Adaptive);
         let base = screen_with_ack(20, 2, 0);
-        p.new_user_bytes(b"x", &base, 1);
+        p.new_user_bytes(b"x", &base, 1, 0);
         // Fast link: predictions tracked but not displayed.
         p.set_srtt(5.0);
         assert_eq!(p.predicted_screen(&base).cell(0, 0).unwrap().c, ' ');
@@ -521,7 +690,7 @@ mod tests {
     fn tentative_predictions_are_underlined() {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 2, 0);
-        p.new_user_bytes(b"x", &base, 1);
+        p.new_user_bytes(b"x", &base, 1, 0);
         let shown = p.predicted_screen(&base);
         assert_ne!(
             shown.cell(0, 0).unwrap().flags & crate::screen::F_UNDERLINE,
@@ -537,31 +706,32 @@ mod tests {
     }
 
     #[test]
-    fn glitch_suppresses_then_clears() {
+    fn resync_suppresses_then_clears() {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 2, 0);
-        p.new_user_bytes(b"x", &base, 1);
+        p.new_user_bytes(b"x", &base, 1, 0);
         // Misprediction: the server applied input 1 but shows 'Z'.
         let mut bad = screen_with_ack(20, 2, 1);
         bad.cells[0].c = 'Z';
-        p.new_server_screen(&bad);
-        // Glitch active: a fresh prediction is suppressed (server shown instead).
-        p.new_user_bytes(b"y", &bad, 2);
+        p.new_server_screen(&bad, 10);
+        // Suppressed: a fresh prediction is hidden (server shown instead).
+        p.new_user_bytes(b"y", &bad, 2, 20);
         assert_eq!(p.predicted_screen(&bad).cell(0, 0).unwrap().c, 'Z');
-        // The server confirms 'y' (input 2) → no contradiction → glitch clears.
-        let mut good = screen_with_ack(20, 2, 2);
+        // The server confirms 'y' at (0,0) with the cursor advanced to col 1 →
+        // no contradiction → suppression clears.
+        let mut good = confirmed_screen(20, 2, 2, 1);
         good.cells[0].c = 'y';
-        p.new_server_screen(&good);
-        // Predictions display again.
-        p.new_user_bytes(b"z", &good, 3);
-        assert_eq!(p.predicted_screen(&good).cell(0, 0).unwrap().c, 'z');
+        p.new_server_screen(&good, 30);
+        // Predictions display again: typing 'z' at the (server) cursor col 1.
+        p.new_user_bytes(b"z", &good, 3, 40);
+        assert_eq!(p.predicted_screen(&good).cell(0, 1).unwrap().c, 'z');
     }
 
     #[test]
     fn predicts_wide_char_with_spacer() {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 2, 0);
-        p.new_user_bytes("世".as_bytes(), &base, 1);
+        p.new_user_bytes("世".as_bytes(), &base, 1, 0);
         let shown = p.predicted_screen(&base);
         assert_eq!(shown.cell(0, 0).unwrap().c, '世');
         assert_eq!(shown.cell(0, 1).unwrap().c, ' '); // spacer
@@ -582,14 +752,14 @@ mod tests {
             let mut server = Screen::blank(cols, rows);
             server.echo_ack = i - 1;
             server.cursor_col = (i - 1) as u16;
-            p.new_user_bytes(b"a", &server, i);
+            p.new_user_bytes(b"a", &server, i, i * 10);
 
-            // Server confirms it: that cell really shows 'a' now.
+            // Server confirms it: that cell really shows 'a', cursor advanced.
             let mut confirmed = Screen::blank(cols, rows);
             confirmed.echo_ack = i;
             confirmed.cells[(i - 1) as usize].c = 'a';
             confirmed.cursor_col = i as u16;
-            p.new_server_screen(&confirmed);
+            p.new_server_screen(&confirmed, i * 10 + 5);
         }
         assert!(
             p.confidence() >= CONFIDENCE_TRIGGER,
@@ -599,7 +769,7 @@ mod tests {
         // SRTT still below the trigger, yet a fresh prediction now displays.
         let mut server = Screen::blank(cols, rows);
         server.echo_ack = CONFIDENCE_TRIGGER as u64;
-        p.new_user_bytes(b"Z", &server, CONFIDENCE_TRIGGER as u64 + 1);
+        p.new_user_bytes(b"Z", &server, CONFIDENCE_TRIGGER as u64 + 1, 1000);
         assert_eq!(
             p.predicted_screen(&server).cell(0, 0).unwrap().c,
             'Z',
@@ -614,10 +784,11 @@ mod tests {
         let mut p = PredictionEngine::new(PredictMode::Adaptive);
         let mut server = Screen::blank(20, 2);
         server.cells[0].c = 'a';
-        p.new_user_bytes(b"a", &server, 1); // predict 'a' where 'a' already is
+        p.new_user_bytes(b"a", &server, 1, 0); // predict 'a' where 'a' already is
         let mut confirmed = server.clone();
         confirmed.echo_ack = 1; // still shows 'a' — correct, but no visible change
-        p.new_server_screen(&confirmed);
+        confirmed.cursor_col = 1; // cursor advanced as predicted
+        p.new_server_screen(&confirmed, 10);
         assert_eq!(
             p.confidence(),
             0,
@@ -632,19 +803,18 @@ mod tests {
         // Earn one credit.
         let mut server = Screen::blank(20, 2);
         server.cursor_col = 0;
-        p.new_user_bytes(b"a", &server, 1);
-        let mut good = Screen::blank(20, 2);
-        good.echo_ack = 1;
+        p.new_user_bytes(b"a", &server, 1, 0);
+        let mut good = confirmed_screen(20, 2, 1, 1);
         good.cells[0].c = 'a';
-        p.new_server_screen(&good);
+        p.new_server_screen(&good, 10);
         assert_eq!(p.confidence(), 1);
 
         // Now mispredict: type 'b', but the server shows 'X'.
-        p.new_user_bytes(b"b", &good, 2);
+        p.new_user_bytes(b"b", &good, 2, 20);
         let mut bad = Screen::blank(20, 2);
         bad.echo_ack = 2;
         bad.cells[1].c = 'X';
-        p.new_server_screen(&bad);
+        p.new_server_screen(&bad, 30);
         assert_eq!(p.confidence(), 0, "misprediction resets confidence");
     }
 
@@ -652,9 +822,101 @@ mod tests {
     fn escape_sequence_abandons_prediction() {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 3, 0);
-        p.new_user_bytes(b"a", &base, 1);
+        p.new_user_bytes(b"a", &base, 1, 0);
         assert_eq!(p.active_predictions(), 1);
-        p.new_user_bytes(b"\x1b[A", &base, 2); // arrow key → unpredictable
+        p.new_user_bytes(b"\x1b[A", &base, 2, 10); // arrow key → unpredictable
         assert_eq!(p.active_predictions(), 0, "escape flushes predictions");
+    }
+
+    /// A prediction left unconfirmed past GLITCH_THRESHOLD escalates the glitch
+    /// trigger, which forces the overlay on even on a fast-SRTT Adaptive link —
+    /// so the user's typing never appears to vanish on a momentary stall.
+    #[test]
+    fn long_pending_prediction_forces_display() {
+        let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        p.set_srtt(5.0); // SRTT gate closed, no confidence yet
+        let base = screen_with_ack(20, 2, 0);
+        p.new_user_bytes(b"x", &base, 1, 0);
+
+        // Recently predicted, fast link → not shown.
+        p.advance(100);
+        assert_eq!(p.glitch_trigger(), 0);
+        assert_eq!(p.predicted_screen(&base).cell(0, 0).unwrap().c, ' ');
+
+        // Still unconfirmed past the threshold → glitch forces it on.
+        p.advance(400);
+        assert!(p.glitch_trigger() > 0, "long-pending prediction escalates");
+        assert_eq!(
+            p.predicted_screen(&base).cell(0, 0).unwrap().c,
+            'x',
+            "stalled prediction surfaced despite low SRTT"
+        );
+    }
+
+    /// A prediction pending past GLITCH_FLAG_THRESHOLD underlines even when
+    /// flagging is otherwise off — signalling the link has stalled.
+    #[test]
+    fn severe_glitch_underlines_even_with_flagging_off() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        p.set_flagging(false);
+        let base = screen_with_ack(20, 2, 0);
+        p.new_user_bytes(b"x", &base, 1, 0);
+        assert_eq!(
+            p.predicted_screen(&base).cell(0, 0).unwrap().flags & crate::screen::F_UNDERLINE,
+            0,
+            "no underline while flagging is off and the prediction is fresh"
+        );
+
+        p.advance(GLITCH_FLAG_THRESHOLD_MS + 1);
+        assert!(p.glitch_trigger() > GLITCH_REPAIR_COUNT);
+        assert_ne!(
+            p.predicted_screen(&base).cell(0, 0).unwrap().flags & crate::screen::F_UNDERLINE,
+            0,
+            "a long-stalled prediction underlines to signal the glitch"
+        );
+    }
+
+    /// Quick confirmations step the glitch trigger back down (rate-limited),
+    /// mirroring mosh's GLITCH_REPAIR_COUNT/GLITCH_REPAIR_MININTERVAL cure.
+    #[test]
+    fn quick_confirmations_cure_glitch_trigger() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        // Drive the trigger to its peak with a long-pending prediction, then
+        // confirm it (late — no cure from a stale confirmation).
+        let s0 = screen_with_ack(20, 2, 0);
+        p.new_user_bytes(b"x", &s0, 1, 0);
+        p.advance(GLITCH_FLAG_THRESHOLD_MS + 1);
+        assert_eq!(p.glitch_trigger(), GLITCH_REPAIR_COUNT * 2);
+
+        let mut confirmed = confirmed_screen(20, 2, 1, 1);
+        confirmed.cells[0].c = 'x';
+        p.new_server_screen(&confirmed, GLITCH_FLAG_THRESHOLD_MS + 1);
+        assert_eq!(
+            p.glitch_trigger(),
+            GLITCH_REPAIR_COUNT * 2,
+            "a stale (slow) confirmation does not cure the glitch"
+        );
+
+        // A run of fresh predict→confirm-within-250ms cycles, spaced past the
+        // repair min-interval, decrements the trigger one notch per cycle.
+        let mut prev = confirmed;
+        let mut t = GLITCH_FLAG_THRESHOLD_MS + 1;
+        for idx in 2u64..=4 {
+            t += GLITCH_REPAIR_MININTERVAL_MS + 50;
+            let col = prev.cursor_col;
+            p.new_user_bytes(b"y", &prev, idx, t);
+            let mut nc = prev.clone();
+            nc.echo_ack = idx;
+            nc.cells[col as usize].c = 'y';
+            nc.cursor_col = col + 1;
+            let before = p.glitch_trigger();
+            p.new_server_screen(&nc, t + 20); // confirmed within GLITCH_THRESHOLD
+            assert_eq!(
+                p.glitch_trigger(),
+                before - 1,
+                "each quick confirmation cures one notch"
+            );
+            prev = nc;
+        }
     }
 }

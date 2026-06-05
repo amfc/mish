@@ -88,10 +88,17 @@ overlay) are all done. These are the remaining parity polish:
   translation keyed on the synced mode; legacy mouse modes X10(9)/hilite(1001)/
   UTF-8(1005)/urxvt(1015) unmodeled; SGR blink (5) dropped from renditions.
   *(Client mode-reset-on-exit and the `[mish]` title prefix are already done.)*
-- **Prediction-ack timing + paste guard + cursor validation.** Port
-  `ECHO_TIMEOUT` (50 ms late-ack) + `input_history`/`set_echo_ack`; suppress
-  prediction on bulk paste; validate the predicted cursor against the server
-  cursor; time-based glitch escalation (`GLITCH_THRESHOLD`); `PredictMode::Experimental`.
+- **Prediction-ack timing + paste guard + cursor validation** — *done* (except
+  `PredictMode::Experimental`). The paste guard (no prediction for an input
+  batch over 100 bytes), predicted-cursor validation against the server cursor,
+  and the time-based glitch trigger (`GLITCH_THRESHOLD` display escalation +
+  `GLITCH_FLAG_THRESHOLD` underline, cured by quick confirmations) are ported in
+  `predict.rs`; the engine now takes `now_ms` and the client ages it via
+  `advance(now)` on every repaint (mosh's 50 ms `wait_time()` poll). The
+  `late_ack`/`echo_ack` gate that mosh's `ECHO_TIMEOUT` machinery feeds is
+  already how we judge a prediction (`Screen::echo_ack`). *Remaining:*
+  `PredictMode::Experimental` (per-keystroke epoch reset) and `predict_overwrite`
+  (insert-vs-overwrite line shifting).
 - **SSP: ECN frame-rate throttle, `attempt_prospective_resend_optimization`,
   SIGUSR1-conditional idle shutdown of disconnected sessions, `apply_diff`
   echo_ack monotonicity enforcement.**

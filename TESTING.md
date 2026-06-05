@@ -168,10 +168,24 @@ prediction overlay). Clean — no UB. Can't run the tokio/PTY layers (that's TSa
 
 All lower-value polish — no correctness or security stakes remain. Ranked:
 
-1. **`#34` Prediction polish** — paste guard (suppress prediction on bulk input),
-   validate the predicted cursor against the server cursor (no stuck mispredicted
-   cursor), time-based glitch escalation, `ECHO_TIMEOUT` late-ack. *Most
-   user-noticeable of what's left (laggy links).*
+1. **`#34` Prediction polish** — *done.* Paste guard (a single input batch over
+   `PASTE_THRESHOLD` = 100 bytes resets the overlay and isn't predicted, mosh's
+   `stmclient.cc` guard); predicted-cursor validation against the server cursor
+   (a confirmed cursor that doesn't match resyncs, mosh's
+   `ConditionalCursorMove::get_validity` — no more stuck mispredicted cursor);
+   time-based glitch trigger (a prediction pending past `GLITCH_THRESHOLD` =
+   250 ms forces the overlay on even on a fast-SRTT link, and past
+   `GLITCH_FLAG_THRESHOLD` = 5 s also underlines, so typing never appears to
+   vanish on a stall; quick confirmations cure the trigger). The engine now
+   takes `now_ms` (sans-IO time-as-argument, like the SSP core) and the client
+   drives aging via `advance(now)` on every repaint (incl. the idle banner
+   tick, the role of mosh's 50 ms `wait_time()`). Tested in `predict.rs`
+   (`paste_guard_skips_bulk_input`, `cursor_misprediction_triggers_resync`,
+   `long_pending_prediction_forces_display`,
+   `severe_glitch_underlines_even_with_flagging_off`,
+   `quick_confirmations_cure_glitch_trigger`) and exercised by `fuzz_predict.rs`.
+   *Deferred: `predict_overwrite` (insert-vs-overwrite shift) and
+   `PredictMode::Experimental`.*
 2. **`#37` CLI/bootstrap parity** — `--ssh` shell-splitting + `ssh -tt`/`-n`,
    `--version`/`--help`, `--predict`/`MOSH_PREDICTION_*`, `--no-init`.
 3. **`#38`** — PTY `IUTF8` flag (may be blocked by portable-pty), three-leg
