@@ -94,11 +94,7 @@ fn vt100_lines(parser: &vt100::Parser) -> Vec<String> {
                 if let Some(cell) = screen.cell(r, c) {
                     let contents = cell.contents();
                     // An empty cell renders as a space in our `to_lines`.
-                    s.push_str(if contents.is_empty() {
-                        " "
-                    } else {
-                        contents.as_str()
-                    });
+                    s.push_str(if contents.is_empty() { " " } else { contents });
                 } else {
                     s.push(' ');
                 }
