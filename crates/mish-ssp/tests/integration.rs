@@ -127,6 +127,13 @@ async fn shutdown_responder_closes_without_being_acked() {
 /// exists precisely for lost handshake frames, yet nothing exercised it under
 /// loss. Measures convergence across several deterministic drop patterns and
 /// prints each, so a seed that falls back to the full 5s grace is visible.
+///
+/// Note on what this proves: convergence here can come via *either* the SSP
+/// shutdown ack *or* the transport-close backstop — when the responder exits it
+/// drops its transport, which (like a QUIC CONNECTION_CLOSE) makes the peer's
+/// `recv` return `Closed`. So this is an end-to-end "both sides close under loss"
+/// guard, not an isolation test of the ack handshake. Empirically both close in
+/// tens of ms even at 60% loss; the grace deadline is the backstop, not the path.
 #[tokio::test]
 async fn shutdown_converges_under_loss() {
     use mish_ssp::memory::Impairments;
