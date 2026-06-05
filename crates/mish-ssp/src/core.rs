@@ -59,6 +59,10 @@ pub struct SspConfig {
     pub max_sent_states: usize,
     /// Cap on retained received states.
     pub max_received_states: usize,
+    /// Enable the prophylactic-resend loss-recovery optimization (mosh's
+    /// `attempt_prospective_resend_optimization`). On by default; exposed mainly
+    /// so benchmarks can A/B its effect.
+    pub prospective_resend: bool,
 }
 
 impl Default for SspConfig {
@@ -73,6 +77,7 @@ impl Default for SspConfig {
             rto: 1000,
             max_sent_states: 32,
             max_received_states: 1024,
+            prospective_resend: true,
         }
     }
 }
@@ -478,7 +483,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
     /// Mirrors mosh's `attempt_prospective_resend_optimization`.
     fn attempt_prospective_resend(&mut self, proposed: &mut Vec<u8>) {
         // Already anchored on the acked front — nothing to gain.
-        if self.assumed_receiver_idx == 0 {
+        if !self.cfg.prospective_resend || self.assumed_receiver_idx == 0 {
             return;
         }
         let resend = {
