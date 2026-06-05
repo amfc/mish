@@ -58,3 +58,20 @@ jobs:
         run: cargo miri test -p mish-ssp --lib --test core_unit
       - name: Miri (mish-terminal prediction)
         run: cargo miri test -p mish-terminal --lib
+
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # Print the per-file table and fail if line coverage regresses below the
+      # floor. The uncovered remainder is binary `main`s, the SSH bootstrap, and
+      # the real-time SystemClock — I/O glue exercised by the e2e tests rather
+      # than unit-coverable.
+      - name: Coverage
+        run: cargo llvm-cov --workspace --fail-under-lines 85

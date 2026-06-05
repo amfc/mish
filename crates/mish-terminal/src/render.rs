@@ -106,3 +106,107 @@ fn push_color(codes: &mut Vec<String>, color: Color, fg: bool) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emulator::Emulator;
+    use crate::screen::{Screen, F_WIDE, F_WIDE_SPACER};
+
+    /// The strongest correctness property: the ANSI we emit, replayed through a
+    /// real terminal emulator, must reconstruct the screen we rendered. This
+    /// proves `render_full` (and `sgr`/`push_color`) emit faithful escape codes.
+    ///
+    /// We feed attributes and indexed/RGB colors (not named colors or wide chars,
+    /// which `render_full` documents as lossy) so the round-trip is exact.
+    #[test]
+    fn render_full_roundtrips_through_emulator() {
+        let mut emu = Emulator::new(20, 4);
+        emu.feed(
+            b"\x1b[1mBold\x1b[0m \x1b[4mUnder\x1b[0m\r\n\
+              \x1b[38;5;200mIdx\x1b[0m \x1b[38;2;10;20;30;48;2;1;2;3mRGB\x1b[0m\r\n\
+              \x1b[3;7mit-inv\x1b[0m plain",
+        );
+        // Move the cursor somewhere non-trivial and hide it.
+        emu.feed(b"\x1b[2;5H\x1b[?25l");
+        let original = emu.snapshot();
+
+        let ansi = render_full(&original);
+
+        let mut replay = Emulator::new(20, 4);
+        replay.feed(&ansi);
+        let reconstructed = replay.snapshot();
+
+        assert_eq!(reconstructed.cells, original.cells, "cells must round-trip");
+        assert_eq!(
+            (reconstructed.cursor_row, reconstructed.cursor_col),
+            (original.cursor_row, original.cursor_col),
+            "cursor position must round-trip"
+        );
+        assert_eq!(
+            reconstructed.cursor_visible, original.cursor_visible,
+            "cursor visibility must round-trip"
+        );
+    }
+
+    #[test]
+    fn sgr_emits_expected_codes() {
+        let cell = Cell {
+            c: 'x',
+            fg: Color::Rgb(10, 20, 30),
+            bg: Color::Indexed(200),
+            flags: F_BOLD | F_UNDERLINE | F_INVERSE | F_STRIKEOUT,
+            ..Default::default()
+        };
+        let s = sgr(&cell);
+        // Leading reset, then each attribute, then truecolor fg and indexed bg.
+        assert_eq!(s, "\x1b[0;1;4;7;9;38;2;10;20;30;48;5;200m");
+    }
+
+    #[test]
+    fn dim_italic_hidden_flags_render() {
+        let cell = Cell {
+            flags: F_DIM | F_ITALIC | F_HIDDEN,
+            ..Default::default()
+        };
+        assert_eq!(sgr(&cell), "\x1b[0;2;3;8m");
+    }
+
+    #[test]
+    fn named_colors_fall_back_to_default() {
+        let mut codes = vec!["0".to_string()];
+        push_color(&mut codes, Color::Named(7), true); // unmapped named → no code
+        push_color(&mut codes, Color::Named(NAMED_BACKGROUND), false);
+        assert_eq!(codes, vec!["0".to_string()], "named colors add nothing");
+    }
+
+    #[test]
+    fn hidden_cursor_and_blank_screen_render() {
+        let mut screen = Screen::blank(3, 2);
+        screen.cursor_visible = false;
+        let out = String::from_utf8(render_full(&screen)).unwrap();
+        assert!(out.contains("\x1b[2J"), "clears the screen");
+        assert!(out.contains("\x1b[?25l"), "hides the cursor");
+        assert!(out.ends_with("\x1b[1;1H"), "homes the cursor (1-based)");
+    }
+
+    #[test]
+    fn wide_spacer_cells_are_skipped() {
+        // A wide glyph occupies a cell plus a spacer; render must not emit the
+        // spacer (which would push everything one column right).
+        let mut screen = Screen::blank(4, 1);
+        screen.cells[0] = Cell {
+            c: '世',
+            flags: F_WIDE,
+            ..Default::default()
+        };
+        screen.cells[1] = Cell {
+            c: ' ',
+            flags: F_WIDE_SPACER,
+            ..Default::default()
+        };
+        let out = String::from_utf8(render_full(&screen)).unwrap();
+        let glyphs: String = out.chars().filter(|c| *c == '世').collect();
+        assert_eq!(glyphs, "世", "the wide glyph is emitted exactly once");
+    }
+}
