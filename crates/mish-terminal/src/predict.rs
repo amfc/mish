@@ -109,9 +109,12 @@ impl PredictionEngine {
     }
 
     fn reset(&mut self) {
+        // Clears the prediction overlay only. The UTF-8 decode buffer is
+        // transport-level framing state owned by the decode loop — clearing it
+        // here (reset is called mid-decode on an escape byte) would corrupt that
+        // loop's indices.
         self.cells.clear();
         self.have_cursor = false;
-        self.utf8.clear();
     }
 
     /// Register local keystroke `bytes`, typed at client input index

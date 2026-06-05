@@ -49,9 +49,14 @@ impl SyncState for BytesState {
         if diff.is_empty() {
             return;
         }
-        debug_assert!(diff.len() >= 4, "malformed BytesState diff");
+        // Untrusted input: a malformed (too-short) diff is ignored, not panicked.
+        if diff.len() < 4 {
+            return;
+        }
         let common = u32::from_le_bytes([diff[0], diff[1], diff[2], diff[3]]) as usize;
         let tail = &diff[4..];
+        // Clamp the truncation point so a hostile `common` can't misbehave.
+        let common = common.min(self.0.len());
         self.0.truncate(common);
         self.0.extend_from_slice(tail);
     }

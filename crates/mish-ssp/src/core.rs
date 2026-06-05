@@ -279,6 +279,12 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         });
     }
 
+    /// Number of retained received states (for tests/observability: must stay
+    /// bounded by the configured cap even under hostile input).
+    pub fn received_state_count(&self) -> usize {
+        self.received_states.len()
+    }
+
     /// Whether everything we've produced has been acknowledged by the peer.
     pub fn is_synced(&self) -> bool {
         let back = self.sent_states.back().expect("never empty");

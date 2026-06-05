@@ -1,5 +1,5 @@
-//! Deterministic full-stack simulation under madsim: client + simulated network
-//! + server + a scripted (deterministic) shell, with no real PTY or OS process.
+//! Deterministic full-stack simulation under madsim: client, simulated network,
+//! server, and a scripted (deterministic) shell — no real PTY or OS process.
 //! Asserts the transparency invariant — the client's reconstructed screen equals
 //! what the shell actually produced — reproducibly from `MADSIM_TEST_SEED`.
 //!
