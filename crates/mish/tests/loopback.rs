@@ -257,3 +257,71 @@ async fn client_resize_propagates_to_server_pty() {
     .await
     .expect("server PTY should be resized");
 }
+
+/// Pressing Ctrl-D quits the shell, which closes the child's PTY. The server must
+/// then negotiate the SSP SHUTDOWN handshake so the *client* exits promptly —
+/// without the user pressing Ctrl-^ . — rather than hanging until its network
+/// timeout and showing "Last contact N seconds ago". We simulate the child exit
+/// by dropping the server's PTY-output sender.
+#[tokio::test]
+async fn child_exit_shuts_down_client() {
+    let (ta, tb) = memory::pair();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+
+    // Server with a fake PTY.
+    let (pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (pty_in_tx, _pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
+    let server = tokio::spawn(run_server(
+        Arc::new(ta),
+        mish_terminal::emulator::Emulator::shared(80, 24),
+        clock.clone(),
+        None,
+        pty_out_rx,
+        pty_in_tx,
+    ));
+
+    // Client with a fake TTY. Keep `cin_tx` alive to the end of the test so that
+    // closing the *input* channel is never what ends the client — the only path
+    // to exit must be the server's shutdown handshake.
+    let (cin_tx, cin_rx) = mpsc::channel::<ClientInput>(64);
+    let (cout_tx, mut cout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let client = tokio::spawn(run_client(
+        Arc::new(tb),
+        80,
+        24,
+        clock.clone(),
+        mish_terminal::predict::PredictMode::Never,
+        None,
+        cin_rx,
+        cout_tx,
+    ));
+
+    // Establish the session: the child writes, the client renders it.
+    pty_out_tx.send(b"hello world".to_vec()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = cout_rx.recv().await.expect("client output");
+            if contains(&frame, b"hello world") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("client should render server output");
+
+    // The shell exits (Ctrl-D): the child's PTY closes, ending the server's
+    // pty_output stream.
+    drop(pty_out_tx);
+
+    // Both halves should finish promptly, with no further input from the user.
+    tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .expect("client should exit after the server's child exits")
+        .expect("client task joined");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server should exit after its child exits")
+        .expect("server task joined");
+
+    drop(cin_tx);
+}

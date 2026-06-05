@@ -45,7 +45,7 @@ pub async fn run_server<T: Transport>(
 ) {
     let (driver, handle) =
         Driver::<T, Screen, UserStream>::with(transport, clock, SspConfig::default());
-    driver.spawn();
+    let driver_task = driver.spawn();
 
     // How many user events we've already applied to the PTY (the echo ack).
     let mut processed: u64 = 0;
@@ -62,11 +62,13 @@ pub async fn run_server<T: Transport>(
     // MOSH_SERVER_NETWORK_TMOUT, which keeps orphaned servers from lingering.
     let mut last_heard = tokio::time::Instant::now();
 
-    loop {
+    'session: loop {
         let idle = network_timeout.map(|t| tokio::time::sleep_until(last_heard + t));
         tokio::select! {
             _ = async { idle.unwrap().await }, if network_timeout.is_some() => {
-                // No client traffic within the timeout window.
+                // No client traffic within the timeout window: the client is
+                // unreachable, so there's no point negotiating a clean shutdown —
+                // just drop the session.
                 return;
             }
             // Child produced output → feed the emulator, publish the new screen.
@@ -85,19 +87,19 @@ pub async fn run_server<T: Transport>(
                             if !reply.is_empty()
                                 && pty_input.send(PtyControl::Input(reply)).is_err()
                             {
-                                return;
+                                break 'session; // child gone
                             }
                             publish(&e, processed)
                         };
                         handle.set_local(screen);
                     }
-                    None => break, // child exited
+                    None => break 'session, // child exited
                 }
             }
             // Client sent new input → apply the new events to the PTY.
             changed = remote.changed() => {
                 if changed.is_err() {
-                    break; // driver stopped
+                    break 'session; // driver stopped
                 }
                 // Heard from the client (input or keepalive) — reset the watchdog.
                 last_heard = tokio::time::Instant::now();
@@ -108,7 +110,7 @@ pub async fn run_server<T: Transport>(
                         match ev {
                             UserEvent::Keystroke(b) => {
                                 if pty_input.send(PtyControl::Input(b.clone())).is_err() {
-                                    return;
+                                    break 'session; // child gone
                                 }
                             }
                             UserEvent::Resize { cols, rows } => {
@@ -116,7 +118,7 @@ pub async fn run_server<T: Transport>(
                                     .send(PtyControl::Resize { cols: *cols, rows: *rows })
                                     .is_err()
                                 {
-                                    return;
+                                    break 'session; // child gone
                                 }
                                 e.resize(*cols, *rows);
                             }
@@ -131,4 +133,12 @@ pub async fn run_server<T: Transport>(
             }
         }
     }
+
+    // The child exited (e.g. the user pressed Ctrl-D / the shell quit). Tell the
+    // client we're closing via the SSP SHUTDOWN handshake — mirroring the client's
+    // own detach path — so it exits immediately instead of waiting out its network
+    // timeout and showing "Last contact N seconds ago". Then wait briefly for the
+    // driver to deliver the handshake before the runtime tears down.
+    handle.shutdown();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), driver_task).await;
 }
