@@ -71,6 +71,15 @@ pub async fn run_server<T: Transport>(
                 match out {
                     Some(bytes) => {
                         emu.feed(&bytes);
+                        // Host answerbacks (DA/DSR/CPR/OSC color/size replies) the
+                        // child's query sequences produced must go back to its
+                        // input, or programs that probe the terminal hang.
+                        let reply = emu.take_answerback();
+                        if !reply.is_empty()
+                            && pty_input.send(PtyControl::Input(reply)).is_err()
+                        {
+                            return;
+                        }
                         handle.set_local(publish(&emu, processed));
                     }
                     None => break, // child exited

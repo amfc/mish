@@ -53,6 +53,43 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// A terminal query the child emits (here a cursor-position report) must be
+/// answered by the server *back into the child's PTY input*. Without this, a
+/// program that probes the terminal hangs waiting for the reply.
+#[tokio::test]
+async fn answerback_written_back_to_pty() {
+    let (server_t, _client_t) = memory::pair();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let (pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (pty_in_tx, mut pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
+    tokio::spawn(run_server(
+        Arc::new(server_t),
+        80,
+        24,
+        clock,
+        None,
+        pty_out_rx,
+        pty_in_tx,
+    ));
+
+    // The child writes a DSR cursor-position query (ESC[6n) to its output.
+    pty_out_tx.send(b"\x1b[6n".to_vec()).await.unwrap();
+
+    let reply = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match pty_in_rx.recv().await {
+                Some(PtyControl::Input(b)) => return b,
+                Some(_) => continue,
+                None => panic!("server ended before answering"),
+            }
+        }
+    })
+    .await
+    .expect("server should write the answerback to the PTY");
+    // Cursor at home → CPR "ESC[1;1R".
+    assert_eq!(reply, b"\x1b[1;1R");
+}
+
 #[tokio::test]
 async fn server_output_reaches_client_and_input_reaches_server() {
     let (ta, tb) = memory::pair();

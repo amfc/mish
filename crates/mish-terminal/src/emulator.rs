@@ -8,23 +8,41 @@
 
 use std::sync::{Arc, Mutex};
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell as ATermCell, Flags};
 use alacritty_terminal::term::{ClipboardType, Config, TermMode};
-use alacritty_terminal::vte::ansi::{Color as ATermColor, CursorShape, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color as ATermColor, CursorShape, NamedColor, Processor, Rgb};
 use alacritty_terminal::{term::test::TermSize, Term};
 
 use crate::screen::{self, Cell, Color, Screen};
 
-/// Event listener that records out-of-band terminal events we synchronize but
-/// which aren't part of the cell grid: the window title and the OSC 52 clipboard
-/// (latest-wins). Everything else is a no-op.
+/// Event listener that records out-of-band terminal events we don't carry in the
+/// cell grid: window title, OSC 52 clipboard (latest-wins), and — crucially —
+/// **host answerbacks**. Terminal query sequences a program sends (Device
+/// Attributes, cursor-position report, status report, OSC color queries, text-
+/// area size) make alacritty emit a reply the *terminal* must write back to the
+/// program's input. We buffer those replies in `answerback`; the server drains
+/// them after each feed and writes them to the child PTY (mirroring mosh's
+/// `terminal_to_host`). Without this, programs that probe the terminal at startup
+/// (vim, tmux, less, `tput`) hang or fall back to wrong defaults.
 #[derive(Clone, Default)]
 struct TermListener {
     title: Arc<Mutex<String>>,
     clipboard: Arc<Mutex<Option<String>>>,
+    answerback: Arc<Mutex<Vec<u8>>>,
+    /// Current screen size `(cols, rows)`, for text-area-size replies.
+    size: Arc<Mutex<(u16, u16)>>,
+}
+
+impl TermListener {
+    fn push_answerback(&self, reply: &str) {
+        self.answerback
+            .lock()
+            .unwrap()
+            .extend_from_slice(reply.as_bytes());
+    }
 }
 
 impl EventListener for TermListener {
@@ -36,9 +54,67 @@ impl EventListener for TermListener {
             Event::ClipboardStore(ClipboardType::Clipboard, text) => {
                 *self.clipboard.lock().unwrap() = Some(text);
             }
+            // Direct answerback (DA1/secondary DA, DSR, CPR, DECRQSS, DECRQM, …).
+            Event::PtyWrite(text) => self.push_answerback(&text),
+            // OSC 4/10/11 color query: answer with the standard default palette
+            // for the index (correct for an unmodified palette — the common case).
+            Event::ColorRequest(index, format) => {
+                self.push_answerback(&format(default_palette_rgb(index)));
+            }
+            // CSI 14/18 t text-area size: answer in cells (we have no pixel size).
+            Event::TextAreaSizeRequest(format) => {
+                let (cols, rows) = *self.size.lock().unwrap();
+                self.push_answerback(&format(WindowSize {
+                    num_lines: rows,
+                    num_cols: cols,
+                    cell_width: 0,
+                    cell_height: 0,
+                }));
+            }
             _ => {}
         }
     }
+}
+
+/// The standard xterm 256-color palette entry for `index`, used to answer OSC
+/// color queries when the palette hasn't been customized. Indices ≥ 256 are the
+/// default foreground/background.
+fn default_palette_rgb(index: usize) -> Rgb {
+    // The 16 base ANSI colors (xterm values).
+    const ANSI16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    let (r, g, b) = match index {
+        0..=15 => ANSI16[index],
+        16..=231 => {
+            const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+            let i = index - 16;
+            (LEVELS[(i / 36) % 6], LEVELS[(i / 6) % 6], LEVELS[i % 6])
+        }
+        232..=255 => {
+            let v = 8 + 10 * (index - 232) as u8;
+            (v, v, v)
+        }
+        // Default foreground (256) and anything else; background (257) is black.
+        257 => (0, 0, 0),
+        _ => (229, 229, 229),
+    };
+    Rgb { r, g, b }
 }
 
 /// A VT emulator producing [`Screen`] snapshots.
@@ -52,6 +128,7 @@ impl Emulator {
     /// Create an emulator with the given screen size.
     pub fn new(cols: u16, rows: u16) -> Self {
         let listener = TermListener::default();
+        *listener.size.lock().unwrap() = (cols, rows);
         let size = TermSize::new(cols as usize, rows as usize);
         let term = Term::new(Config::default(), &size, listener.clone());
         Self {
@@ -66,8 +143,16 @@ impl Emulator {
         self.parser.advance(&mut self.term, bytes);
     }
 
+    /// Take any pending host answerback the last [`feed`](Self::feed) produced
+    /// (terminal query replies the server must write back to the child PTY).
+    /// Empties the buffer.
+    pub fn take_answerback(&self) -> Vec<u8> {
+        std::mem::take(&mut self.listener.answerback.lock().unwrap())
+    }
+
     /// Resize the emulated screen.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        *self.listener.size.lock().unwrap() = (cols, rows);
         self.term
             .resize(TermSize::new(cols as usize, rows as usize));
     }
@@ -200,3 +285,52 @@ const _: () = {
     let _ = NamedColor::Foreground;
     let _ = NamedColor::Background;
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Device Status Report (cursor position) query must produce a CPR reply
+    /// the server can write back to the child. Without it, programs that measure
+    /// the cursor (prompt width detection, vim, …) hang.
+    #[test]
+    fn dsr_cursor_position_reply() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"abc"); // cursor now at row 1, col 4 (1-based)
+        emu.feed(b"\x1b[6n"); // DSR: report cursor position
+        assert_eq!(emu.take_answerback(), b"\x1b[1;4R");
+        // Draining empties the buffer.
+        assert!(emu.take_answerback().is_empty());
+    }
+
+    /// Primary Device Attributes (`ESC[c`) must be answered (programs use it to
+    /// detect terminal capabilities at startup).
+    #[test]
+    fn device_attributes_reply() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"\x1b[c");
+        let reply = emu.take_answerback();
+        assert!(
+            reply.starts_with(b"\x1b[?") && reply.ends_with(b"c"),
+            "DA1 reply should be a CSI ? … c sequence, got {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// CSI 18 t (text-area size in cells) is answered from the current size.
+    #[test]
+    fn text_area_size_reply() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"\x1b[18t");
+        let reply = emu.take_answerback();
+        // xterm form: CSI 8 ; rows ; cols t
+        assert_eq!(reply, b"\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn no_query_no_answerback() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"just some text\r\nand more");
+        assert!(emu.take_answerback().is_empty());
+    }
+}
