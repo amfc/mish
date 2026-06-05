@@ -67,14 +67,27 @@ impl PtyProcess {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    // EOF / EIO on the master means every slave fd is closed — the
+                    // child has exited. This is what should trigger the session's
+                    // clean shutdown, so it's logged at info.
+                    Ok(0) => {
+                        tracing::info!(target: "mish::pty", "pty reader: EOF — child exited");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::info!(target: "mish::pty", error = %e, "pty reader: read error — child exited");
+                        break;
+                    }
                     Ok(n) => {
                         if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            tracing::debug!(target: "mish::pty", "pty reader: output channel closed; stopping");
                             break;
                         }
                     }
                 }
             }
+            // Dropping `out_tx` here closes the server's pty_output channel.
+            tracing::debug!(target: "mish::pty", "pty reader thread exiting (pty_output now closed)");
         });
 
         // Control thread: input writes + resizes (owns writer and master).

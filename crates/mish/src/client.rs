@@ -226,11 +226,17 @@ pub async fn run_client<T: Transport>(
                         repaint!();
                     }
                     // Detach or input closed → begin a clean shutdown.
-                    Some(ClientInput::Detach) | None => break,
+                    Some(ClientInput::Detach) | None => {
+                        tracing::info!(target: "mish::client", "client: detach or input closed; ending session");
+                        break;
+                    }
                 }
             }
             changed = remote.changed() => {
                 if changed.is_err() {
+                    // The driver task ended — typically because the server began a
+                    // clean shutdown (its child exited) and our driver mirrored it.
+                    tracing::info!(target: "mish::client", "client: remote driver stopped; ending session");
                     break; // driver stopped
                 }
                 server_screen = remote.borrow_and_update().clone();
@@ -243,6 +249,8 @@ pub async fn run_client<T: Transport>(
 
     // Clean shutdown: ask the peer to close, then wait briefly for the driver to
     // finish the handshake.
+    tracing::info!(target: "mish::client", "client: session loop ended; finalizing shutdown handshake");
     handle.shutdown();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), driver_task).await;
+    tracing::info!(target: "mish::client", "client: shutdown complete");
 }

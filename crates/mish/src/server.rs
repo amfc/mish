@@ -46,6 +46,7 @@ pub async fn run_server<T: Transport>(
     let (driver, handle) =
         Driver::<T, Screen, UserStream>::with(transport, clock, SspConfig::default());
     let driver_task = driver.spawn();
+    tracing::info!(target: "mish::server", "server session loop started");
 
     // How many user events we've already applied to the PTY (the echo ack).
     let mut processed: u64 = 0;
@@ -69,6 +70,7 @@ pub async fn run_server<T: Transport>(
                 // No client traffic within the timeout window: the client is
                 // unreachable, so there's no point negotiating a clean shutdown —
                 // just drop the session.
+                tracing::info!(target: "mish::server", "server: network timeout; dropping session");
                 return;
             }
             // Child produced output → feed the emulator, publish the new screen.
@@ -93,7 +95,10 @@ pub async fn run_server<T: Transport>(
                         };
                         handle.set_local(screen);
                     }
-                    None => break 'session, // child exited
+                    None => {
+                        tracing::info!(target: "mish::server", "server: pty_output closed (child exited); shutting down");
+                        break 'session; // child exited
+                    }
                 }
             }
             // Client sent new input → apply the new events to the PTY.
@@ -139,6 +144,12 @@ pub async fn run_server<T: Transport>(
     // own detach path — so it exits immediately instead of waiting out its network
     // timeout and showing "Last contact N seconds ago". Then wait briefly for the
     // driver to deliver the handshake before the runtime tears down.
+    tracing::info!(target: "mish::server", "server: session loop ended; initiating shutdown handshake");
     handle.shutdown();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), driver_task).await;
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(2), driver_task).await;
+    tracing::info!(
+        target: "mish::server",
+        timed_out = joined.is_err(),
+        "server: shutdown handshake finished; driver joined"
+    );
 }

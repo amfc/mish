@@ -50,12 +50,21 @@ impl Drop for Bootstrap {
     }
 }
 
-/// Build the `mish-server` argument list: optional `--detach`, an ephemeral
-/// port, then an optional `-- command`.
-fn server_args(detach: bool, port: &str, command: Option<&str>) -> Vec<String> {
+/// Build the `mish-server` argument list: optional `--detach`, an optional named
+/// reattachable `--session NAME`, an ephemeral port, then an optional `-- command`.
+fn server_args(
+    detach: bool,
+    session: Option<&str>,
+    port: &str,
+    command: Option<&str>,
+) -> Vec<String> {
     let mut args = Vec::new();
     if detach {
         args.push("--detach".to_string());
+    }
+    if let Some(name) = session {
+        args.push("--session".to_string());
+        args.push(name.to_string());
     }
     args.push(port.to_string());
     if let Some(cmd) = command {
@@ -66,11 +75,15 @@ fn server_args(detach: bool, port: &str, command: Option<&str>) -> Vec<String> {
 }
 
 /// Start `mish-server` locally as a child process (no SSH). Used for `--local`.
-pub async fn local(server_cmd: &str, command: Option<&str>) -> Result<Bootstrap> {
+pub async fn local(
+    server_cmd: &str,
+    session: Option<&str>,
+    command: Option<&str>,
+) -> Result<Bootstrap> {
     // Local mode: keep the server in the foreground as a managed child (no
     // detach — we kill it when the session ends).
     let mut child = Command::new(server_cmd)
-        .args(server_args(false, "0", command))
+        .args(server_args(false, session, "0", command))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -100,6 +113,7 @@ pub async fn ssh(
     ssh_pty: bool,
     host: &str,
     server_cmd: &str,
+    session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
     let (prog, base) = ssh_argv
@@ -116,7 +130,7 @@ pub async fn ssh(
     cmd.arg(host)
         .arg("--")
         .arg(server_cmd)
-        .args(server_args(true, "0", command));
+        .args(server_args(true, session, "0", command));
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

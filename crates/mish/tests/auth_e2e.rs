@@ -13,7 +13,7 @@ use mish_quic::transport;
 /// Spawn the real server via the local bootstrap and return the connection info.
 async fn spawn_server() -> bootstrap::Bootstrap {
     let server = env!("CARGO_BIN_EXE_mish-server");
-    bootstrap::local(server, Some("/bin/sh"))
+    bootstrap::local(server, None, Some("/bin/sh"))
         .await
         .expect("bootstrap should start the server and print MISH CONNECT")
 }

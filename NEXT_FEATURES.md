@@ -80,16 +80,19 @@ primitive that #4/#6 reuse, and delivers the headline win.
 
 ---
 
-## 2. Session persistence + reattach  🟡 core done
+## 2. Session persistence + reattach  ✅ done (opt-in)
 
-> **Status:** the persistent-session **core is implemented** (`mish::persist`):
-> `mish-server --persist` keeps the PTY + emulator alive across client
-> disconnects and accepts **reattach** connections, each re-syncing the full
-> current screen automatically (a fresh SSP session syncs from scratch) —
-> including output produced while no client was attached
-> (`mosh/tests/reattach.rs`). *Remaining:* the client-side reattach CLI + a
-> host-side session registry so re-running `mish host` finds your existing
-> detached session (Phase 2 below), and optional 0-RTT for instant reattach.
+> **Status:** implemented end-to-end. `mish-server --persist` keeps the PTY +
+> emulator alive across disconnects and accepts **reattach** connections, each
+> re-syncing the full current screen automatically (a fresh SSP session syncs
+> from scratch) — including output produced while no client was attached
+> (`mosh/tests/reattach.rs`). `--session NAME` adds a host-side **registry**
+> (`mish::registry`, a `0600` user-only file) so a later `mish host --session
+> NAME` finds the live daemon and **reattaches** by reprinting its connect line
+> (`mosh/tests/session_reattach.rs`); the client passes `--session` through the
+> bootstrap. Reattach reuses the session credentials (socket-free; see
+> SECURITY.md). Opt-in; default is a fresh session. *Remaining (optional):* 0-RTT
+> for instant reattach, and a daemon-socket variant for zero key at rest.
 
 
 **Why.** mosh sessions die with the client process. A persistent server + reattach

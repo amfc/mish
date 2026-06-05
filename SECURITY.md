@@ -43,6 +43,27 @@ on quinn's defaults, which we do not disable:
   quinn per RFC 9000 §8.1.
 - **Header protection and AEAD** for all 1-RTT packets.
 
+## Reattach / persistent sessions (`--session`)
+
+A named persistent session (`mish-server --session NAME`, NEXT_FEATURES.md #2)
+records the live session in a **`0600`, user-only** file under the user's runtime
+dir (`$XDG_RUNTIME_DIR/mish/<name>.session`), holding the session's `MOSH
+CONNECT` line — including the reused per-session client cert/key — so a later
+`mish host --session NAME` reattaches to the running daemon.
+
+This keeps a credential **at rest**, a step down from the otherwise memory-only
+key. The exposure is bounded: the file is readable only by the user (and root),
+and **anyone who can read it already has shell access as that user on the host**,
+so they never needed the mish session to act as them — the registry adds no new
+capability to an attacker. The trust anchor for *who may reattach* remains the SSH
+login that launches the lookup. Socket-free reattach is the reason a key lives at
+rest at all (the running daemon's cert verifier is fixed at startup, so a freshly
+SSH'd lookup must reuse the recorded credential rather than mint a new one); a
+zero-key-at-rest variant would require a daemon control socket (deferred). Stale
+entries (after an abrupt daemon death) are reaped on the next lookup by a
+liveness (`kill(pid, 0)`) check. Persistence is **opt-in** (`--session`); the
+default remains a fresh per-connection session.
+
 ## Follow-ups (tracked)
 
 - **Zeroize the in-memory client key.** It currently lives as a `Vec<u8>` in

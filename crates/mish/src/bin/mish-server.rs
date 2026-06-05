@@ -9,7 +9,7 @@
 //! so the fork happens in a single-threaded process. The child then builds the
 //! runtime and constructs the Quinn endpoint from the inherited socket.
 //!
-//! Usage: `mish-server [--detach] [--persist] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [bind-port] [-- command]`
+//! Usage: `mish-server [--detach] [--persist] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [bind-port] [-- command]`
 //!
 //! With no `-- command`, the user's `$SHELL` is started as a **login shell**
 //! (`-l`). `-4`/`-6` select the bind address family (default IPv4 `0.0.0.0`).
@@ -41,7 +41,15 @@ struct Options {
     /// Keep the session alive across client disconnects and accept reattaches
     /// (`--persist`), instead of exiting when the client leaves.
     persist: bool,
+    /// Named, reattachable session (`--session NAME`): on start, reattach to an
+    /// existing live session of this name (reprint its connect line and exit),
+    /// else register a new one. Implies `--persist`.
+    session: Option<String>,
     command: Option<String>,
+    /// Write a JSON event log here (`--log-file`); `None` disables logging.
+    log_file: Option<std::path::PathBuf>,
+    /// Max verbosity for the event log (`--log-level`, default debug).
+    log_level: tracing::Level,
 }
 
 fn parse_args() -> Result<Options> {
@@ -51,13 +59,20 @@ fn parse_args() -> Result<Options> {
         locale: Vec::new(),
         bind_ip: "0.0.0.0".to_string(),
         persist: false,
+        session: None,
         command: None,
+        log_file: None,
+        log_level: tracing::Level::DEBUG,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--detach" => opts.detach = true,
             "--persist" => opts.persist = true,
+            "--session" => {
+                opts.session = Some(args.next().context("--session needs a NAME")?);
+                opts.persist = true; // a reattachable session must persist
+            }
             "-4" => opts.bind_ip = "0.0.0.0".to_string(),
             "-6" => opts.bind_ip = "::".to_string(),
             "--family" => {
@@ -75,6 +90,13 @@ fn parse_args() -> Result<Options> {
                 let kv = args.next().context("-l needs KEY=VAL")?;
                 let (k, v) = kv.split_once('=').context("-l expects KEY=VAL")?;
                 opts.locale.push((k.to_string(), v.to_string()));
+            }
+            "--log-file" => {
+                opts.log_file = Some(args.next().context("--log-file needs a PATH")?.into());
+            }
+            "--log-level" => {
+                opts.log_level =
+                    mish::trace::parse_level(&args.next().context("--log-level needs a LEVEL")?);
             }
             "--" => {
                 let rest: Vec<String> = args.by_ref().collect();
@@ -138,6 +160,16 @@ fn main() -> Result<()> {
     suppress_core_dumps();
     let opts = parse_args()?;
 
+    // Optional event log (--log-file). Installed before the daemonize fork: the
+    // file fd and the (thread-free, synchronous) subscriber are inherited by the
+    // forked child, so logging keeps working after we detach.
+    if let Some(path) = &opts.log_file {
+        if let Err(e) = mish::trace::init_file_logging(path, "server", opts.log_level) {
+            eprintln!("mish: warning: could not open log file {}: {e}", path.display());
+        }
+    }
+    tracing::info!(target: "mish::server", detach = opts.detach, persist = opts.persist, "server starting");
+
     // Export locale/env overrides for the child shell.
     for (k, v) in &opts.locale {
         std::env::set_var(k, v);
@@ -159,6 +191,23 @@ fn main() -> Result<()> {
     }
 
     mish_quic::config::init_crypto();
+
+    // Reattach: if a named session is requested and a live one already exists,
+    // reprint its connect line and exit — the running daemon keeps serving and
+    // the client connects to it (with the recorded, reused credentials).
+    if let Some(name) = &opts.session {
+        if let Some(entry) = mish::registry::find_live(name) {
+            println!("{}", entry.connect_line);
+            std::io::stdout().flush().ok();
+            eprintln!(
+                "mish: reattaching to existing session '{name}' on port {}",
+                entry.port().unwrap_or(0)
+            );
+            tracing::info!(target: "mish::server", session = %name, "reattach to existing session");
+            return Ok(());
+        }
+    }
+
     // Mutual authentication: mint a per-session client cert/key the client must
     // present, and require it server-side. The credentials travel only over the
     // authenticated SSH channel (the MISH CONNECT line below), so only the
@@ -168,12 +217,13 @@ fn main() -> Result<()> {
     let port = socket.local_addr()?.port();
 
     use mish::bootstrap::to_hex;
-    println!(
+    let connect_line = format!(
         "MISH CONNECT {port} {} {} {}",
         to_hex(&auth.server_cert_der),
         to_hex(&auth.client_cert_der),
         to_hex(&auth.client_key_der),
     );
+    println!("{connect_line}");
     std::io::stdout().flush().ok();
     eprintln!("mish server listening on UDP port {port}");
 
@@ -181,11 +231,26 @@ fn main() -> Result<()> {
         daemonize().context("daemonizing")?;
     }
 
+    // Register the (now post-fork) daemon so a later `--session NAME` can find it.
+    // Done after daemonize so the recorded PID is the serving process.
+    if let Some(name) = &opts.session {
+        if let Err(e) = mish::registry::store(name, std::process::id() as i32, &connect_line) {
+            eprintln!("mish: warning: could not record session '{name}': {e}");
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    runtime.block_on(serve(socket, server_config, opts.command, opts.persist))
+    let result = runtime.block_on(serve(socket, server_config, opts.command, opts.persist));
+
+    // Deregister on a clean exit (shell quit / reattach window elapsed). A daemon
+    // killed abruptly leaves a stale entry, which `find_live` reaps on next lookup.
+    if let Some(name) = &opts.session {
+        mish::registry::remove(name);
+    }
+    result
 }
 
 async fn serve(
@@ -206,10 +271,12 @@ async fn serve(
             Ok(conn) => conn.context("accepting QUIC connection")?,
             Err(_) => {
                 eprintln!("no client connected within the signal timeout; exiting");
+                tracing::info!(target: "mish::server", "no client within signal timeout; exiting");
                 return Ok(());
             }
         };
     eprintln!("client connected from {}", t.remote_address());
+    tracing::info!(target: "mish::server", remote = %t.remote_address(), persist, "client connected");
 
     // An explicit `-- command` runs as given; with no command we start the
     // user's $SHELL as a login shell (reads the login profile, like `mosh host`).
@@ -243,6 +310,7 @@ async fn serve(
     )
     .await;
     eprintln!("session ended");
+    tracing::info!(target: "mish::server", "session ended");
     Ok(())
 }
 

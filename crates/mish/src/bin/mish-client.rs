@@ -94,8 +94,16 @@ struct Options {
     /// Suppress terminal initialization — don't enter the alternate screen
     /// (`--no-init` / `MOSH_NO_TERM_INIT`, mosh's smcup/rmcup suppression).
     no_init: bool,
+    /// Named, reattachable session (`--session NAME`): the server keeps it alive
+    /// across disconnects and reattaches to it on a later run (the "never lose
+    /// your shell" mode). Opt-in; without it, a fresh session each time.
+    session: Option<String>,
     host: Option<String>,
     command: Option<String>,
+    /// Write a JSON event log here (`--log-file`); `None` disables logging.
+    log_file: Option<std::path::PathBuf>,
+    /// Max verbosity for the event log (`--log-level`, default debug).
+    log_level: tracing::Level,
 }
 
 /// Resolve a `--predict` / `MOSH_PREDICTION_DISPLAY` mode name. `experimental`
@@ -126,8 +134,11 @@ fn parse_args() -> Result<Options> {
             Err(_) => PredictMode::Adaptive,
         },
         no_init: std::env::var_os("MOSH_NO_TERM_INIT").is_some(),
+        session: None,
         host: None,
         command: None,
+        log_file: None,
+        log_level: tracing::Level::DEBUG,
     };
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -149,6 +160,13 @@ fn parse_args() -> Result<Options> {
             "-a" | "--predict-always" => opts.predict = PredictMode::Always,
             "-n" | "--predict-never" => opts.predict = PredictMode::Never,
             "--no-init" => opts.no_init = true,
+            "--session" => opts.session = Some(args.next().context("--session needs a NAME")?),
+            "--log-file" => {
+                opts.log_file = Some(args.next().context("--log-file needs a PATH")?.into());
+            }
+            "--log-level" => {
+                opts.log_level = mish::trace::parse_level(&args.next().context("--log-level needs a LEVEL")?);
+            }
             "--version" => {
                 println!("mish-client (mish) {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -186,6 +204,9 @@ fn print_usage() {
          \x20 --predict <mode>     adaptive|always|never|experimental (default: adaptive)\n\
          \x20 -a, --predict-always always echo locally; -n, --predict-never  disable\n\
          \x20 --no-init            don't enter the alternate screen (MOSH_NO_TERM_INIT)\n\
+         \x20 --session <name>     reattachable persistent session (never lose your shell)\n\
+         \x20 --log-file <path>    write a JSON event log (for debugging)\n\
+         \x20 --log-level <lvl>    log verbosity: error|warn|info|debug|trace (default debug)\n\
          \x20 --version            print version and exit\n\
          \x20 -h, --help           show this help\n\n\
          env: MOSH_PREDICTION_DISPLAY, MOSH_NO_TERM_INIT, MOSH_ESCAPE_KEY"
@@ -207,11 +228,20 @@ fn default_local_server() -> String {
 async fn main() -> Result<()> {
     let opts = parse_args()?;
 
+    // Optional event log (--log-file): install before anything else so the whole
+    // session — bootstrap, connect, run, disconnect — is captured.
+    if let Some(path) = &opts.log_file {
+        if let Err(e) = mish::trace::init_file_logging(path, "client", opts.log_level) {
+            eprintln!("[mish-client] warning: could not open log file {}: {e}", path.display());
+        }
+    }
+    tracing::info!(target: "mish::client", local = opts.local, "client starting");
+
     // 1. Bootstrap: get (udp addr, cert) by starting mish-server locally or via SSH.
     let boot: Bootstrap = if opts.local {
         let server = opts.server_cmd.unwrap_or_else(default_local_server);
         eprintln!("[mish-client] starting local server `{server}`…");
-        bootstrap::local(&server, opts.command.as_deref())
+        bootstrap::local(&server, opts.session.as_deref(), opts.command.as_deref())
             .await
             .context("local bootstrap")?
     } else {
@@ -223,6 +253,7 @@ async fn main() -> Result<()> {
             opts.ssh_pty,
             &host,
             &server,
+            opts.session.as_deref(),
             opts.command.as_deref(),
         )
         .await
@@ -242,9 +273,11 @@ async fn main() -> Result<()> {
     let t = transport::connect(&endpoint, boot.addr, "localhost")
         .await
         .context("connecting to server")?;
+    tracing::info!(target: "mish::client", addr = %boot.addr, "connected to server");
 
     // 3. Drive the local terminal.
     run_terminal(t, opts.predict, opts.no_init).await;
+    tracing::info!(target: "mish::client", "client session ended; tearing down");
 
     // Dropping `boot` tears down the server / ssh channel.
     drop(boot);

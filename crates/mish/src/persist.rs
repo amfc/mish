@@ -144,6 +144,7 @@ impl PersistentSession {
                 }
                 _ = done_rx.changed() => {
                     if *done_rx.borrow() {
+                        tracing::info!(target: "mish::persist", "child exited; shutting down attached client");
                         handle.shutdown();
                         let _ = tokio::time::timeout(Duration::from_secs(2), driver_task).await;
                         return AttachEnd::ChildExited;
@@ -161,6 +162,7 @@ impl PersistentSession {
                     if changed.is_err() {
                         // Driver stopped — the connection is gone. Keep the
                         // session for reattach.
+                        tracing::info!(target: "mish::persist", "client connection dropped; awaiting reattach");
                         return AttachEnd::Disconnected;
                     }
                     last_heard = tokio::time::Instant::now();

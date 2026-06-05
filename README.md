@@ -91,6 +91,18 @@ keeps riding loss-tolerant datagrams; history is fetched on demand over a
 **reliable QUIC side-channel** and shown as a paused viewport (any keystroke
 returns to live). See [`NEXT_FEATURES.md`](NEXT_FEATURES.md).
 
+**Persistent sessions / reattach (also better than mosh).** With `--session
+NAME`, the server keeps the shell + terminal state alive across disconnects, and
+re-running `mish host --session NAME` **reattaches** to it (tmux/abduco-style)
+— combined with QUIC roaming, that's the full "never lose your shell" story.
+Opt-in; the default is a fresh session each time. (Reattach reuses the session's
+credentials via a `0600` user-only registry file — see
+[`SECURITY.md`](SECURITY.md).)
+
+```sh
+mish host --session work      # start (or reattach to) a persistent session "work"
+```
+
 A blue status banner ("mish: Last contact N seconds ago…") appears when the link
 stalls, and the window title is prefixed `[mish]`.
 
@@ -131,6 +143,7 @@ the independent UDP/QUIC path.
 | Real-PTY reference | output of a real program on a real kernel PTY rendered by our emulator and the independent `vt100` must agree (real bytes, independent oracle) | `mosh/tests/real_terminal_reference.rs` |
 | Side-channel | reliable bidi-stream request/response over real QUIC: framed round-trip + a 256 KiB payload past the datagram limit | `mish-quic/tests/side_channel.rs`, `mish-ssp` `framing` |
 | Scrollback | client fetches a deep history window over QUIC and gets the scrolled-off rows; client scroll-mode renders the history viewport headlessly | `mosh/tests/scrollback_e2e.rs`, `mosh/tests/scroll_client.rs` |
+| Reattach | the persistent session survives a client detach and re-syncs the full screen (incl. gap output) to a fresh connection; a second `--session NAME` server reattaches via the registry | `mosh/tests/reattach.rs`, `mosh/tests/session_reattach.rs`, `mosh` `registry` |
 | Diff-engine benchmark | throughput of `new_frame` + `apply_diff` round-trip across scrolling/typing/full-repaint workloads (mosh's `benchmark.cc`) | `mish-terminal/examples/diff_bench.rs` |
 | Clock fuzz | non-monotonic / jumping / boundary clock values into the core's timer math: no panic, bounded memory, and forward jumps still converge | `mish-ssp/tests/fuzz_clock.rs` |
 | Roaming | a client that migrates its source address mid-session keeps converging (server re-pins the peer) | `mish-madsim/tests/madsim_fullstack.rs` |

@@ -20,8 +20,10 @@ pub mod client;
 pub mod locale;
 pub mod persist;
 pub mod pty;
+pub mod registry;
 pub mod scrollback;
 pub mod server;
+pub mod trace;
 
 pub use bootstrap::Bootstrap;
 pub use client::{run_client, ClientInput};

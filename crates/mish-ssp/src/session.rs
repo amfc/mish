@@ -217,6 +217,11 @@ where
             //    (we sent our final ack-bearing frame in the tick above), or the
             //    grace period elapsed.
             if shutting_down && (self.core.is_shutdown_acked() || now >= shutdown_deadline) {
+                tracing::debug!(
+                    target: "mish::ssp",
+                    acked = self.core.is_shutdown_acked(),
+                    "driver: shutdown complete; exiting"
+                );
                 return Ok(());
             }
 
@@ -244,6 +249,7 @@ where
                                     // The peer initiated shutdown — mirror it so
                                     // both sides converge to a clean close.
                                     if self.core.peer_is_shutting_down() && !shutting_down {
+                                        tracing::debug!(target: "mish::ssp", "driver: peer is shutting down; mirroring");
                                         shutting_down = true;
                                         self.core.start_shutdown();
                                         shutdown_deadline = now + 5000;
@@ -252,7 +258,10 @@ where
                             }
                             // Malformed / incomplete datagrams are silently dropped.
                         }
-                        Err(TransportError::Closed) => return Err(SessionError::Closed),
+                        Err(TransportError::Closed) => {
+                            tracing::debug!(target: "mish::ssp", "driver: transport closed; exiting");
+                            return Err(SessionError::Closed);
+                        }
                         Err(_) => { /* transient: treat as a drop */ }
                     }
                 }
@@ -265,6 +274,7 @@ where
                 }
                 // Application requested a clean shutdown.
                 _ = self.shutdown.notified(), if !shutting_down => {
+                    tracing::debug!(target: "mish::ssp", "driver: local shutdown requested");
                     shutting_down = true;
                     self.core.start_shutdown();
                     shutdown_deadline = self.clock.now_ms() + 5000;
