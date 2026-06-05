@@ -227,17 +227,16 @@ impl PredictionEngine {
                         }
                     }
                     2 => {
-                        // Wide char: the glyph cell plus a spacer.
+                        // Wide char: the glyph cell plus a blank spacer (width is
+                        // derived from the char, so no flags are needed).
                         let wide = Cell {
                             c,
-                            flags: crate::screen::F_WIDE,
                             ..Cell::default()
                         };
                         self.push_cell(wide, input_index);
                         self.advance_cursor();
                         let spacer = Cell {
                             c: ' ',
-                            flags: crate::screen::F_WIDE_SPACER,
                             ..Cell::default()
                         };
                         self.push_cell(spacer, input_index);
@@ -509,12 +508,8 @@ mod tests {
         p.new_user_bytes("世".as_bytes(), &base, 1);
         let shown = p.predicted_screen(&base);
         assert_eq!(shown.cell(0, 0).unwrap().c, '世');
-        assert_ne!(shown.cell(0, 0).unwrap().flags & crate::screen::F_WIDE, 0);
-        assert_ne!(
-            shown.cell(0, 1).unwrap().flags & crate::screen::F_WIDE_SPACER,
-            0
-        );
-        // Cursor advanced by the full display width.
+        assert_eq!(shown.cell(0, 1).unwrap().c, ' '); // spacer
+                                                      // Cursor advanced by the full display width.
         assert_eq!(shown.cursor_col, 2);
     }
 

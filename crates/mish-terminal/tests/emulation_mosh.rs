@@ -307,24 +307,16 @@ fn combining_marks_captured_and_diffed() {
 }
 
 /// Wide (CJK) characters occupy a glyph cell + a spacer, and round-trip exactly.
+/// Geometry is derived from the character's display width, not a stored flag.
 #[test]
 fn wide_char_cells_and_diff() {
-    use mish_terminal::screen;
     let mut e = Emulator::new(10, 2);
     e.feed("世界".as_bytes());
     let s = e.snapshot();
-    assert_eq!(s.cell(0, 0).unwrap().c, '世');
-    assert_ne!(
-        s.cell(0, 0).unwrap().flags & screen::F_WIDE,
-        0,
-        "wide flag set"
-    );
-    assert_ne!(
-        s.cell(0, 1).unwrap().flags & screen::F_WIDE_SPACER,
-        0,
-        "spacer follows"
-    );
+    assert_eq!(s.cell(0, 0).unwrap().c, '世'); // wide glyph
+    assert_eq!(s.cell(0, 1).unwrap().c, ' '); // its spacer
     assert_eq!(s.cell(0, 2).unwrap().c, '界');
+    assert_eq!(s.to_lines()[0], "世界"); // spacers not doubled
 
     let blank = Screen::blank(10, 2);
     let mut e2 = Emulator::new(10, 2);

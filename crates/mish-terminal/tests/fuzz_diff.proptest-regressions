@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5491aef43fa236a7cad70f59a785996cbd777f44d9ca6f5a4b81481243e7e685 # shrinks to ops = [Cup(0, 3), Tab, Print(","), ScrollDown(1), Newline]
+cc 8918439e1d1a9bf9bea4671944cf1317f6c3e7b45b074c73492aaf0866052f1a # shrinks to ops = [Sgr([40]), El(0), Tab, Print("a")]
+cc b2752d38673276e1088148356c24c59f3a3452eaadc4e7099ea96e0b986b46af # shrinks to ops = [Sgr([40]), ScrollUp(1), ScrollDown(1), Print("A"), Print("A"), Print("0"), Print("?")]
+cc 1f90cdd9a89c433f3cc26d816b0bcbecf9522e7d2fecbe64e09f0b5d2d6eaf46 # shrinks to ops = [Wide("世界"), Backspace, Ed(0)]

@@ -128,8 +128,17 @@ impl Emulator {
 }
 
 fn convert_cell(cell: &ATermCell) -> Cell {
+    // The emulator may store a control character as a cell glyph (e.g. a TAB,
+    // kept for reflow). Such a cell renders as blank and can't be reproduced by
+    // re-emitting the control byte (the receiver re-interprets it), so we
+    // normalize it to a space — visually identical, and it round-trips.
+    let c = if (cell.c as u32) < 0x20 || cell.c == '\u{7f}' {
+        ' '
+    } else {
+        cell.c
+    };
     Cell {
-        c: cell.c,
+        c,
         fg: convert_color(cell.fg),
         bg: convert_color(cell.bg),
         flags: convert_flags(cell.flags),
@@ -150,6 +159,10 @@ fn convert_color(color: ATermColor) -> Color {
 }
 
 fn convert_flags(flags: Flags) -> u16 {
+    // Only display attributes are stored. WIDE_CHAR / WIDE_CHAR_SPACER are
+    // deliberately omitted: cell geometry is derived from the character's own
+    // display width (the receiver re-derives it when it replays the glyph), so
+    // storing the flags would be redundant state that diverges on erase.
     let mut out = 0u16;
     let map = [
         (Flags::INVERSE, screen::F_INVERSE),
@@ -159,8 +172,6 @@ fn convert_flags(flags: Flags) -> u16 {
         (Flags::DIM, screen::F_DIM),
         (Flags::HIDDEN, screen::F_HIDDEN),
         (Flags::STRIKEOUT, screen::F_STRIKEOUT),
-        (Flags::WIDE_CHAR, screen::F_WIDE),
-        (Flags::WIDE_CHAR_SPACER, screen::F_WIDE_SPACER),
     ];
     for (af, mf) in map {
         if flags.contains(af) {

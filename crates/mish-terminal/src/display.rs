@@ -37,7 +37,9 @@ struct FrameState {
 }
 
 fn cell_width(cell: &Cell) -> i32 {
-    if cell.flags & crate::screen::F_WIDE != 0 {
+    // Geometry derives from the character's display width, not a stored flag.
+    use unicode_width::UnicodeWidthChar;
+    if UnicodeWidthChar::width(cell.c).unwrap_or(1) == 2 {
         2
     } else {
         1
@@ -272,6 +274,15 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
     let mut baseline_owned: Option<Screen> = None;
     if initialized {
         if let Some(k) = detect_scroll_up(old, new) {
+            // A line feed fills the newly-exposed line with the *current* pen's
+            // background (BCE). Reset to the default pen first so exposed rows
+            // match the default-blank `scroll_up` baseline (put_row then redraws
+            // any genuinely non-default exposed content).
+            frame.update_rendition(
+                Color::Named(NAMED_FOREGROUND),
+                Color::Named(NAMED_BACKGROUND),
+                0,
+            );
             frame.append_move(new.rows as i32 - 1, 0);
             frame.push_n(k as usize, b'\n'); // LF at the bottom scrolls up
             frame.cursor_x = 0;
@@ -404,10 +415,11 @@ fn put_row(frame: &mut FrameState, old: &Screen, new: &Screen, y: u16, initializ
         frame.append_cell(cell);
         frame.cursor_x += cell_width(cell);
         x += cell_width(cell) as u16;
-        // Writing the final column leaves the real cursor in an ambiguous
-        // pending-wrap state; trash our tracked position to force the next move
-        // to be explicit (mosh does the same).
-        if x >= width {
+        // Trash our tracked cursor (forcing the next move to be explicit) when
+        // the real cursor position becomes ambiguous: at the final column
+        // (pending-wrap), or after emitting a control-character cell (e.g. a
+        // stored TAB, which the receiver re-interprets and advances differently).
+        if x >= width || (cell.c as u32) < 0x20 || cell.c == '\u{7f}' {
             frame.cursor_x = -1;
             frame.cursor_y = -1;
         }

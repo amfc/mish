@@ -155,14 +155,18 @@ impl Screen {
     /// trimmed. Handy for assertions and debugging (attributes are ignored).
     /// Wide-character spacer cells are skipped so wide glyphs aren't doubled.
     pub fn to_lines(&self) -> Vec<String> {
+        use unicode_width::UnicodeWidthChar;
         (0..self.rows)
             .map(|r| {
-                let mut s: String = self
-                    .row_slice(r)
-                    .iter()
-                    .filter(|c| c.flags & F_WIDE_SPACER == 0)
-                    .map(|c| c.c)
-                    .collect();
+                let row = self.row_slice(r);
+                let mut s = String::new();
+                let mut x = 0;
+                while x < row.len() {
+                    let c = row[x].c;
+                    s.push(c);
+                    // Skip the spacer cell that follows a wide glyph.
+                    x += UnicodeWidthChar::width(c).unwrap_or(1).max(1);
+                }
                 let trimmed = s.trim_end().len();
                 s.truncate(trimmed);
                 s
