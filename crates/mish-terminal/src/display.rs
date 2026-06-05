@@ -332,6 +332,12 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
     if !initialized || old.bracketed_paste != new.bracketed_paste {
         set(frame, 2004, new.bracketed_paste);
     }
+    if !initialized || old.focus_event != new.focus_event {
+        set(frame, 1004, new.focus_event);
+    }
+    if !initialized || old.alternate_scroll != new.alternate_scroll {
+        set(frame, 1007, new.alternate_scroll);
+    }
     for (bit, code) in [
         (MOUSE_CLICK, 1000),
         (MOUSE_DRAG, 1002),
@@ -340,6 +346,18 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
     ] {
         if !initialized || (old.mouse_mode & bit) != (new.mouse_mode & bit) {
             set(frame, code, new.mouse_mode & bit != 0);
+        }
+    }
+
+    // OSC 52 clipboard (server→client). Latest-wins: re-emit only when it
+    // changed (or on a full repaint, so a reconnecting client re-syncs). We only
+    // ever set it, never clear it — the emulator's listener doesn't revert to
+    // `None`, so an unset→set transition is the only case.
+    if new.clipboard.is_some() && (!initialized || old.clipboard != new.clipboard) {
+        if let Some(text) = &new.clipboard {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+            frame.push(&format!("\x1b]52;c;{b64}\x1b\\"));
         }
     }
 

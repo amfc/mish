@@ -12,24 +12,30 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell as ATermCell, Flags};
-use alacritty_terminal::term::{Config, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as ATermColor, CursorShape, NamedColor, Processor};
 use alacritty_terminal::{term::test::TermSize, Term};
 
 use crate::screen::{self, Cell, Color, Screen};
 
-/// Event listener that records terminal title changes (everything else is a
-/// no-op for our purposes — we only synchronize the rendered screen).
+/// Event listener that records out-of-band terminal events we synchronize but
+/// which aren't part of the cell grid: the window title and the OSC 52 clipboard
+/// (latest-wins). Everything else is a no-op.
 #[derive(Clone, Default)]
-struct TitleListener {
+struct TermListener {
     title: Arc<Mutex<String>>,
+    clipboard: Arc<Mutex<Option<String>>>,
 }
 
-impl EventListener for TitleListener {
+impl EventListener for TermListener {
     fn send_event(&self, event: Event) {
         match event {
             Event::Title(t) => *self.title.lock().unwrap() = t,
             Event::ResetTitle => self.title.lock().unwrap().clear(),
+            // OSC 52 copy (the system clipboard, not the X primary selection).
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                *self.clipboard.lock().unwrap() = Some(text);
+            }
             _ => {}
         }
     }
@@ -37,15 +43,15 @@ impl EventListener for TitleListener {
 
 /// A VT emulator producing [`Screen`] snapshots.
 pub struct Emulator {
-    term: Term<TitleListener>,
+    term: Term<TermListener>,
     parser: Processor,
-    listener: TitleListener,
+    listener: TermListener,
 }
 
 impl Emulator {
     /// Create an emulator with the given screen size.
     pub fn new(cols: u16, rows: u16) -> Self {
-        let listener = TitleListener::default();
+        let listener = TermListener::default();
         let size = TermSize::new(cols as usize, rows as usize);
         let term = Term::new(Config::default(), &size, listener.clone());
         Self {
@@ -123,6 +129,9 @@ impl Emulator {
             mouse_mode,
             cursor_shape,
             cursor_blink: style.blinking,
+            focus_event: mode.contains(TermMode::FOCUS_IN_OUT),
+            alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+            clipboard: self.listener.clipboard.lock().unwrap().clone(),
         }
     }
 }

@@ -115,6 +115,14 @@ pub struct Screen {
     pub cursor_shape: u8,
     /// Cursor blink.
     pub cursor_blink: bool,
+    /// Focus-event reporting (DECSET 1004) is active.
+    pub focus_event: bool,
+    /// Alternate-scroll mode (DECSET 1007) is active. Defaults *on* (alacritty's
+    /// default), so blank/initial screens set it true to match the emulator.
+    pub alternate_scroll: bool,
+    /// Latest OSC 52 clipboard contents set by the remote application
+    /// (latest-wins; `None` until something sets it). Server→client.
+    pub clipboard: Option<String>,
 }
 
 impl Screen {
@@ -133,6 +141,9 @@ impl Screen {
             mouse_mode: 0,
             cursor_shape: 0,
             cursor_blink: false,
+            focus_event: false,
+            alternate_scroll: true,
+            clipboard: None,
         }
     }
 
@@ -207,6 +218,9 @@ impl SyncState for Screen {
             mouse_mode: 0,
             cursor_shape: 0,
             cursor_blink: false,
+            focus_event: false,
+            alternate_scroll: true,
+            clipboard: None,
         }
     }
 

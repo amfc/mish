@@ -90,6 +90,9 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
                 mouse_mode: 0,
                 cursor_shape: 0,
                 cursor_blink: false,
+                focus_event: false,
+                alternate_scroll: true,
+                clipboard: None,
             })
     })
 }
@@ -129,6 +132,9 @@ fn scroll_up_is_minimal_and_correct() {
             mouse_mode: 0,
             cursor_shape: 0,
             cursor_blink: false,
+            focus_event: false,
+            alternate_scroll: true,
+            clipboard: None,
         }
     };
     let old = mk(["row0", "row1", "row2", "row3", "row4", "row5"]);
@@ -147,6 +153,77 @@ fn scroll_up_is_minimal_and_correct() {
     assert!(
         screen_eq(&apply(&old, &new), &new),
         "scroll diff must reproduce new"
+    );
+}
+
+/// Focus-event mode (DECSET 1004) is captured by the emulator and round-trips
+/// through the diff in both directions.
+#[test]
+fn focus_mode_roundtrips() {
+    let mut emu = Emulator::new(10, 3);
+    emu.feed(b"hi");
+    let off0 = emu.snapshot();
+    assert!(!off0.focus_event);
+    emu.feed(b"\x1b[?1004h");
+    let on = emu.snapshot();
+    assert!(on.focus_event, "emulator tracks focus-event mode");
+    assert_eq!(apply(&off0, &on).focus_event, true, "1004 set round-trips");
+    emu.feed(b"\x1b[?1004l");
+    let off1 = emu.snapshot();
+    assert_eq!(
+        apply(&on, &off1).focus_event,
+        false,
+        "1004 reset round-trips"
+    );
+}
+
+/// Alternate-scroll mode (DECSET 1007) — default on in the emulator — round-trips.
+#[test]
+fn alternate_scroll_mode_roundtrips() {
+    let mut emu = Emulator::new(10, 3);
+    let on = emu.snapshot();
+    assert!(on.alternate_scroll, "default on");
+    emu.feed(b"\x1b[?1007l");
+    let off = emu.snapshot();
+    assert!(!off.alternate_scroll, "1007l turns it off");
+    assert_eq!(
+        apply(&on, &off).alternate_scroll,
+        false,
+        "reset round-trips"
+    );
+    emu.feed(b"\x1b[?1007h");
+    let on2 = emu.snapshot();
+    assert_eq!(apply(&off, &on2).alternate_scroll, true, "set round-trips");
+}
+
+/// OSC 52 clipboard is decoded by the emulator and re-emitted (base64) by the
+/// diff, so the contents round-trip to the client.
+#[test]
+fn clipboard_osc52_roundtrips() {
+    let mut emu = Emulator::new(10, 3);
+    emu.feed(b"x");
+    let before = emu.snapshot();
+    assert_eq!(before.clipboard, None);
+    // OSC 52 copy of "hello" (base64 "aGVsbG8="), ST-terminated.
+    emu.feed(b"\x1b]52;c;aGVsbG8=\x1b\\");
+    let set = emu.snapshot();
+    assert_eq!(
+        set.clipboard.as_deref(),
+        Some("hello"),
+        "emulator decodes the OSC 52 payload"
+    );
+    assert_eq!(
+        apply(&before, &set).clipboard.as_deref(),
+        Some("hello"),
+        "clipboard round-trips through the diff"
+    );
+    // A subsequent change also propagates (base64("world")="d29ybGQ=").
+    emu.feed(b"\x1b]52;c;d29ybGQ=\x1b\\");
+    let changed = emu.snapshot();
+    assert_eq!(
+        apply(&set, &changed).clipboard.as_deref(),
+        Some("world"),
+        "clipboard change round-trips"
     );
 }
 
@@ -177,8 +254,8 @@ proptest! {
         let n = cols as usize * rows as usize;
         let mut a_cells = cells_a; a_cells.resize(n, Cell::default());
         let mut b_cells = cells_b; b_cells.resize(n, Cell::default());
-        let old = Screen { cols, rows, cells: a_cells, cursor_row: ca.min(rows-1), cursor_col: cb.min(cols-1), cursor_visible: true, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false };
-        let new = Screen { cols, rows, cells: b_cells, cursor_row: (rows-1).min(ca), cursor_col: (cols-1).min(cb), cursor_visible: false, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false };
+        let old = Screen { cols, rows, cells: a_cells, cursor_row: ca.min(rows-1), cursor_col: cb.min(cols-1), cursor_visible: true, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, clipboard: None };
+        let new = Screen { cols, rows, cells: b_cells, cursor_row: (rows-1).min(ca), cursor_col: (cols-1).min(cb), cursor_visible: false, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, clipboard: None };
         let got = apply(&old, &new);
         if !screen_eq(&got, &new) {
             let fd = (0..new.cells.len()).find(|&i| got.cells.get(i) != new.cells.get(i));

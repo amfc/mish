@@ -63,21 +63,32 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
             // round-trip (an emulator quirk, not a diff concern).
             "[a-z]{0,8}",
             any::<u64>(),
+            any::<bool>(), // focus_event
+            any::<bool>(), // alternate_scroll
         )
-            .prop_map(|(cols, rows, cells, cr, cc, cv, title, echo_ack)| Screen {
-                cols,
-                rows,
-                cells,
-                cursor_row: cr,
-                cursor_col: cc,
-                cursor_visible: cv,
-                title,
-                echo_ack,
-                bracketed_paste: false,
-                mouse_mode: 0,
-                cursor_shape: 0,
-                cursor_blink: false,
-            })
+            .prop_map(
+                |(cols, rows, cells, cr, cc, cv, title, echo_ack, focus, alt_scroll)| Screen {
+                    cols,
+                    rows,
+                    cells,
+                    cursor_row: cr,
+                    cursor_col: cc,
+                    cursor_visible: cv,
+                    title,
+                    echo_ack,
+                    bracketed_paste: false,
+                    mouse_mode: 0,
+                    cursor_shape: 0,
+                    cursor_blink: false,
+                    focus_event: focus,
+                    alternate_scroll: alt_scroll,
+                    // Clipboard is monotonic (the emulator never reverts it to
+                    // None), so an arbitrary Some→None pair would be an
+                    // unreachable transition; covered by dedicated directional
+                    // tests in display_roundtrip.rs instead.
+                    clipboard: None,
+                },
+            )
     })
 }
 
