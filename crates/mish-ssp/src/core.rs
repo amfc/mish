@@ -444,7 +444,13 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             return Vec::new();
         }
 
-        let diff = self.current_state.diff_from(&self.assumed().state);
+        let mut diff = self.current_state.diff_from(&self.assumed().state);
+        // Prophylactic resend: the assumed-delivered state is only *assumed* — if
+        // the datagram that carried it was lost, a diff built on it is unapplyable
+        // and the peer drops it, costing a round-trip to recover. Diffing from the
+        // *acked* front instead is always applyable; do that when it costs little
+        // extra (mosh's `attempt_prospective_resend_optimization`).
+        self.attempt_prospective_resend(&mut diff);
 
         let mut out = Vec::new();
         if diff.is_empty() {
@@ -461,6 +467,29 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             self.mindelay_clock = None;
         }
         out
+    }
+
+    /// Loss-recovery optimization: consider diffing from the *acked* front state
+    /// instead of the merely-assumed-delivered one. The assumed state may have
+    /// been lost in flight; a diff anchored on the acked state is always
+    /// applyable, so this recovers from a dropped datagram a round-trip sooner.
+    /// We only switch when it's nearly free — the front-anchored diff is no bigger
+    /// than the proposed one, or at most ~100 bytes bigger and still under 1000.
+    /// Mirrors mosh's `attempt_prospective_resend_optimization`.
+    fn attempt_prospective_resend(&mut self, proposed: &mut Vec<u8>) {
+        // Already anchored on the acked front — nothing to gain.
+        if self.assumed_receiver_idx == 0 {
+            return;
+        }
+        let resend = {
+            let front = &self.sent_states.front().expect("never empty").state;
+            self.current_state.diff_from(front)
+        };
+        let (rlen, plen) = (resend.len(), proposed.len());
+        if rlen <= plen || (rlen < 1000 && rlen.saturating_sub(plen) < 100) {
+            self.assumed_receiver_idx = 0;
+            *proposed = resend;
+        }
     }
 
     fn send_to_receiver(&mut self, now: Millis, diff: Vec<u8>, out: &mut Vec<Instruction>) {

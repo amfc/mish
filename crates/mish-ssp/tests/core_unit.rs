@@ -212,3 +212,61 @@ fn malformed_diff_does_not_panic() {
     // truncate(huge) is a no-op on an empty vec, then "x" is appended.
     assert_eq!(b.remote_state().as_slice(), b"x");
 }
+
+/// Tick `c` (advancing virtual time) until it emits, returning the instructions.
+fn tick_until_emit(c: &mut Core, now: &mut u64) -> Vec<Instruction> {
+    for _ in 0..2000 {
+        let out = c.tick(*now);
+        if !out.is_empty() {
+            return out;
+        }
+        *now += 5;
+    }
+    panic!("core never emitted");
+}
+
+/// The prophylactic-resend optimization (mosh's
+/// `attempt_prospective_resend_optimization`): when a sent-but-only-*assumed*-
+/// delivered state is actually lost, the next send anchors its diff on the
+/// *acked* front state instead, so the peer recovers a round-trip sooner.
+#[test]
+fn prospective_resend_recovers_from_a_lost_datagram() {
+    let mut a = Core::new(0);
+    let mut b = Core::new(0);
+    let mut now = 0u64;
+
+    // 1. a → "v1"; deliver it; b acks; a learns v1 is acked (front advances to v1).
+    a.set_current_state(BytesState::new(b"v1".to_vec()));
+    for i in tick_until_emit(&mut a, &mut now) {
+        b.recv(now, &i);
+    }
+    now += 5;
+    for i in tick_until_emit(&mut b, &mut now) {
+        a.recv(now, &i);
+    }
+
+    // 2. a → "v1v2"; it is sent but the datagram is LOST (never reaches b). a now
+    //    *assumes* b has v1v2, but b is still at v1.
+    a.set_current_state(BytesState::new(b"v1v2".to_vec()));
+    let lost = tick_until_emit(&mut a, &mut now);
+    assert_eq!(lost[0].new_num, 2, "v1v2 was sent (and dropped)");
+
+    // 3. a → "v1v2v3"; the next send should anchor on the acked front (v1, num 1),
+    //    not the merely-assumed (and lost) v1v2 (num 2).
+    a.set_current_state(BytesState::new(b"v1v2v3".to_vec()));
+    let resent = tick_until_emit(&mut a, &mut now);
+    assert_eq!(
+        resent[0].old_num, 1,
+        "diff anchored on the acked front, not the lost assumed state"
+    );
+
+    // 4. Because the diff builds on v1 (which b has), b recovers straight to
+    //    v1v2v3 despite never receiving v1v2 — one round-trip sooner than if the
+    //    diff had been anchored on the lost state (which b would have dropped).
+    b.recv(now, &resent[0]);
+    assert_eq!(
+        b.remote_state().as_slice(),
+        b"v1v2v3",
+        "peer recovers from the lost datagram in a single step"
+    );
+}
