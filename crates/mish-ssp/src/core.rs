@@ -297,19 +297,27 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
     fn send_interval(&self) -> Millis {
         // Aim for ~2 frames per RTT, clamped to the configured bounds. Falls back
         // to the minimum interval until we have an RTT sample.
+        let lo = self.cfg.send_interval_min.min(self.cfg.send_interval_max);
         if self.rtt.initialized {
             (self.rtt.srtt / 2.0).ceil() as Millis
         } else {
             self.cfg.send_interval_min
         }
-        .clamp(self.cfg.send_interval_min, self.cfg.send_interval_max)
+        .clamp(lo, self.cfg.send_interval_max)
     }
 
+    /// Floor for the RTT-derived RTO (ms), so a tiny RTT can't make us
+    /// retransmit absurdly fast.
+    const RTO_FLOOR: Millis = 50;
+
     fn timeout(&self) -> Millis {
-        // RTT-derived RTO, clamped so it never exceeds the configured rto (which
-        // acts as the conservative upper bound) and stays above a small floor.
+        // RTT-derived RTO, clamped to `[floor, cfg.rto]`. `cfg.rto` is the
+        // conservative upper bound; the floor keeps us from over-eager resends.
+        // If a caller configures `rto` *below* the floor (unusual), honor their
+        // smaller bound rather than panicking on an inverted clamp range.
         if self.rtt.initialized {
-            (self.rtt.rto().ceil() as Millis).clamp(50, self.cfg.rto)
+            let floor = Self::RTO_FLOOR.min(self.cfg.rto);
+            (self.rtt.rto().ceil() as Millis).clamp(floor, self.cfg.rto)
         } else {
             self.cfg.rto
         }
