@@ -260,6 +260,7 @@ impl Emulator {
             cursor_blink: style.blinking,
             focus_event: mode.contains(TermMode::FOCUS_IN_OUT),
             alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+            alt_screen: mode.contains(TermMode::ALT_SCREEN),
             clipboard: self.listener.clipboard.lock().unwrap().clone(),
             app_cursor_keys: mode.contains(TermMode::APP_CURSOR),
             bell_count: *self.listener.bell_count.lock().unwrap(),

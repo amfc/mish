@@ -333,11 +333,12 @@ async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init
                 }
                 Ok(n) => n,
             };
+            let chunk = &buf[..n];
             // Scrollback keys: Shift-PageUp / Shift-PageDown (xterm modifier
             // encoding) drive the history viewer instead of being sent to the
             // shell. These arrive as one atomic read in practice; checking the
             // whole read keeps it out of the per-byte escape state machine.
-            match &buf[..n] {
+            match chunk {
                 b"\x1b[5;2~" => {
                     let _ = key_tx.send(ClientInput::ScrollUp).await;
                     continue;
@@ -349,7 +350,38 @@ async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init
                 _ => {}
             }
             let mut batch: Vec<u8> = Vec::with_capacity(n);
-            for &b in &buf[..n] {
+            let mut i = 0;
+            while i < chunk.len() {
+                // SGR mouse report (`ESC [ < … M/m`): pull it out whole so it
+                // bypasses the keystroke path and reaches run_client, which
+                // routes the wheel to scrollback / the app. Like a local
+                // terminal, we assume the report arrives in one read; a report
+                // split across reads falls through and is sent as plain bytes.
+                if !escaping && chunk[i] == 0x1b && chunk[i + 1..].starts_with(b"[<") {
+                    if let Some(rel) = chunk[i + 3..].iter().position(|&b| b == b'M' || b == b'm') {
+                        let end = i + 3 + rel; // index of the M/m terminator
+                        // Flush keystrokes that preceded the report, in order.
+                        if !batch.is_empty()
+                            && key_tx
+                                .send(ClientInput::Keys(std::mem::take(&mut batch)))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        if key_tx
+                            .send(ClientInput::Mouse(chunk[i..=end].to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                let b = chunk[i];
+                i += 1;
                 if escaping {
                     escaping = false;
                     match b {
@@ -499,10 +531,12 @@ struct TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
-        // Disable mouse modes, bracketed paste, screen-reverse; show cursor.
+        // Disable mouse modes (incl. our wheel-capture baseline) and bracketed
+        // paste, drop screen-reverse, restore alternate-scroll (which we force
+        // off during the session), and show the cursor.
         print!(
             "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
-             \x1b[?2004l\x1b[?5l\x1b[?25h"
+             \x1b[?2004l\x1b[?5l\x1b[?1007h\x1b[?25h"
         );
         // Leave the alternate screen only if we entered it.
         if !self.no_init {

@@ -120,6 +120,13 @@ pub struct Screen {
     /// Alternate-scroll mode (DECSET 1007) is active. Defaults *on* (alacritty's
     /// default), so blank/initial screens set it true to match the emulator.
     pub alternate_scroll: bool,
+    /// The remote app is on the alternate screen (DECSET 1049 — vim, less,
+    /// htop…). Carried so the client can route the mouse wheel correctly: at the
+    /// shell prompt (primary screen) the wheel drives mosh scrollback, but on the
+    /// alternate screen it must reach the app (which owns its own scrolling).
+    /// Not a real-terminal mode — the client never replays it; it's a routing
+    /// hint, so it travels out-of-band in the diff header, not the escape stream.
+    pub alt_screen: bool,
     /// Latest OSC 52 clipboard contents set by the remote application
     /// (latest-wins; `None` until something sets it). Server→client.
     pub clipboard: Option<String>,
@@ -150,6 +157,7 @@ impl Screen {
             cursor_blink: false,
             focus_event: false,
             alternate_scroll: true,
+            alt_screen: false,
             clipboard: None,
             app_cursor_keys: false,
             bell_count: 0,
@@ -201,10 +209,15 @@ impl Screen {
 }
 
 /// Diff header (little-endian) preceding the mosh `new_frame` escape stream:
-/// `echo_ack: u64 | cols: u16 | rows: u16`. Dimensions tell the receiver whether
-/// the escape stream is an incremental frame (same dims) or a full repaint
-/// (resized), and echo_ack is the out-of-band prediction-validation counter.
-const DIFF_HEADER: usize = 12;
+/// `echo_ack: u64 | cols: u16 | rows: u16 | flags: u8`. Dimensions tell the
+/// receiver whether the escape stream is an incremental frame (same dims) or a
+/// full repaint (resized), echo_ack is the out-of-band prediction-validation
+/// counter, and `flags` carries state that isn't reproducible from the escape
+/// stream (bit 0: `alt_screen`).
+const DIFF_HEADER: usize = 13;
+
+/// `flags` bit: the remote app is on the alternate screen.
+const FLAG_ALT_SCREEN: u8 = 1 << 0;
 
 /// Upper bound on a synchronized screen's cell count, to reject malformed or
 /// hostile diffs that would allocate an absurd grid (a generous ~2000×2000).
@@ -229,6 +242,7 @@ impl SyncState for Screen {
             cursor_blink: false,
             focus_event: false,
             alternate_scroll: true,
+            alt_screen: false,
             clipboard: None,
             app_cursor_keys: false,
             bell_count: 0,
@@ -239,13 +253,15 @@ impl SyncState for Screen {
         // The diff is mosh's minimal escape stream transforming `prev` into
         // `self` (cursor moves, ECH/EL erases, SGR runs) — see `crate::display`.
         let ansi = crate::display::new_frame(prev, self, true);
-        if ansi.is_empty() && self.echo_ack == prev.echo_ack {
+        if ansi.is_empty() && self.echo_ack == prev.echo_ack && self.alt_screen == prev.alt_screen {
             return Vec::new();
         }
+        let flags = if self.alt_screen { FLAG_ALT_SCREEN } else { 0 };
         let mut out = Vec::with_capacity(DIFF_HEADER + ansi.len());
         out.extend_from_slice(&self.echo_ack.to_le_bytes());
         out.extend_from_slice(&self.cols.to_le_bytes());
         out.extend_from_slice(&self.rows.to_le_bytes());
+        out.push(flags);
         out.extend_from_slice(&ansi);
         out
     }
@@ -257,6 +273,7 @@ impl SyncState for Screen {
         let echo_ack = u64::from_le_bytes(diff[0..8].try_into().unwrap());
         let cols = u16::from_le_bytes([diff[8], diff[9]]);
         let rows = u16::from_le_bytes([diff[10], diff[11]]);
+        let flags = diff[12];
         let ansi = &diff[DIFF_HEADER..];
 
         // Reject degenerate or implausibly large geometries from a malformed/
@@ -281,6 +298,9 @@ impl SyncState for Screen {
         emu.feed(ansi);
         let mut next = emu.snapshot();
         next.echo_ack = echo_ack;
+        // `alt_screen` can't be reconstructed from the escape stream (the client
+        // never replays 1049), so restore it from the header flags.
+        next.alt_screen = flags & FLAG_ALT_SCREEN != 0;
         *self = next;
     }
 

@@ -92,6 +92,7 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
                 cursor_blink: false,
                 focus_event: false,
                 alternate_scroll: true,
+                alt_screen: false,
                 clipboard: None,
                 app_cursor_keys: false,
                 bell_count: 0,
@@ -136,6 +137,7 @@ fn scroll_up_is_minimal_and_correct() {
             cursor_blink: false,
             focus_event: false,
             alternate_scroll: true,
+            alt_screen: false,
             clipboard: None,
             app_cursor_keys: false,
             bell_count: 0,
@@ -287,6 +289,7 @@ fn lines_to_screen(cols: u16, labels: &[&str]) -> Screen {
         cursor_blink: false,
         focus_event: false,
         alternate_scroll: true,
+        alt_screen: false,
         clipboard: None,
         app_cursor_keys: false,
         bell_count: 0,
@@ -391,8 +394,8 @@ proptest! {
         let n = cols as usize * rows as usize;
         let mut a_cells = cells_a; a_cells.resize(n, Cell::default());
         let mut b_cells = cells_b; b_cells.resize(n, Cell::default());
-        let old = Screen { cols, rows, cells: a_cells, cursor_row: ca.min(rows-1), cursor_col: cb.min(cols-1), cursor_visible: true, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, clipboard: None, app_cursor_keys: false, bell_count: 0 };
-        let new = Screen { cols, rows, cells: b_cells, cursor_row: (rows-1).min(ca), cursor_col: (cols-1).min(cb), cursor_visible: false, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, clipboard: None, app_cursor_keys: false, bell_count: 0 };
+        let old = Screen { cols, rows, cells: a_cells, cursor_row: ca.min(rows-1), cursor_col: cb.min(cols-1), cursor_visible: true, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, alt_screen: false, clipboard: None, app_cursor_keys: false, bell_count: 0 };
+        let new = Screen { cols, rows, cells: b_cells, cursor_row: (rows-1).min(ca), cursor_col: (cols-1).min(cb), cursor_visible: false, title: String::new(), echo_ack: 0, bracketed_paste: false, mouse_mode: 0, cursor_shape: 0, cursor_blink: false, focus_event: false, alternate_scroll: true, alt_screen: false, clipboard: None, app_cursor_keys: false, bell_count: 0 };
         let got = apply(&old, &new);
         if !screen_eq(&got, &new) {
             let fd = (0..new.cells.len()).find(|&i| got.cells.get(i) != new.cells.get(i));

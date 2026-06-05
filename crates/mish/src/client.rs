@@ -16,15 +16,56 @@ use mish_ssp::transport::Transport;
 use mish_terminal::display::new_frame;
 use mish_terminal::history::HistoryResponse;
 use mish_terminal::predict::{PredictMode, PredictionEngine};
-use mish_terminal::screen::Screen;
+use mish_terminal::screen::{Screen, MOUSE_CLICK, MOUSE_SGR};
 use mish_terminal::user::UserStream;
 use tokio::sync::mpsc;
+
+/// Lines fed to an alt-screen pager per mouse-wheel notch (matches the usual
+/// terminal alternate-scroll step).
+const WHEEL_STEP_LINES: usize = 3;
+
+/// Decode an SGR mouse report (`ESC [ < Cb ; Cx ; Cy M`) as a vertical wheel
+/// event: `Some(true)` = wheel up, `Some(false)` = wheel down, `None` for any
+/// other mouse event. Wheel notches are press-only (`M`).
+fn sgr_wheel(seq: &[u8]) -> Option<bool> {
+    let body = seq.strip_prefix(b"\x1b[<")?;
+    let body = body.strip_suffix(b"M")?; // wheel is a press, never a release
+    let cb: u32 = std::str::from_utf8(body)
+        .ok()?
+        .split(';')
+        .next()?
+        .parse()
+        .ok()?;
+    // Wheel group: bit 6 set, bit 7 clear (modifier bits 2..5 are ignored).
+    // Vertical only (bit 1 clear): 64 = up, 65 = down.
+    if cb & 0xC0 == 0x40 && cb & 0b10 == 0 {
+        Some(cb & 1 == 0)
+    } else {
+        None
+    }
+}
+
+/// The arrow-key escape an app expects, in SS3 form when application-cursor-keys
+/// (DECCKM) is active — used to drive alt-screen pagers from the wheel.
+fn arrow_seq(up: bool, app_cursor: bool) -> &'static [u8] {
+    match (up, app_cursor) {
+        (true, false) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+        (true, true) => b"\x1bOA",
+        (false, true) => b"\x1bOB",
+    }
+}
 
 /// An input event from the user's terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientInput {
     /// Raw keystroke bytes to forward to the remote shell.
     Keys(Vec<u8>),
+    /// A complete SGR mouse report (`ESC [ < … M/m`) read from the local
+    /// terminal. `run_client` routes it: wheel notches drive scrollback at the
+    /// shell prompt, scroll an alt-screen pager, or — when the remote app reads
+    /// the mouse itself — are forwarded verbatim.
+    Mouse(Vec<u8>),
     /// The local terminal was resized.
     Resize { cols: u16, rows: u16 },
     /// Force a full repaint of the current screen (e.g. after resuming from
@@ -125,6 +166,17 @@ pub async fn run_client<T: Transport>(
                 mish_terminal::notification::stalled_overlay(&predicted, silent_secs)
                     .unwrap_or(predicted)
             };
+            // Mouse-wheel capture: when the remote app isn't reading the mouse,
+            // keep SGR button reporting on (and alternate-scroll off) on the
+            // real terminal so the wheel arrives as a report we can route to
+            // scrollback — instead of the terminal translating it into arrow
+            // keys (which the shell would read as command-history navigation).
+            // Apps that do read the mouse keep their exact modes, so their own
+            // event encoding round-trips untouched.
+            if shown.mouse_mode == 0 {
+                shown.mouse_mode = MOUSE_CLICK | MOUSE_SGR;
+                shown.alternate_scroll = false;
+            }
             // Prefix the window title so the user can tell they're in mosh (like
             // upstream's "[mosh] " prefix). Applied only to the painted frame, not
             // the synchronized state, so transparency comparisons are unaffected.
@@ -160,24 +212,10 @@ pub async fn run_client<T: Transport>(
                         }
                     }};
                 }
-                match inp {
-                    Some(ClientInput::Keys(b)) => {
-                        // Any keystroke returns to the live screen and is forwarded.
-                        exit_scroll!();
-                        stream.push_keystroke(b.clone());
-                        handle.set_local(stream.clone());
-                        // Speculatively echo the keystroke immediately.
-                        engine.new_user_bytes(&b, &server_screen, stream.total(), clock.now_ms());
-                        repaint!();
-                    }
-                    Some(ClientInput::Resize { cols, rows }) => {
-                        exit_scroll!();
-                        stream.push_resize(cols, rows);
-                        handle.set_local(stream.clone());
-                    }
-                    // Scroll one page up into server-held history. Fetched over the
-                    // reliable side-channel; clamped to the available history.
-                    Some(ClientInput::ScrollUp) => {
+                // Scroll one page up into server-held history (fetched over the
+                // reliable side-channel; clamped to the available history).
+                macro_rules! scroll_up {
+                    () => {{
                         if let Some(h) = &history {
                             let page = rows.max(1) as u32;
                             let target = scroll_offset.saturating_add(page);
@@ -198,10 +236,12 @@ pub async fn run_client<T: Transport>(
                                 }
                             }
                         }
-                    }
-                    // Scroll one page back toward the live screen; at the bottom,
-                    // leave scrollback entirely.
-                    Some(ClientInput::ScrollDown) => {
+                    }};
+                }
+                // Scroll one page back toward the live screen; at the bottom,
+                // leave scrollback entirely.
+                macro_rules! scroll_down {
+                    () => {{
                         if scroll_offset > 0 {
                             let page = rows.max(1) as u32;
                             let target = scroll_offset.saturating_sub(page);
@@ -217,6 +257,62 @@ pub async fn run_client<T: Transport>(
                                 }
                             }
                         }
+                    }};
+                }
+                match inp {
+                    Some(ClientInput::Keys(b)) => {
+                        // Any keystroke returns to the live screen and is forwarded.
+                        exit_scroll!();
+                        stream.push_keystroke(b.clone());
+                        handle.set_local(stream.clone());
+                        // Speculatively echo the keystroke immediately.
+                        engine.new_user_bytes(&b, &server_screen, stream.total(), clock.now_ms());
+                        repaint!();
+                    }
+                    Some(ClientInput::Resize { cols, rows }) => {
+                        exit_scroll!();
+                        stream.push_resize(cols, rows);
+                        handle.set_local(stream.clone());
+                    }
+                    // Keyboard scroll (Shift-PageUp/Down): one page up/down.
+                    Some(ClientInput::ScrollUp) => scroll_up!(),
+                    Some(ClientInput::ScrollDown) => scroll_down!(),
+                    // A mouse report from the local terminal. Route by what the
+                    // remote app wants and where it is:
+                    Some(ClientInput::Mouse(seq)) => {
+                        if server_screen.mouse_mode != 0 {
+                            // The app reads the mouse itself (vim, tmux, …):
+                            // forward the report verbatim. Not a keystroke, so
+                            // don't predict-echo it.
+                            exit_scroll!();
+                            stream.push_keystroke(seq);
+                            handle.set_local(stream.clone());
+                            repaint!();
+                        } else if let Some(up) = sgr_wheel(&seq) {
+                            if server_screen.alt_screen {
+                                // Alt-screen pager (less, man…) with no mouse
+                                // mode: replicate alternate-scroll by feeding it
+                                // arrow keys, so it scrolls its own content
+                                // rather than us hijacking the wheel.
+                                let mut keys = Vec::new();
+                                for _ in 0..WHEEL_STEP_LINES {
+                                    keys.extend_from_slice(arrow_seq(
+                                        up,
+                                        server_screen.app_cursor_keys,
+                                    ));
+                                }
+                                exit_scroll!();
+                                stream.push_keystroke(keys);
+                                handle.set_local(stream.clone());
+                                repaint!();
+                            } else if up {
+                                scroll_up!();
+                            } else {
+                                scroll_down!();
+                            }
+                        }
+                        // Non-wheel mouse events (clicks/drags) at the prompt
+                        // mean nothing to the shell — swallow them.
                     }
                     // Force a full repaint from scratch (resume-from-suspend): the
                     // real terminal lost our painted state, so re-emit the whole
@@ -253,4 +349,36 @@ pub async fn run_client<T: Transport>(
     handle.shutdown();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), driver_task).await;
     tracing::info!(target: "mish::client", "client: shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{arrow_seq, sgr_wheel};
+
+    #[test]
+    fn sgr_wheel_decodes_vertical_notches() {
+        assert_eq!(sgr_wheel(b"\x1b[<64;5;5M"), Some(true)); // wheel up
+        assert_eq!(sgr_wheel(b"\x1b[<65;5;5M"), Some(false)); // wheel down
+        // Modifier bits (here ctrl = +16) don't change the direction.
+        assert_eq!(sgr_wheel(b"\x1b[<80;5;5M"), Some(true));
+        assert_eq!(sgr_wheel(b"\x1b[<81;5;5M"), Some(false));
+    }
+
+    #[test]
+    fn sgr_wheel_rejects_non_wheel_events() {
+        assert_eq!(sgr_wheel(b"\x1b[<0;5;5M"), None); // left button press
+        assert_eq!(sgr_wheel(b"\x1b[<0;5;5m"), None); // release
+        assert_eq!(sgr_wheel(b"\x1b[<66;5;5M"), None); // horizontal wheel left
+        assert_eq!(sgr_wheel(b"\x1b[<64;5;5m"), None); // a wheel "release" isn't a notch
+        assert_eq!(sgr_wheel(b"\x1b[A"), None); // not a mouse report at all
+        assert_eq!(sgr_wheel(b"\x1b[<garbage M"), None);
+    }
+
+    #[test]
+    fn arrow_seq_respects_app_cursor_keys() {
+        assert_eq!(arrow_seq(true, false), b"\x1b[A");
+        assert_eq!(arrow_seq(false, false), b"\x1b[B");
+        assert_eq!(arrow_seq(true, true), b"\x1bOA");
+        assert_eq!(arrow_seq(false, true), b"\x1bOB");
+    }
 }

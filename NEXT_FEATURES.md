@@ -57,14 +57,27 @@ split transport.
 
 **Design.** Keep the live screen exactly as today on datagrams. The server's
 emulator already owns history (alacritty's grid has a scrollback region). On the
-client, entering "scroll mode" (e.g. Shift-PageUp, or the synced
-alternate-scroll/mouse wheel) sends a **history request** over the reliable
-control stream: "give me rows `[top-N, top)` as of grid epoch E". The server
-serializes those rows (the same `Screen`/cell encoding, optionally
-deflate-compressed like instructions) and streams them back reliably. The client
-renders a **history overlay** above the live screen — analogous to the prediction
-overlay in `predict.rs`: a viewport into server-held history that the live screen
-scrolls back into, dismissed on any keystroke.
+client, entering "scroll mode" (Shift-PageUp, or — now implemented — the
+**mouse wheel**) sends a **history request** over the reliable control stream:
+"give me rows `[top-N, top)` as of grid epoch E". The server serializes those
+rows (the same `Screen`/cell encoding, optionally deflate-compressed like
+instructions) and streams them back reliably. The client renders a **history
+overlay** above the live screen — analogous to the prediction overlay in
+`predict.rs`: a viewport into server-held history that the live screen scrolls
+back into, dismissed on any keystroke.
+
+**Wheel routing (implemented).** The wheel is only mosh's at the shell prompt.
+The client keeps SGR button reporting on (and alternate-scroll off) on the real
+terminal *while the remote app isn't reading the mouse*, so the wheel arrives as
+a report it can route instead of the terminal turning it into arrow keys (which
+the shell would read as command-history navigation — the original "scrollback
+doesn't work" bug). Routing, by the synced remote state: app reads the mouse
+(`mouse_mode != 0`) → forward the report verbatim; else on the **alternate
+screen** (`alt_screen`, carried in a new diff-header flag byte) → synthesize
+arrow keys so a plain pager like `less` scrolls itself; else (primary screen) →
+mosh scrollback. Cost, as with tmux: native click-drag selection at the prompt
+needs the terminal's bypass modifier (Shift, or ⌥ on macOS). See
+`mosh/tests/mouse_routing.rs` + `client::tests`.
 
 **Reuse.** `Screen`/cell codec, the deflate path, the overlay-compositing idea
 from `predict.rs`/`notification.rs`, alacritty's existing scrollback buffer.

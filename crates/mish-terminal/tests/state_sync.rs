@@ -65,30 +65,34 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
             any::<u64>(),
             any::<bool>(), // focus_event
             any::<bool>(), // alternate_scroll
+            any::<bool>(), // alt_screen
         )
             .prop_map(
-                |(cols, rows, cells, cr, cc, cv, title, echo_ack, focus, alt_scroll)| Screen {
-                    cols,
-                    rows,
-                    cells,
-                    cursor_row: cr,
-                    cursor_col: cc,
-                    cursor_visible: cv,
-                    title,
-                    echo_ack,
-                    bracketed_paste: false,
-                    mouse_mode: 0,
-                    cursor_shape: 0,
-                    cursor_blink: false,
-                    focus_event: focus,
-                    alternate_scroll: alt_scroll,
-                    // Clipboard is monotonic (the emulator never reverts it to
-                    // None), so an arbitrary Some→None pair would be an
-                    // unreachable transition; covered by dedicated directional
-                    // tests in display_roundtrip.rs instead.
-                    clipboard: None,
-                    app_cursor_keys: false,
-                    bell_count: 0,
+                |(cols, rows, cells, cr, cc, cv, title, echo_ack, focus, alt_scroll, alt_screen)| {
+                    Screen {
+                        cols,
+                        rows,
+                        cells,
+                        cursor_row: cr,
+                        cursor_col: cc,
+                        cursor_visible: cv,
+                        title,
+                        echo_ack,
+                        bracketed_paste: false,
+                        mouse_mode: 0,
+                        cursor_shape: 0,
+                        cursor_blink: false,
+                        focus_event: focus,
+                        alternate_scroll: alt_scroll,
+                        alt_screen,
+                        // Clipboard is monotonic (the emulator never reverts it
+                        // to None), so an arbitrary Some→None pair would be an
+                        // unreachable transition; covered by dedicated
+                        // directional tests in display_roundtrip.rs instead.
+                        clipboard: None,
+                        app_cursor_keys: false,
+                        bell_count: 0,
+                    }
                 },
             )
     })
@@ -185,6 +189,27 @@ fn userstream_subtract_preserves_logical_content() {
     let mut x = prev.clone();
     x.apply_diff(&diff);
     assert_eq!(x.total(), 5);
+}
+
+// Regression (found by the `userstream_decode` fuzzer): a hostile diff whose
+// `start` index is near u64::MAX must not overflow the per-event index. Before
+// the `saturating_add` fix this panicked with "attempt to add with overflow" in
+// the apply loop. Guarded as a seed under fuzz/regressions/userstream_decode/.
+#[test]
+fn userstream_apply_hostile_start_does_not_overflow() {
+    // bincode of StreamDiff { start: u64::MAX, suffix: [<2 events>] }.
+    let hostile: &[u8] = &[
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    // Against a fresh stream and a non-empty one (the fuzz harness's two cases).
+    let mut s = UserStream::new();
+    s.apply_diff(hostile); // must not panic
+    let mut s2 = UserStream::new();
+    s2.push_keystroke(b"hello".to_vec());
+    s2.push_resize(80, 24);
+    s2.apply_diff(hostile); // must not panic
 }
 
 // ---------- End-to-end client/server convergence over the simulator ----------

@@ -10,6 +10,16 @@ goal is far fewer lines than upstream mosh (~20k C++ + hand-rolled OCB crypto)
 while matching its key property: **a roaming, low-latency shell that survives
 packet loss, IP changes, and suspend/resume.**
 
+**Status: working end-to-end and at mosh feature parity.** All seven milestones
+(M1–M7) are done: the sans-IO SSP core, fragmentation + RTT estimation, the
+mutually-authenticated QUIC transport, the `alacritty-terminal` layer with
+mosh's minimal-diff, the `mish-client` / `mish-server` binaries, predictive
+echo, and the deterministic network simulators. Several features now go *beyond*
+upstream mosh — server-side **scrollback**, **persistent sessions + reattach**,
+and a reliable QUIC **side-channel** (see [`NEXT_FEATURES.md`](NEXT_FEATURES.md)).
+What's left (tracked in [`FUTURE_WORK.md`](FUTURE_WORK.md)) is small polish, not
+core functionality.
+
 ## Why this can be small
 
 Mosh's genius is the **State Synchronization Protocol (SSP)**: instead of a
@@ -23,12 +33,13 @@ crypto, congestion control, and connection migration mosh had to build by hand.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ mish-client / mish-server  (binaries — TODO)                 │
+│ mish-client / mish-server  (mish crate — done)           │
 ├─────────────────────────────────────────────────────────────┤
-│ mish-terminal  (alacritty-terminal-backed SyncStates — TODO) │
+│ mish-terminal  (alacritty-terminal-backed SyncStates)        │
 │    Complete (screen)   ·   UserStream (keystrokes)           │
+│    + predictive echo overlay (mosh's terminaloverlay)        │
 ├─────────────────────────────────────────────────────────────┤
-│ mish-ssp  (this crate)                                       │
+│ mish-ssp  (sans-IO protocol core)                            │
 │   ┌──────────────┐   ┌─────────────────┐  ┌───────────────┐  │
 │   │ SyncState    │   │ SspCore         │  │ Session/Driver│  │
 │   │ trait        │──▶│ (sans-IO state  │◀─│ (async event  │  │
@@ -38,8 +49,12 @@ crypto, congestion control, and connection migration mosh had to build by hand.
 │                  sim::NetworkSim   │       Transport trait   │
 │                  (virtual-time     │      ┌───────┴───────┐  │
 │                   simulator)       │      │ memory  │ quic │  │
-│                                    │      │ (now)   │(TODO)│  │
+│                                    │      │ (test)  │(done)│  │
 └────────────────────────────────────┴──────┴───────┴──────┴──┘
+
+Crates: mish-ssp (core) · mish-terminal (emulator + diff + predict) ·
+mish-quic (Quinn transport) · mish (binaries) · mish-sim (turmoil) ·
+mish-madsim (madsim). Both sim engines run the real session in virtual time.
 ```
 
 ### Design principle: sans-IO core
@@ -81,26 +96,33 @@ mish-client --local -- /bin/bash
 # Options: --ssh <cmd>  --server <cmd>  --predict <mode>  --no-init
 # Keys: Ctrl-] quick-detach; escape prefix Ctrl-^ (MOSH_ESCAPE_KEY) then
 #       `.` quit / Ctrl-Z suspend (resumes cleanly on `fg`).
-#       Shift-PageUp / Shift-PageDown scroll into server-held scrollback.
+#       Mouse wheel (or Shift-PageUp/PageDown) scrolls into server-held scrollback.
 ```
 
 **Scrollback (better than mosh).** Unlike upstream mosh — which has no
 scrollback and tells you to run tmux — `mish-client` can scroll into the
-server's terminal history with **Shift-PageUp / Shift-PageDown**. The live screen
-keeps riding loss-tolerant datagrams; history is fetched on demand over a
-**reliable QUIC side-channel** and shown as a paused viewport (any keystroke
-returns to live). See [`NEXT_FEATURES.md`](NEXT_FEATURES.md).
+server's terminal history with the **mouse wheel** (or **Shift-PageUp /
+Shift-PageDown**). The live screen keeps riding loss-tolerant datagrams; history
+is fetched on demand over a **reliable QUIC side-channel** and shown as a paused
+viewport (any keystroke returns to live). See [`NEXT_FEATURES.md`](NEXT_FEATURES.md).
+
+At the shell prompt the wheel scrolls *mosh's* scrollback; inside a full-screen
+app (vim, less, htop…) it reaches the app as usual, so those keep their own
+scrolling. To make this work the client turns on mouse reporting at the prompt,
+which — as with tmux — means native click-drag text selection there now needs
+the terminal's bypass modifier held (**Shift** on most terminals, **⌥/Option**
+on macOS Terminal & iTerm2).
 
 **Persistent sessions / reattach (also better than mosh).** With `--session
 NAME`, the server keeps the shell + terminal state alive across disconnects, and
-re-running `mish host --session NAME` **reattaches** to it (tmux/abduco-style)
+re-running `mish-client host --session NAME` **reattaches** to it (tmux/abduco-style)
 — combined with QUIC roaming, that's the full "never lose your shell" story.
 Opt-in; the default is a fresh session each time. (Reattach reuses the session's
 credentials via a `0600` user-only registry file — see
 [`SECURITY.md`](SECURITY.md).)
 
 ```sh
-mish host --session work      # start (or reattach to) a persistent session "work"
+mish-client host --session work   # start (or reattach to) a persistent session "work"
 ```
 
 A blue status banner ("mish: Last contact N seconds ago…") appears when the link
@@ -194,6 +216,11 @@ differences from upstream mosh.
 
 ## Roadmap
 
+All seven milestones below are **complete** — this is the build history, kept for
+context. Forward work (features that go beyond mosh) lives in
+[`NEXT_FEATURES.md`](NEXT_FEATURES.md); remaining polish in
+[`FUTURE_WORK.md`](FUTURE_WORK.md).
+
 - [x] **M1 — SSP core + transport/session traits.** Sans-IO `SspCore`,
       `SyncState`/`Transport`/`Session` traits, in-memory transport, virtual-time
       simulator, PBT + sim + async integration tests. *(done)*
@@ -280,8 +307,21 @@ Builds on stable Rust (pinned in `rust-toolchain.toml`). CI
 ```sh
 cargo test                                   # everything (stable)
 RUSTFLAGS="--cfg madsim" cargo test -p mish-madsim   # deterministic madsim sim
-cargo +nightly fuzz run screen_apply         # cargo-fuzz target (needs cargo-fuzz)
+cargo +nightly fuzz run screen_apply         # one cargo-fuzz target (needs cargo-fuzz)
 cargo +nightly miri test -p mish-ssp --lib   # UB/aliasing check on the sans-IO core
+```
+
+There are six coverage-guided libFuzzer targets (`instruction_decode`,
+`screen_apply`, `diff_roundtrip`, `frag_reassemble`, `userstream_decode`,
+`differential_emulator`). CI smoke-runs each for 40 s as a regression gate; for a
+real campaign, **[`scripts/fuzz-overnight.sh`](scripts/fuzz-overnight.sh)** runs
+all of them at once in libFuzzer fork mode, saturating every core and surviving
+crashes (each saved, fuzzing continues), with a per-target time budget:
+
+```sh
+./scripts/fuzz-overnight.sh                  # all targets, ~8h each, all cores
+DURATION=3600 ./scripts/fuzz-overnight.sh    # shorter run (1h)
+./scripts/fuzz-overnight.sh diff_roundtrip   # a single target
 ```
 
 ## License
