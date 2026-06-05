@@ -278,6 +278,7 @@ name = "mish-terminal"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "base64",
  "bincode",
  "mish-ssp",
  "serde",

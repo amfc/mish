@@ -10,9 +10,10 @@
 //!
 //! Faithfulness is verified by *round-trip*: feeding `new_frame(old, new)` to an
 //! emulator showing `old` reproduces `new` exactly (see the property tests and
-//! [`crate::screen`]'s `apply_diff`). We deliberately omit a few mosh
-//! micro-optimizations (vertical-scroll detection, hyperlinks, mouse/paste
-//! modes) — they affect byte count, not correctness.
+//! [`crate::screen`]'s `apply_diff`). Bandwidth optimizations — vertical-scroll
+//! detection (whole-screen and DECSTBM sub-regions, both directions), minimal
+//! SGR deltas, ECH/EL blank runs — are all guarded by that round-trip identity:
+//! a wrong optimization would change the reconstructed screen and fail the tests.
 
 use crate::screen::{
     Cell, Color, Hyperlink, Screen, F_BOLD, F_DIM, F_HIDDEN, F_INVERSE, F_ITALIC, F_STRIKEOUT,
@@ -268,26 +269,25 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
         frame.push("\x1b[?25l");
     }
 
-    // Vertical-scroll detection: if `new` is `old` shifted up by k rows, emit a
-    // scroll (cheap: a few line feeds at the bottom) and redraw only the exposed
-    // rows, instead of repainting every shifted row.
+    // Vertical-scroll detection: if `new` is `old` with a (sub-)region scrolled
+    // up or down, emit a cheap scroll (a few line feeds / reverse-indexes, with a
+    // scroll region for sub-regions) and redraw only the exposed rows, instead of
+    // repainting every shifted row. The synthesized `baseline` models exactly
+    // what the emitted escapes do to the screen, so the put_row pass below
+    // redraws only the genuine remainder — and the round-trip stays exact.
     let mut baseline_owned: Option<Screen> = None;
     if initialized {
-        if let Some(k) = detect_scroll_up(old, new) {
-            // A line feed fills the newly-exposed line with the *current* pen's
-            // background (BCE). Reset to the default pen first so exposed rows
-            // match the default-blank `scroll_up` baseline (put_row then redraws
-            // any genuinely non-default exposed content).
+        if let Some(op) = detect_scroll(old, new) {
+            // Scrolls fill newly-exposed lines with the *current* pen's background
+            // (BCE). Reset to the default pen first so exposed rows match the
+            // default-blank scrolled baseline.
             frame.update_rendition(
                 Color::Named(NAMED_FOREGROUND),
                 Color::Named(NAMED_BACKGROUND),
                 0,
             );
-            frame.append_move(new.rows as i32 - 1, 0);
-            frame.push_n(k as usize, b'\n'); // LF at the bottom scrolls up
-            frame.cursor_x = 0;
-            frame.cursor_y = new.rows as i32 - 1;
-            baseline_owned = Some(scroll_up(old, k));
+            emit_scroll(&mut frame, new.rows, op);
+            baseline_owned = Some(apply_scroll(old, op));
         }
     }
     let baseline = baseline_owned.as_ref().unwrap_or(old);
@@ -478,47 +478,150 @@ fn row_eq(old: &Screen, new: &Screen, y: u16) -> bool {
     })
 }
 
-/// If `new` equals `old` scrolled up by `k` rows (1..rows) — i.e. the top
-/// `rows-k` rows of `new` match the bottom `rows-k` rows of `old` — return the
-/// smallest such `k`. Returns `None` if the cells are identical or no scroll
-/// relationship holds.
-fn detect_scroll_up(old: &Screen, new: &Screen) -> Option<u16> {
+/// A detected vertical scroll: a row range `[top, bottom]` (inclusive) shifted by
+/// `k` rows, up or down. A whole-screen scroll is `top == 0 && bottom == rows-1`
+/// and is emitted without a scroll region (plain LF/RI); a sub-region uses
+/// DECSTBM. The exposed `k` rows become blank in the baseline and are redrawn.
+#[derive(Clone, Copy, Debug)]
+struct Scroll {
+    top: u16,
+    bottom: u16,
+    k: u16,
+    down: bool,
+}
+
+/// Detect whether `new` is `old` with one contiguous region scrolled up or down.
+/// Returns the smallest-`k` scroll found, preferring up over down. `None` if the
+/// screens are identical, differently sized, or not related by a single scroll.
+fn detect_scroll(old: &Screen, new: &Screen) -> Option<Scroll> {
     if old.cols != new.cols || old.rows != new.rows || old.rows < 2 {
         return None;
     }
     if old.cells == new.cells {
-        return None; // identical — nothing to scroll
+        return None;
     }
     let rows = new.rows;
     let w = new.cols as usize;
-    for k in 1..rows {
-        let shifted_matches = (0..rows - k).all(|i| {
-            let oi = (i + k) as usize * w;
-            let ni = i as usize * w;
-            old.cells[oi..oi + w] == new.cells[ni..ni + w]
-        });
-        if shifted_matches {
-            return Some(k);
+    let row_eq = |a: u16, b: u16| {
+        let ai = a as usize * w;
+        let bi = b as usize * w;
+        old.cells[ai..ai + w] == new.cells[bi..bi + w]
+    };
+
+    // The band of rows that actually differ. Rows outside it are unchanged
+    // between old and new, so a scroll confined to [top, bottom] explains the
+    // whole frame.
+    let mut top = None;
+    let mut bottom = 0u16;
+    for y in 0..rows {
+        let yi = y as usize * w;
+        if old.cells[yi..yi + w] != new.cells[yi..yi + w] {
+            top.get_or_insert(y);
+            bottom = y;
+        }
+    }
+    let top = top?;
+    if bottom <= top {
+        return None; // a single changed row can't be a scroll
+    }
+    let region_h = bottom - top + 1;
+
+    // Scroll up by k within [top, bottom]: new[top+i] == old[top+i+k].
+    for k in 1..region_h {
+        if (0..region_h - k).all(|i| row_eq(top + i + k, top + i)) {
+            return Some(Scroll {
+                top,
+                bottom,
+                k,
+                down: false,
+            });
+        }
+    }
+    // Scroll down by k within [top, bottom]: new[top+k+i] == old[top+i].
+    for k in 1..region_h {
+        if (0..region_h - k).all(|i| row_eq(top + i, top + k + i)) {
+            return Some(Scroll {
+                top,
+                bottom,
+                k,
+                down: true,
+            });
         }
     }
     None
 }
 
-/// `old` with its rows shifted up by `k`; the bottom `k` rows become blank.
-/// Only the cells matter (used as the put_row baseline after a scroll).
-fn scroll_up(old: &Screen, k: u16) -> Screen {
+/// Emit the escape sequence that performs `op`, leaving `frame`'s tracked cursor
+/// consistent with where the real cursor ends up.
+fn emit_scroll(frame: &mut FrameState, rows: u16, op: Scroll) {
+    let whole = op.top == 0 && op.bottom == rows - 1;
+    if whole && !op.down {
+        // Whole screen up: LFs at the bottom row scroll the screen up.
+        frame.append_move(rows as i32 - 1, 0);
+        frame.push_n(op.k as usize, b'\n');
+        frame.cursor_x = 0;
+        frame.cursor_y = rows as i32 - 1;
+        return;
+    }
+    if whole && op.down {
+        // Whole screen down: reverse-indexes at the top row scroll the screen down.
+        frame.append_move(0, 0);
+        for _ in 0..op.k {
+            frame.push("\x1bM"); // RI
+        }
+        frame.cursor_x = 0;
+        frame.cursor_y = 0;
+        return;
+    }
+    // Sub-region: set the scroll region (DECSTBM), scroll at the appropriate
+    // margin, then reset the region. DECSTBM and its reset both home the cursor,
+    // so mark our tracked position unknown to force an explicit move next.
+    frame.push(&format!("\x1b[{};{}r", op.top + 1, op.bottom + 1));
+    if op.down {
+        frame.push(&format!("\x1b[{};1H", op.top + 1));
+        for _ in 0..op.k {
+            frame.push("\x1bM"); // RI at the top margin scrolls the region down
+        }
+    } else {
+        frame.push(&format!("\x1b[{};1H", op.bottom + 1));
+        frame.push_n(op.k as usize, b'\n'); // LF at the bottom margin scrolls up
+    }
+    frame.push("\x1b[r"); // reset scroll region to the full screen
+    frame.cursor_x = -1;
+    frame.cursor_y = -1;
+}
+
+/// `old` with `op` applied: rows in `[top, bottom]` shifted by `k`, the exposed
+/// `k` rows blanked. Rows outside the region are untouched. Models exactly what
+/// [`emit_scroll`]'s escapes do to the screen, so it's the correct put_row baseline.
+fn apply_scroll(old: &Screen, op: Scroll) -> Screen {
     let mut s = old.clone();
-    let rows = old.rows;
     let w = old.cols as usize;
-    for i in 0..rows {
-        let di = i as usize * w;
-        let src = i + k;
-        if src < rows {
-            let si = src as usize * w;
-            s.cells[di..di + w].clone_from_slice(&old.cells[si..si + w]);
+    let blank_row = |s: &mut Screen, row: u16| {
+        let di = row as usize * w;
+        for c in &mut s.cells[di..di + w] {
+            *c = Cell::default();
+        }
+    };
+    let copy_row = |s: &mut Screen, dst: u16, src: u16| {
+        let di = dst as usize * w;
+        let si = src as usize * w;
+        s.cells[di..di + w].clone_from_slice(&old.cells[si..si + w]);
+    };
+    for i in op.top..=op.bottom {
+        if op.down {
+            // Row i takes old row i-k (within the region); top k rows exposed.
+            if i >= op.top + op.k {
+                copy_row(&mut s, i, i - op.k);
+            } else {
+                blank_row(&mut s, i);
+            }
         } else {
-            for c in &mut s.cells[di..di + w] {
-                *c = Cell::default();
+            // Row i takes old row i+k (within the region); bottom k rows exposed.
+            if i + op.k <= op.bottom {
+                copy_row(&mut s, i, i + op.k);
+            } else {
+                blank_row(&mut s, i);
             }
         }
     }

@@ -219,6 +219,110 @@ fn clipboard_osc52_roundtrips() {
     );
 }
 
+/// Build a screen from one label per row (padded with blanks).
+fn lines_to_screen(cols: u16, labels: &[&str]) -> Screen {
+    let mut cells = Vec::new();
+    for l in labels {
+        let mut row: Vec<Cell> = l
+            .chars()
+            .map(|c| Cell {
+                c,
+                ..Cell::default()
+            })
+            .collect();
+        row.resize(cols as usize, Cell::default());
+        cells.extend(row);
+    }
+    Screen {
+        cols,
+        rows: labels.len() as u16,
+        cells,
+        cursor_row: 0,
+        cursor_col: 0,
+        cursor_visible: true,
+        title: String::new(),
+        echo_ack: 0,
+        bracketed_paste: false,
+        mouse_mode: 0,
+        cursor_shape: 0,
+        cursor_blink: false,
+        focus_event: false,
+        alternate_scroll: true,
+        clipboard: None,
+    }
+}
+
+/// Whole-screen downward scroll: emitted via reverse-index (RI), smaller than a
+/// full repaint, and round-trips exactly.
+#[test]
+fn scroll_down_whole_screen() {
+    let cols = 16u16;
+    let old = lines_to_screen(cols, &["r0", "r1", "r2", "r3", "r4", "r5"]);
+    // Scrolled down by 2: old rows 0..4 move to the bottom; two new top rows.
+    let new = lines_to_screen(cols, &["t0", "t1", "r0", "r1", "r2", "r3"]);
+    let diff = new_frame(&old, &new, true);
+    let full = new_frame(&Screen::blank(cols, 6), &new, false);
+    assert!(
+        diff.windows(2).any(|w| w == b"\x1bM"),
+        "downward scroll should emit reverse-index (RI)"
+    );
+    assert!(
+        diff.len() < full.len(),
+        "scroll diff smaller than full repaint"
+    );
+    assert!(
+        screen_eq(&apply(&old, &new), &new),
+        "down-scroll round-trips"
+    );
+}
+
+/// Scroll region with a fixed bottom status line: rows [0,4] scroll up while the
+/// last row stays. Emitted with DECSTBM and round-trips.
+#[test]
+fn scroll_region_bottom_status_fixed() {
+    let cols = 20u16;
+    let old = lines_to_screen(cols, &["a0", "a1", "a2", "a3", "a4", "STATUS"]);
+    // Region [0,4] scrolled up by 1; row 5 (STATUS) unchanged.
+    let new = lines_to_screen(cols, &["a1", "a2", "a3", "a4", "NEW", "STATUS"]);
+    let diff = new_frame(&old, &new, true);
+    let full = new_frame(&Screen::blank(cols, 6), &new, false);
+    // DECSTBM set region "ESC[1;5r".
+    assert!(
+        diff.windows(6).any(|w| w == b"\x1b[1;5r"),
+        "region scroll should set DECSTBM"
+    );
+    assert!(
+        diff.len() < full.len(),
+        "region scroll smaller than full repaint"
+    );
+    assert!(
+        screen_eq(&apply(&old, &new), &new),
+        "region up-scroll round-trips"
+    );
+}
+
+/// Scroll region scrolling *down* with a fixed header and footer.
+#[test]
+fn scroll_region_down_with_fixed_header_footer() {
+    let cols = 20u16;
+    let old = lines_to_screen(cols, &["HDR", "b1", "b2", "b3", "b4", "FTR"]);
+    // Region [1,4] scrolled down by 1; rows 0 and 5 unchanged.
+    let new = lines_to_screen(cols, &["HDR", "NEW", "b1", "b2", "b3", "FTR"]);
+    let diff = new_frame(&old, &new, true);
+    assert!(
+        diff.windows(6).any(|w| w == b"\x1b[2;5r"),
+        "region [1,4] scroll should set DECSTBM ESC[2;5r"
+    );
+    assert!(
+        diff.windows(2).any(|w| w == b"\x1bM"),
+        "downward region scroll uses RI"
+    );
+    assert!(
+        screen_eq(&apply(&old, &new), &new),
+        "region down-scroll round-trips"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 

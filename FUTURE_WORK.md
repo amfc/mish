@@ -43,9 +43,12 @@ trigger. Tested in `predict.rs` (`confidence_enables_adaptive_below_srtt_trigger
 
 ## Misc
 
-- **Diff: full mosh scroll-region optimization** — we detect whole-screen
-  scroll-up; mosh also handles scroll *regions* (DECSTBM) and downward scroll.
-  Minor bandwidth, not correctness.
+- **Diff: scroll-region optimization** — *done.* `display::detect_scroll` now
+  recognizes whole-screen scrolls (LF/RI) and DECSTBM sub-regions in both
+  directions; the synthesized baseline models the emitted escapes exactly, so the
+  round-trip stays exact. Tested in `display_roundtrip.rs` (whole-screen down,
+  bottom-fixed region up, header/footer-fixed region down) and stressed by the
+  diff fuzzers.
 - **`CSI 1 J` (erase-above) divergence from vt100** — *small, inherited.* The
   differential emulator test (`tests/differential_emulator.rs`) found that our
   alacritty backend, on `CSI 1 J` with the cursor on row 1, leaves row 0 intact,
