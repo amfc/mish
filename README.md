@@ -241,6 +241,14 @@ mish equivalents.
       targets run under ASan in CI); builds on **stable** Rust with a **GitHub
       Actions CI** (fmt/clippy/test + madsim + Miri + coverage + fuzz). *(done)*
 
+### Beyond parity
+
+With mosh parity reached, the forward roadmap — features that make mish
+*better than* mosh by exploiting QUIC's reliable streams and crypto/resumption
+(server-side **scrollback**, **session persistence + reattach**, **multi-client
+attach**, large-payload **clipboard**, **congestion-aware pacing**, and **port
+forwarding**) — is laid out in **[`NEXT_FEATURES.md`](NEXT_FEATURES.md)**.
+
 ## Toolchain, fuzzing & CI
 
 Builds on stable Rust (pinned in `rust-toolchain.toml`). CI
