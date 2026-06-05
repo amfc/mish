@@ -333,12 +333,19 @@ async fn run_terminal(t: transport::QuicTransport) {
     writer.abort();
 }
 
-/// Restores cooked mode and leaves the alternate screen on drop.
+/// Restores cooked mode and the main screen on drop, and resets the input modes
+/// a remote program may have left enabled so the local terminal isn't wedged
+/// (mouse reporting, bracketed paste, reverse video) after the session ends.
 struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
-        print!("\x1b[?1049l\x1b[?25h");
+        // Disable mouse modes, bracketed paste, screen-reverse; show cursor;
+        // leave the alternate screen.
+        print!(
+            "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
+             \x1b[?2004l\x1b[?5l\x1b[?25h\x1b[?1049l"
+        );
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }

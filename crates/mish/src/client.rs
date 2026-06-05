@@ -76,8 +76,14 @@ pub async fn run_client<T: Transport>(
             engine.set_srtt(handle.srtt_ms());
             let predicted = engine.predicted_screen(&server_screen);
             let silent_secs = clock.now_ms().saturating_sub(handle.last_recv_ms()) / 1000;
-            let shown = mish_terminal::notification::stalled_overlay(&predicted, silent_secs)
+            let mut shown = mish_terminal::notification::stalled_overlay(&predicted, silent_secs)
                 .unwrap_or(predicted);
+            // Prefix the window title so the user can tell they're in mosh (like
+            // upstream's "[mosh] " prefix). Applied only to the painted frame, not
+            // the synchronized state, so transparency comparisons are unaffected.
+            if !shown.title.starts_with("[mish] ") {
+                shown.title = format!("[mish] {}", shown.title);
+            }
             let frame = new_frame(&painted, &shown, painted_once);
             painted = shown;
             painted_once = true;
