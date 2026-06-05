@@ -121,14 +121,18 @@ async fn shell_exit_disconnects_client() {
         .await
         .unwrap();
 
-    // The client session loop must end on its own, promptly, with no detach.
-    tokio::time::timeout(Duration::from_secs(15), client)
+    // The client session loop must end on its own, *promptly* (not just
+    // eventually): a tight bound, well under the 5s shutdown grace deadline, so a
+    // regression to the slow grace-fallback path fails here instead of passing a
+    // lenient liveness timeout. The disconnect is a sub-RTT handshake on
+    // localhost; 3s is generous headroom for a loaded machine.
+    tokio::time::timeout(Duration::from_secs(3), client)
         .await
-        .expect("client should disconnect after the remote shell exits")
+        .expect("client should disconnect promptly after the remote shell exits")
         .expect("client task joined");
-    tokio::time::timeout(Duration::from_secs(15), server)
+    tokio::time::timeout(Duration::from_secs(3), server)
         .await
-        .expect("server should exit after the shell exits")
+        .expect("server should exit promptly after the shell exits")
         .expect("server task joined");
 
     drop(cin_tx);

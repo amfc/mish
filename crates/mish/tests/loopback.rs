@@ -313,14 +313,16 @@ async fn child_exit_shuts_down_client() {
     // pty_output stream.
     drop(pty_out_tx);
 
-    // Both halves should finish promptly, with no further input from the user.
-    tokio::time::timeout(Duration::from_secs(5), client)
+    // Both halves should finish *promptly* — a tight bound, well under the 5s
+    // shutdown grace deadline, so a regression to the slow grace-fallback path
+    // fails here rather than passing a lenient liveness timeout.
+    tokio::time::timeout(Duration::from_secs(2), client)
         .await
-        .expect("client should exit after the server's child exits")
+        .expect("client should exit promptly after the server's child exits")
         .expect("client task joined");
-    tokio::time::timeout(Duration::from_secs(5), server)
+    tokio::time::timeout(Duration::from_secs(2), server)
         .await
-        .expect("server should exit after its child exits")
+        .expect("server should exit promptly after its child exits")
         .expect("server task joined");
 
     drop(cin_tx);
