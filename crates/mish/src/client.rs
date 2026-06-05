@@ -26,6 +26,9 @@ pub enum ClientInput {
     Keys(Vec<u8>),
     /// The local terminal was resized.
     Resize { cols: u16, rows: u16 },
+    /// Force a full repaint of the current screen (e.g. after resuming from
+    /// suspend, where the real terminal's contents were lost / changed).
+    Redraw,
     /// The user detached (e.g. Ctrl-]): begin a clean shutdown.
     Detach,
 }
@@ -94,6 +97,13 @@ pub async fn run_client<T: Transport>(
                     Some(ClientInput::Resize { cols, rows }) => {
                         stream.push_resize(cols, rows);
                         handle.set_local(stream.clone());
+                    }
+                    // Force a full repaint from scratch (resume-from-suspend): the
+                    // real terminal lost our painted state, so re-emit the whole
+                    // screen rather than an incremental diff against `painted`.
+                    Some(ClientInput::Redraw) => {
+                        painted_once = false;
+                        repaint!();
                     }
                     // Detach or input closed → begin a clean shutdown.
                     Some(ClientInput::Detach) | None => break,

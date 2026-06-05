@@ -5,7 +5,10 @@
 //! and opens the QUIC/UDP session to that port — trusting exactly that
 //! certificate (exchanged over the authenticated SSH channel). It then captures
 //! raw keystrokes (forwarded as a `UserStream`), repaints received screens, and
-//! tracks SIGWINCH resizes. Detach with `Ctrl-]`.
+//! tracks SIGWINCH resizes. Quick-detach with `Ctrl-]`. The escape prefix
+//! `Ctrl-^` (configurable via `MOSH_ESCAPE_KEY`) then `.` quits, the prefix again
+//! sends it literally, and `Ctrl-Z` suspends; on resume (`fg`/SIGCONT) raw mode
+//! is restored and the screen repainted.
 //!
 //! Usage:
 //! ```text
@@ -29,8 +32,41 @@ use mish_ssp::clock::SystemClock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-/// Detach key: Ctrl-] (0x1d), same as telnet's escape.
+/// Quick-detach key: Ctrl-] (0x1d), same as telnet's escape.
 const DETACH: u8 = 0x1d;
+
+/// Default escape prefix: Ctrl-^ (0x1e), as in upstream mosh. Followed by `.` to
+/// quit, the prefix again to send it literally, or Ctrl-Z to suspend.
+const DEFAULT_ESCAPE: u8 = 0x1e;
+const CTRL_Z: u8 = 0x1a;
+
+/// Resolve the escape prefix byte from `MOSH_ESCAPE_KEY` (its first byte; a bare
+/// ASCII letter is taken as its control code, e.g. `a` → Ctrl-A), else the default.
+fn escape_key() -> u8 {
+    match std::env::var("MOSH_ESCAPE_KEY")
+        .ok()
+        .and_then(|s| s.bytes().next())
+    {
+        Some(b @ b'a'..=b'z') => b & 0x1f,
+        Some(b @ b'A'..=b'Z') => b & 0x1f,
+        Some(b) => b,
+        None => DEFAULT_ESCAPE,
+    }
+}
+
+/// Leave raw mode + the alternate screen, stop ourselves (SIGTSTP), and — once
+/// resumed (SIGCONT) — the installed handler re-enters raw mode and repaints.
+#[cfg(unix)]
+fn suspend() {
+    use std::io::Write;
+    let _ = crossterm::terminal::disable_raw_mode();
+    print!("\x1b[?1049l\x1b[?25h");
+    std::io::stdout().flush().ok();
+    // Stop the whole process; execution resumes here on SIGCONT (`fg`).
+    unsafe {
+        libc::raise(libc::SIGTSTP);
+    }
+}
 
 struct Options {
     local: bool,
@@ -161,33 +197,100 @@ async fn run_terminal(t: transport::QuicTransport) {
         }
     });
 
-    // stdin: forward raw keystrokes; Ctrl-] requests a clean detach.
+    // stdin: forward raw keystrokes, with an escape state machine. The escape
+    // prefix (Ctrl-^ by default, MOSH_ESCAPE_KEY-configurable) then: `.` quits,
+    // the prefix again sends it literally, Ctrl-Z suspends. Ctrl-] is a quick
+    // detach. The `escaping` flag persists across reads (the command byte may
+    // arrive in the next chunk).
     let key_tx = in_tx.clone();
+    let escape = escape_key();
     tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 1024];
+        let mut escaping = false;
         loop {
-            match stdin.read(&mut buf).await {
+            let n = match stdin.read(&mut buf).await {
                 Ok(0) | Err(_) => {
                     let _ = key_tx.send(ClientInput::Detach).await;
-                    break;
+                    return;
                 }
-                Ok(n) => {
-                    if buf[..n].contains(&DETACH) {
-                        let _ = key_tx.send(ClientInput::Detach).await;
-                        break;
+                Ok(n) => n,
+            };
+            let mut batch: Vec<u8> = Vec::with_capacity(n);
+            for &b in &buf[..n] {
+                if escaping {
+                    escaping = false;
+                    match b {
+                        b'.' => {
+                            if !batch.is_empty() {
+                                let _ = key_tx
+                                    .send(ClientInput::Keys(std::mem::take(&mut batch)))
+                                    .await;
+                            }
+                            let _ = key_tx.send(ClientInput::Detach).await;
+                            return;
+                        }
+                        x if x == escape => batch.push(escape), // literal prefix
+                        CTRL_Z => {
+                            // Flush pending keys, then suspend; on resume the
+                            // SIGCONT handler restores raw mode + repaints.
+                            if !batch.is_empty() {
+                                let _ = key_tx
+                                    .send(ClientInput::Keys(std::mem::take(&mut batch)))
+                                    .await;
+                            }
+                            #[cfg(unix)]
+                            suspend();
+                        }
+                        // Unknown escape command: ignore it (no passthrough).
+                        _ => {}
                     }
-                    if key_tx
-                        .send(ClientInput::Keys(buf[..n].to_vec()))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                } else if b == escape {
+                    escaping = true;
+                } else if b == DETACH {
+                    if !batch.is_empty() {
+                        let _ = key_tx
+                            .send(ClientInput::Keys(std::mem::take(&mut batch)))
+                            .await;
                     }
+                    let _ = key_tx.send(ClientInput::Detach).await;
+                    return;
+                } else {
+                    batch.push(b);
                 }
+            }
+            if !batch.is_empty() && key_tx.send(ClientInput::Keys(batch)).await.is_err() {
+                return;
             }
         }
     });
+
+    // SIGCONT: we were resumed (`fg`) after a stop. Re-enter raw mode + the
+    // alternate screen and force a full repaint — the real terminal lost our
+    // painted state while we were suspended (or stopped by any other means).
+    #[cfg(unix)]
+    {
+        let redraw_tx = in_tx.clone();
+        tokio::spawn(async move {
+            let mut sig = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::from_raw(libc::SIGCONT),
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while sig.recv().await.is_some() {
+                let _ = crossterm::terminal::enable_raw_mode();
+                {
+                    use std::io::Write;
+                    print!("\x1b[?1049h");
+                    std::io::stdout().flush().ok();
+                }
+                if redraw_tx.send(ClientInput::Redraw).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // SIGWINCH: report new terminal size.
     let resize_tx = in_tx.clone();

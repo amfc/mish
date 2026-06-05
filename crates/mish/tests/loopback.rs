@@ -151,6 +151,64 @@ async fn server_output_reaches_client_and_input_reaches_server() {
     .expect("server should receive client keystrokes");
 }
 
+/// A `Redraw` (sent by the binary on SIGCONT/resume) forces a full repaint of
+/// the current screen, not an incremental diff — so a terminal whose contents we
+/// lost while suspended is fully restored.
+#[tokio::test]
+async fn redraw_forces_full_repaint() {
+    let (ta, tb) = memory::pair();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+
+    let (pty_out_tx, pty_out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (pty_in_tx, _pty_in_rx) = mpsc::unbounded_channel::<PtyControl>();
+    tokio::spawn(run_server(
+        Arc::new(ta),
+        80,
+        24,
+        clock.clone(),
+        None,
+        pty_out_rx,
+        pty_in_tx,
+    ));
+    let (cin_tx, cin_rx) = mpsc::channel::<ClientInput>(64);
+    let (cout_tx, mut cout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(run_client(
+        Arc::new(tb),
+        80,
+        24,
+        clock.clone(),
+        mish_terminal::predict::PredictMode::Never,
+        cin_rx,
+        cout_tx,
+    ));
+
+    // Wait for the initial paint of the server's output.
+    pty_out_tx.send(b"hello world".to_vec()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if contains(&cout_rx.recv().await.expect("frame"), b"hello world") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("initial paint");
+
+    // Now force a redraw; the next frame must be a full repaint (clears with
+    // ESC[2J) and re-draws the content.
+    cin_tx.send(ClientInput::Redraw).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = cout_rx.recv().await.expect("frame");
+            if contains(&frame, b"\x1b[2J") && contains(&frame, b"hello world") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("Redraw should emit a full repaint");
+}
+
 #[tokio::test]
 async fn client_resize_propagates_to_server_pty() {
     let (ta, tb) = memory::pair();
