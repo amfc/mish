@@ -18,8 +18,18 @@ use crate::state::SyncState;
 /// Link impairment + timing configuration for the simulator.
 #[derive(Clone, Copy, Debug)]
 pub struct SimConfig {
-    /// Drop probability per datagram, in `[0.0, 1.0]`.
+    /// Drop probability per datagram, in `[0.0, 1.0]`. Applies to the A→B
+    /// (forward) direction; see [`SimConfig::loss_return`] for B→A.
     pub loss: f64,
+    /// Drop probability for the B→A (return) direction. `None` ⇒ same as `loss`
+    /// (symmetric). Set it for an *asymmetric* link (e.g. a good downlink with a
+    /// terrible uplink — the common mobile case).
+    pub loss_return: Option<f64>,
+    /// Clock offset (ms) applied to node B's view of time, modeling skew between
+    /// the two peers' clocks. The protocol's RTT/timestamp math uses wrapping
+    /// 16-bit timestamps and per-peer relative deltas, so a constant offset must
+    /// not break convergence — this lets us prove it.
+    pub clock_skew_b: i64,
     /// Probability per datagram that a *duplicate* is also delivered (with its
     /// own independent delay, so the copy may arrive before or after).
     pub dup: f64,
@@ -42,6 +52,8 @@ impl Default for SimConfig {
     fn default() -> Self {
         Self {
             loss: 0.0,
+            loss_return: None,
+            clock_skew_b: 0,
             dup: 0.0,
             corrupt: 0.0,
             min_delay: 10,
@@ -154,9 +166,15 @@ impl<L: SyncState, R: SyncState> NetworkSim<L, R> {
             Dest::A => Dest::B,
             Dest::B => Dest::A,
         };
+        // Loss is per-direction: A→B uses `loss`, B→A uses `loss_return` (or
+        // `loss` when symmetric).
+        let loss = match from {
+            Dest::A => self.cfg.loss,
+            Dest::B => self.cfg.loss_return.unwrap_or(self.cfg.loss),
+        };
         for inst in instrs {
             self.sent += 1;
-            if self.rng.next_f64() < self.cfg.loss {
+            if self.rng.next_f64() < loss {
                 self.dropped += 1;
                 continue;
             }
@@ -201,7 +219,9 @@ impl<L: SyncState, R: SyncState> NetworkSim<L, R> {
     /// rarely returns `false`; use [`NetworkSim::run_until`] with a predicate.
     pub fn step(&mut self) -> bool {
         let aw = self.a.next_wakeup(self.now);
-        let bw = self.b.next_wakeup(self.now);
+        // B runs in its skewed clock domain; convert its wakeup back to master
+        // time so the event loop schedules it correctly.
+        let bw = self.b.next_wakeup(self.b_now()).map(|t| self.to_master(t));
         let dw = self.in_flight.iter().map(|f| f.deliver).min();
 
         let next = [aw, bw, dw].into_iter().flatten().min();
@@ -213,6 +233,7 @@ impl<L: SyncState, R: SyncState> NetworkSim<L, R> {
 
         // Deliver everything due at or before `now`.
         let now = self.now;
+        let b_now = self.b_now();
         let mut due = Vec::new();
         let mut i = 0;
         while i < self.in_flight.len() {
@@ -226,17 +247,27 @@ impl<L: SyncState, R: SyncState> NetworkSim<L, R> {
             self.delivered += 1;
             match f.dest {
                 Dest::A => self.a.recv(now, &f.inst),
-                Dest::B => self.b.recv(now, &f.inst),
+                Dest::B => self.b.recv(b_now, &f.inst),
             }
         }
 
         // tick() self-gates on its timers, so calling both every step is safe.
         let a_out = self.a.tick(now);
         self.schedule(Dest::A, a_out);
-        let b_out = self.b.tick(now);
+        let b_out = self.b.tick(b_now);
         self.schedule(Dest::B, b_out);
 
         true
+    }
+
+    /// Node B's current time in its own (skewed) clock domain.
+    fn b_now(&self) -> Millis {
+        (self.now as i64 + self.cfg.clock_skew_b).max(0) as Millis
+    }
+
+    /// Convert a B-domain time back to the simulator's master clock.
+    fn to_master(&self, b_time: Millis) -> Millis {
+        (b_time as i64 - self.cfg.clock_skew_b).max(0) as Millis
     }
 
     /// Step until `pred` holds (returns `true`) or `max_time` ms of virtual time

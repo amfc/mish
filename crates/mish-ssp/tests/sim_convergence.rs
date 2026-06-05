@@ -194,6 +194,97 @@ fn soak_combined_faults_many_seeds() {
 }
 
 #[test]
+fn converges_under_asymmetric_loss() {
+    // A good downlink (A→B) with a terrible uplink (B→A) — the common mobile
+    // case. Both directions must still converge.
+    let cfg = SimConfig {
+        loss: 0.05,
+        loss_return: Some(0.6),
+        min_delay: 1,
+        max_delay: 40,
+        seed: 0xA551_0888,
+        ..Default::default()
+    };
+    let mut sim = NetworkSim::<BytesState, BytesState>::new(cfg);
+    sim.set_a_local(BytesState::new(b"down is fine".to_vec()));
+    sim.set_b_local(BytesState::new(b"up is awful".to_vec()));
+    let ok = sim.run_until(|s| converged(s, b"down is fine", b"up is awful"), MAX_TIME);
+    assert!(
+        ok,
+        "asymmetric link must converge both ways (t={}, dropped={}/{})",
+        sim.now(),
+        sim.dropped,
+        sim.sent
+    );
+}
+
+#[test]
+fn converges_with_divergent_peer_clocks() {
+    // The two peers' clocks differ by a large constant offset. The protocol's
+    // timestamp/RTT math uses wrapping 16-bit timestamps and per-peer relative
+    // deltas, so a constant skew must not break convergence.
+    for skew in [37_000i64, -50_000, 1_000_000, -1_000_000] {
+        let cfg = SimConfig {
+            loss: 0.2,
+            min_delay: 5,
+            max_delay: 30,
+            clock_skew_b: skew,
+            seed: 0xC10C_C0DE ^ (skew as u64),
+            ..Default::default()
+        };
+        let mut sim = NetworkSim::<BytesState, BytesState>::new(cfg);
+        sim.set_a_local(BytesState::new(b"clock A".to_vec()));
+        sim.set_b_local(BytesState::new(b"clock B".to_vec()));
+        let ok = sim.run_until(|s| converged(s, b"clock A", b"clock B"), MAX_TIME);
+        assert!(ok, "skew {skew}ms must still converge (t={})", sim.now());
+    }
+}
+
+#[test]
+fn long_soak_memory_stays_bounded() {
+    // A long churn: hundreds of state updates over a lossy/duplicating link, with
+    // the receive *and* sent queues asserted bounded at every step — the protocol
+    // must not accumulate memory under sustained traffic.
+    let cfg = SimConfig {
+        loss: 0.25,
+        dup: 0.15,
+        min_delay: 1,
+        max_delay: 30,
+        seed: 0x50A4,
+        ..Default::default()
+    };
+    let mut sim = NetworkSim::<BytesState, BytesState>::new(cfg);
+    for step in 0..400u32 {
+        sim.set_a_local(BytesState::new(format!("a-update-{step}").into_bytes()));
+        sim.set_b_local(BytesState::new(format!("b-update-{step}").into_bytes()));
+        let target = sim.now() + 5;
+        sim.run_until(
+            |s| {
+                let (ra, rb) = s.received_counts();
+                assert!(
+                    ra <= 1025 && rb <= 1025,
+                    "receive queue grew: a={ra} b={rb}"
+                );
+                s.now() >= target
+            },
+            MAX_TIME,
+        );
+    }
+    let want_a = b"a-update-399";
+    let want_b = b"b-update-399";
+    assert!(
+        sim.run_until(|s| converged(s, want_a, want_b), MAX_TIME),
+        "must converge after a long churn (t={})",
+        sim.now()
+    );
+    let (ra, rb) = sim.received_counts();
+    assert!(
+        ra <= 1025 && rb <= 1025,
+        "final receive queue: a={ra} b={rb}"
+    );
+}
+
+#[test]
 fn converges_across_many_seeds() {
     // Same scenario, different impairment sequences — guards against seed-luck.
     for seed in 0..32u64 {

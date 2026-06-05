@@ -53,6 +53,11 @@ pub struct Faults {
     /// Probability a byte is flipped before sending (QUIC's AEAD must reject the
     /// tampered packet — it never reaches the application).
     pub corrupt: f64,
+    /// If set, datagrams **larger** than this are silently dropped — an MTU
+    /// black hole. QUIC's DPLPMTUD must probe the path size down and the session
+    /// still converge. Keep it >= 1200 so the QUIC Initial (which requires a
+    /// 1200-byte minimum path) still gets through.
+    pub max_pass: Option<usize>,
 }
 
 /// Wraps a real socket and injects per-datagram faults (loss/dup/corruption).
@@ -92,6 +97,12 @@ impl AsyncUdpSocket for LossyUdpSocket {
         if drop {
             // Pretend the datagram went out; it's silently lost on the wire.
             return Ok(());
+        }
+        if let Some(max) = self.faults.max_pass {
+            if transmit.contents.len() > max {
+                // MTU black hole: oversized packet vanishes (DPLPMTUD probes down).
+                return Ok(());
+            }
         }
         if let Some(i) = corrupt_at {
             // Flip a byte; QUIC's AEAD rejects the packet, so it's effectively

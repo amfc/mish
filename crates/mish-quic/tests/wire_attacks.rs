@@ -179,6 +179,39 @@ async fn off_path_injection_does_not_disrupt() {
     task.abort();
 }
 
+/// An MTU black hole (the path silently drops datagrams larger than ~1200 bytes)
+/// must not wedge the session: QUIC's DPLPMTUD keeps the packet size at the base
+/// MTU and a large screen state still transfers (fragmented) and converges.
+#[tokio::test]
+async fn mtu_black_hole_still_converges() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (server_ep, addr, _cert) = lossy::faulty_server_endpoint(
+        bind,
+        Faults {
+            // Drop anything above the QUIC Initial floor — DPLPMTUD probes for a
+            // bigger MTU get black-holed, so the path stays at the base size.
+            max_pass: Some(1252),
+            ..Default::default()
+        },
+        0xB1A4,
+    )
+    .map(|(ep, cert)| {
+        let a = ep.local_addr().unwrap();
+        (ep, a, cert)
+    })
+    .unwrap();
+    let client_ep = transport::loopback_client().unwrap();
+    let (mut client, server, task) = link(server_ep, addr, client_ep).await;
+
+    // A large state forces fragmentation across many base-MTU datagrams.
+    let big = vec![b'Z'; 20 * 1024];
+    server.set_local(BytesState::new(big.clone()));
+    tokio::time::timeout(Duration::from_secs(20), await_state(&mut client, &big))
+        .await
+        .expect("large state must transfer through an MTU black hole");
+    task.abort();
+}
+
 /// A pre-handshake junk flood (garbage UDP arriving before any legitimate
 /// connection) must not exhaust or crash the server: a real client can still
 /// connect and converge afterwards. (QUIC's 3x anti-amplification limit — the

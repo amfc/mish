@@ -204,7 +204,12 @@ async fn full_stack_transparency_under_loss() {
 /// server tracks the peer by the address it last heard from, so once the client
 /// sends from the new socket the session must continue and converge. Returns
 /// whether transparency held after the migration.
-async fn roaming_client_node(server: SocketAddr, input: Vec<u8>) -> bool {
+async fn roaming_client_node(
+    server: SocketAddr,
+    input: Vec<u8>,
+    max_roams: u32,
+    roam_interval_ms: u64,
+) -> bool {
     let bind_ephemeral = || async {
         UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
             .await
@@ -226,23 +231,28 @@ async fn roaming_client_node(server: SocketAddr, input: Vec<u8>) -> bool {
     core.set_current_state(stream);
 
     let mut contacted = false;
-    let mut roamed = false;
+    let mut roams_done = 0u32;
+    let mut last_roam = 0u64;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(120) {
         let now = start.elapsed().as_millis() as u64;
         send_all(&sock, Some(server), &mut frag, core.tick(now)).await;
 
-        if screen_eq(core.remote_state(), &expected) {
-            // Require the migration to have actually happened before we pass.
-            return roamed;
+        // Pass only once every migration has happened *and* the screen matches —
+        // so a storm of migrations is genuinely survived, not skipped by an early
+        // convergence.
+        if roams_done == max_roams && screen_eq(core.remote_state(), &expected) {
+            return true;
         }
 
-        // Once we've made contact, jump to a brand-new source address. The next
-        // tick-driven datagram (a keepalive ack within ack_interval) leaves from
-        // the new socket and the server re-pins the peer there.
-        if contacted && !roamed {
+        // After contact, jump to a fresh source address on a schedule. The next
+        // tick-driven datagram (a keepalive within ack_interval) leaves from the
+        // new socket and the server re-pins the peer there.
+        if contacted && roams_done < max_roams && now.saturating_sub(last_roam) >= roam_interval_ms
+        {
             sock = bind_ephemeral().await;
-            roamed = true;
+            roams_done += 1;
+            last_roam = now;
         }
 
         let wait = core.wait_time(now).unwrap_or(3_600_000).max(1);
@@ -260,7 +270,7 @@ async fn roaming_client_node(server: SocketAddr, input: Vec<u8>) -> bool {
     false
 }
 
-async fn run_roaming() -> bool {
+async fn run_roaming(max_roams: u32, roam_interval_ms: u64) -> bool {
     let handle = Handle::current();
     madsim::net::NetSim::current().update_config(|c| {
         c.packet_loss_rate = 0.0;
@@ -279,7 +289,7 @@ async fn run_roaming() -> bool {
     input.extend_from_slice(b"ROAM_OK\r");
 
     client
-        .spawn(async move { roaming_client_node(saddr, input).await })
+        .spawn(async move { roaming_client_node(saddr, input, max_roams, roam_interval_ms).await })
         .await
         .unwrap()
 }
@@ -287,7 +297,18 @@ async fn run_roaming() -> bool {
 #[madsim::test]
 async fn full_stack_transparency_with_roaming() {
     assert!(
-        run_roaming().await,
+        run_roaming(1, 0).await,
         "session must survive a client source-address migration and converge"
+    );
+}
+
+/// Roaming *storm*: the client migrates to a fresh source address repeatedly
+/// (every ~1.5s) — a phone hopping cells / flapping Wi-Fi. The session must
+/// survive all of them and still converge.
+#[madsim::test]
+async fn full_stack_transparency_with_roaming_storm() {
+    assert!(
+        run_roaming(8, 1500).await,
+        "session must survive repeated rapid migrations and converge"
     );
 }
