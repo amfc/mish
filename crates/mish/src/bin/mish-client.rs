@@ -24,7 +24,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use mish::bootstrap::{self, Bootstrap};
 use mish::client::{run_client, ClientInput};
-use mish_quic::{transport, CertificateDer};
+use mish_quic::transport;
 use mish_ssp::clock::SystemClock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -113,10 +113,15 @@ async fn main() -> Result<()> {
     };
     eprintln!("[mish-client] connecting to {} …", boot.addr);
 
-    // 2. Open the QUIC session to the bootstrapped port, trusting its cert.
-    let cert = CertificateDer::from(boot.cert_der.clone());
-    let endpoint = transport::client_endpoint("0.0.0.0:0".parse().unwrap(), cert)
-        .context("creating QUIC client endpoint")?;
+    // 2. Open the mutually-authenticated QUIC session: trust the server cert and
+    //    present the minted client cert/key from the SSH-authenticated channel.
+    let endpoint = transport::authenticated_client_endpoint(
+        "0.0.0.0:0".parse().unwrap(),
+        &boot.server_cert_der,
+        &boot.client_cert_der,
+        &boot.client_key_der,
+    )
+    .context("creating QUIC client endpoint")?;
     let t = transport::connect(&endpoint, boot.addr, "localhost")
         .await
         .context("connecting to server")?;

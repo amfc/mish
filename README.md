@@ -61,9 +61,13 @@ edges, then hammer the deterministic core.
 ## Usage
 
 Like upstream mosh, `mish-client` bootstraps the session itself: it SSHes to the
-host, starts `mish-server`, reads the `MISH CONNECT <port> <cert>` line it prints
-over the (authenticated) SSH channel, then opens the QUIC/UDP session directly to
-that port — trusting exactly that certificate.
+host, starts `mish-server`, reads the `MISH CONNECT <port> <server-cert>
+<client-cert> <client-key>` line it prints over the (authenticated) SSH channel,
+then opens a **mutually-authenticated** QUIC/UDP session directly to that port.
+The client pins the server cert *and* presents the minted client cert/key, so —
+as in mosh's shared-key model — the server accepts input only from the party that
+read those credentials over SSH. Anyone else who reaches the UDP port is rejected
+at the TLS handshake.
 
 ```sh
 # Remote (like `mosh host`): SSH in, start the server, attach over UDP.
@@ -163,7 +167,8 @@ differences from upstream mosh.
       length-disguising chaff — QUIC already pads/encrypts.)*
 - [x] **M3 — QUIC transport (`mish-quic`).** Quinn endpoint with the unreliable
       datagram extension implementing `Transport`; datagram-only connections
-      (streams disabled); self-signed/insecure + trusted TLS configs; **client
+      (streams disabled); **mutual-auth TLS** (pinned server + minted client cert)
+      plus self-signed/insecure configs for tests; **client
       migration/roaming** verified; deterministic loss injection via a custom
       `AsyncUdpSocket` proving SSP heals QUIC datagram loss end-to-end. *(done)*
       *(Deferred: `turmoil`/`madsim` virtual-time sim of the QUIC layer — the
@@ -183,8 +188,11 @@ differences from upstream mosh.
       resize, `Ctrl-]` detach). Session loops are transport-generic and
       I/O-decoupled, so they're tested headlessly; plus a real-PTY test and a
       **full-stack test** (real QUIC + real `/bin/sh` + emulator + render).
-      *(done. Deferred: SSH-bootstrapped certs — the demo uses insecure TLS
-      verification.)*
+      The QUIC session is **mutually authenticated**: `mish-server` mints a
+      per-session client cert/key, ships it (with the server cert) over the
+      authenticated SSH `MISH CONNECT` line, and pins it — so only the
+      SSH-authenticated party can connect or inject input. Verified by positive
+      and negative security tests in `mish-quic/tests/auth.rs`. *(done)*
 - [x] **M6 — Predictive echo + deterministic network simulation.**
       Client-side speculative echo (`mish-terminal/src/predict.rs`, mosh's
       `terminaloverlay`): overlays predicted keystrokes, validates/culls them

@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mish::bootstrap::{from_hex, to_hex};
+use mish::bootstrap::from_hex;
 use mish::client::{run_client, ClientInput};
-use mish_quic::{transport, CertificateDer};
+use mish_quic::transport;
 use mish_ssp::clock::{Clock, SystemClock};
 use mish_terminal::predict::PredictMode;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -41,13 +41,14 @@ async fn detach_survives_parent_exit() {
         let mut it = line.split_whitespace();
         if it.next() == Some("MOSH") && it.next() == Some("CONNECT") {
             let port: u16 = it.next().unwrap().parse().unwrap();
-            let cert = from_hex(it.next().unwrap()).unwrap();
-            conn = Some((port, cert));
+            let server_cert = from_hex(it.next().unwrap()).unwrap();
+            let client_cert = from_hex(it.next().unwrap()).unwrap();
+            let client_key = from_hex(it.next().unwrap()).unwrap();
+            conn = Some((port, server_cert, client_cert, client_key));
             break;
         }
     }
-    let (port, cert_der) = conn.expect("server printed MISH CONNECT");
-    let _ = to_hex; // keep the import used
+    let (port, server_cert, client_cert, client_key) = conn.expect("server printed MISH CONNECT");
 
     // The fork parent must exit promptly (proving it detached the daemon).
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -56,10 +57,14 @@ async fn detach_survives_parent_exit() {
         .expect("wait");
     assert!(status.success(), "detach parent exited cleanly");
 
-    // The daemon is now an orphan — but still listening. Connect and run.
-    let cert = CertificateDer::from(cert_der);
-    let endpoint =
-        transport::client_endpoint("0.0.0.0:0".parse().unwrap(), cert).expect("client endpoint");
+    // The daemon is now an orphan — but still listening. Connect (mutual auth).
+    let endpoint = transport::authenticated_client_endpoint(
+        "0.0.0.0:0".parse().unwrap(),
+        &server_cert,
+        &client_cert,
+        &client_key,
+    )
+    .expect("client endpoint");
     let t = transport::connect(&endpoint, ([127, 0, 0, 1], port).into(), "localhost")
         .await
         .expect("connect to the detached daemon");

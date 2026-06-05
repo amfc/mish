@@ -120,6 +120,23 @@ pub fn client_endpoint(
     Ok(endpoint)
 }
 
+/// Build a mutual-auth client endpoint: trusts `server_cert` and presents the
+/// minted client cert/key so the authenticating server accepts the connection.
+pub fn authenticated_client_endpoint(
+    addr: SocketAddr,
+    server_cert_der: &[u8],
+    client_cert_der: &[u8],
+    client_key_der: &[u8],
+) -> Result<Endpoint, QuicError> {
+    let mut endpoint = Endpoint::client(addr)?;
+    endpoint.set_default_client_config(config::authenticated_client_config(
+        server_cert_der,
+        client_cert_der,
+        client_key_der,
+    ));
+    Ok(endpoint)
+}
+
 /// Build a client endpoint that accepts any server certificate (testing only).
 pub fn insecure_client_endpoint(addr: SocketAddr) -> Result<Endpoint, QuicError> {
     let mut endpoint = Endpoint::client(addr)?;
@@ -155,4 +172,15 @@ pub fn loopback_server() -> Result<(Endpoint, SocketAddr, CertificateDer<'static
 /// Convenience: a client endpoint bound to a loopback ephemeral port.
 pub fn loopback_client() -> Result<Endpoint, QuicError> {
     insecure_client_endpoint("127.0.0.1:0".parse().unwrap())
+}
+
+/// Convenience: a mutual-auth server endpoint on a loopback port. Returns the
+/// endpoint, its address, and the [`SessionAuth`](crate::config::SessionAuth) to
+/// hand to a client (the client cert/key it must present + the server cert).
+pub fn loopback_authenticated_server(
+) -> Result<(Endpoint, SocketAddr, crate::config::SessionAuth), QuicError> {
+    let (server_config, auth) = config::authenticated_server_config();
+    let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())?;
+    let addr = endpoint.local_addr()?;
+    Ok((endpoint, addr, auth))
 }

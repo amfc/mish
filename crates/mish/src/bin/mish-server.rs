@@ -119,13 +119,20 @@ fn main() -> Result<()> {
     }
 
     mish_quic::config::init_crypto();
-    let (server_config, cert) = mish_quic::config::self_signed_server_config();
+    // Mutual authentication: mint a per-session client cert/key the client must
+    // present, and require it server-side. The credentials travel only over the
+    // authenticated SSH channel (the MISH CONNECT line below), so only the
+    // SSH-authenticated party can connect and inject input.
+    let (server_config, auth) = mish_quic::config::authenticated_server_config();
     let socket = bind_in_range(&opts.ports).context("binding UDP socket")?;
     let port = socket.local_addr()?.port();
 
+    use mish::bootstrap::to_hex;
     println!(
-        "MISH CONNECT {port} {}",
-        mish::bootstrap::to_hex(cert.as_ref())
+        "MISH CONNECT {port} {} {} {}",
+        to_hex(&auth.server_cert_der),
+        to_hex(&auth.client_cert_der),
+        to_hex(&auth.client_key_der),
     );
     std::io::stdout().flush().ok();
     eprintln!("mish server listening on UDP port {port}");

@@ -8,11 +8,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::crypto::rustls::QuicClientConfig;
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, ServerConfig, TransportConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::SignatureScheme;
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DistinguishedName, SignatureScheme};
 
 /// Datagram receive/send buffer sizes (bytes). Generous; the SSP layer keeps
 /// instructions small.
@@ -54,6 +56,84 @@ pub fn self_signed_server_config() -> (ServerConfig, CertificateDer<'static>) {
         .expect("valid single-cert server config");
     server_config.transport_config(transport_config());
     (server_config, cert_der)
+}
+
+/// The credentials a server mints for one session: its own cert plus the
+/// **client** cert/key the client must present. All three are handed to the
+/// client over the SSH-authenticated `MISH CONNECT` channel; possession of the
+/// client key is what authenticates the client to the server (mosh's shared-key
+/// model, expressed as mutual TLS).
+pub struct SessionAuth {
+    /// Server certificate (DER) — the client pins it to authenticate the server.
+    pub server_cert_der: Vec<u8>,
+    /// Client certificate (DER) — the server pins it to authenticate the client.
+    pub client_cert_der: Vec<u8>,
+    /// Client private key (PKCS#8 DER) — transmitted over SSH; the client
+    /// presents it during the QUIC/TLS handshake.
+    pub client_key_der: Vec<u8>,
+}
+
+/// A QUIC server config that **requires and pins a specific client certificate**
+/// (mutual authentication), plus the [`SessionAuth`] to hand to the client. This
+/// closes the input-injection gap: only a peer presenting the minted client cert
+/// — transmitted solely over the authenticated SSH channel — can connect.
+pub fn authenticated_server_config() -> (ServerConfig, SessionAuth) {
+    init_crypto();
+    let server = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("server cert generation");
+    let client = rcgen::generate_simple_self_signed(vec!["mish-client".to_string()])
+        .expect("client cert generation");
+
+    let server_cert_der = server.cert.der().clone();
+    let server_key = PrivatePkcs8KeyDer::from(server.key_pair.serialize_der());
+    let client_cert_der = client.cert.der().clone();
+
+    let verifier = Arc::new(PinnedClientCertVerifier::new(
+        client_cert_der.clone().into_owned(),
+    ));
+    let rustls_server = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![server_cert_der.clone()],
+            PrivateKeyDer::Pkcs8(server_key),
+        )
+        .expect("valid mutual-auth server config");
+
+    let qsc = QuicServerConfig::try_from(rustls_server).expect("TLS13 quic server config");
+    let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
+    server_config.transport_config(transport_config());
+
+    let auth = SessionAuth {
+        server_cert_der: server_cert_der.to_vec(),
+        client_cert_der: client_cert_der.to_vec(),
+        client_key_der: client.key_pair.serialize_der(),
+    };
+    (server_config, auth)
+}
+
+/// A client config that trusts the given server cert **and presents the minted
+/// client cert/key** so the mutual-auth server accepts it.
+pub fn authenticated_client_config(
+    server_cert_der: &[u8],
+    client_cert_der: &[u8],
+    client_key_der: &[u8],
+) -> ClientConfig {
+    init_crypto();
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(server_cert_der.to_vec()))
+        .expect("add trusted server cert");
+    let client_chain = vec![CertificateDer::from(client_cert_der.to_vec())];
+    let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key_der.to_vec()));
+
+    let rustls_client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_chain, client_key)
+        .expect("valid mutual-auth client config");
+    let qcc = QuicClientConfig::try_from(rustls_client).expect("TLS13 quic client config");
+    let mut client_config = ClientConfig::new(Arc::new(qcc));
+    client_config.transport_config(transport_config());
+    client_config
 }
 
 /// A client config that trusts a specific server certificate.
@@ -133,5 +213,92 @@ impl ServerCertVerifier for SkipServerVerification {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// A `ClientCertVerifier` that accepts **exactly one** client certificate (by
+/// DER equality). The pinned cert is minted per session and delivered only over
+/// the authenticated SSH channel, so presenting it proves the peer is the
+/// SSH-authenticated party. Chain/CA/EKU validation is deliberately bypassed
+/// (the cert is self-signed and pinned); the TLS signature is still verified, so
+/// the client must actually hold the matching private key.
+#[derive(Debug)]
+struct PinnedClientCertVerifier {
+    pinned: CertificateDer<'static>,
+    provider: Arc<CryptoProvider>,
+    /// We advertise no acceptable-CA hints (the client already knows its cert).
+    no_hints: Vec<DistinguishedName>,
+}
+
+impl PinnedClientCertVerifier {
+    fn new(pinned: CertificateDer<'static>) -> Self {
+        Self {
+            pinned,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            no_hints: Vec::new(),
+        }
+    }
+}
+
+impl ClientCertVerifier for PinnedClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.no_hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.pinned.as_ref() {
+            Ok(ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "client certificate not recognized".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

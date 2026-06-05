@@ -6,11 +6,16 @@
 //! in `--local` mode, a child process) starts `mish-server`, which prints
 //!
 //! ```text
-//! MISH CONNECT <port> <hex-encoded-cert-DER>
+//! MISH CONNECT <port> <server-cert-DER> <client-cert-DER> <client-key-DER>
 //! ```
 //!
-//! over the (SSH-encrypted) channel. We parse it, then open a QUIC connection to
-//! the host on that UDP port, trusting exactly that certificate.
+//! (all hex-encoded) over the (SSH-encrypted) channel. We parse it, then open a
+//! **mutually-authenticated** QUIC connection: the client trusts exactly the
+//! server cert and presents the minted client cert/key, so the server accepts
+//! input only from the party that read this line over the authenticated SSH
+//! channel. Carrying the client private key over SSH is safe (the channel is
+//! confidential and authenticated) and mirrors how upstream mosh ships its
+//! shared session key.
 //!
 //! The bootstrap child (the local server process, or the `ssh` process) is held
 //! for the lifetime of the [`Bootstrap`] and killed on drop. (Upstream mosh
@@ -29,7 +34,12 @@ use tokio::process::{Child, Command};
 /// child process keeping the server reachable.
 pub struct Bootstrap {
     pub addr: SocketAddr,
-    pub cert_der: Vec<u8>,
+    /// Server certificate (DER) the client pins to authenticate the server.
+    pub server_cert_der: Vec<u8>,
+    /// Client certificate (DER) the client presents for mutual auth.
+    pub client_cert_der: Vec<u8>,
+    /// Client private key (PKCS#8 DER) the client presents for mutual auth.
+    pub client_key_der: Vec<u8>,
     child: Child,
 }
 
@@ -68,10 +78,12 @@ pub async fn local(server_cmd: &str, command: Option<&str>) -> Result<Bootstrap>
         .spawn()
         .with_context(|| format!("spawning local server `{server_cmd}`"))?;
 
-    let (port, cert_der) = read_connect(&mut child).await?;
+    let creds = read_connect(&mut child).await?;
     Ok(Bootstrap {
-        addr: SocketAddr::from(([127, 0, 0, 1], port)),
-        cert_der,
+        addr: SocketAddr::from(([127, 0, 0, 1], creds.port)),
+        server_cert_der: creds.server_cert,
+        client_cert_der: creds.client_cert,
+        client_key_der: creds.client_key,
         child,
     })
 }
@@ -97,11 +109,11 @@ pub async fn ssh(
         .spawn()
         .with_context(|| format!("spawning `{ssh_cmd} {host} {server_cmd}`"))?;
 
-    let (port, cert_der) = read_connect(&mut child).await?;
+    let creds = read_connect(&mut child).await?;
 
     // The UDP session goes to the same host SSH reached; resolve its address.
     let hostname = host.rsplit('@').next().unwrap_or(host);
-    let ip = tokio::net::lookup_host((hostname, port))
+    let ip = tokio::net::lookup_host((hostname, creds.port))
         .await
         .with_context(|| format!("resolving {hostname}"))?
         .next()
@@ -109,13 +121,23 @@ pub async fn ssh(
 
     Ok(Bootstrap {
         addr: ip,
-        cert_der,
+        server_cert_der: creds.server_cert,
+        client_cert_der: creds.client_cert,
+        client_key_der: creds.client_key,
         child,
     })
 }
 
+/// The parsed contents of a `MISH CONNECT` line.
+struct ConnectInfo {
+    port: u16,
+    server_cert: Vec<u8>,
+    client_cert: Vec<u8>,
+    client_key: Vec<u8>,
+}
+
 /// Read the child's stdout until the `MISH CONNECT` line appears.
-async fn read_connect(child: &mut Child) -> Result<(u16, Vec<u8>)> {
+async fn read_connect(child: &mut Child) -> Result<ConnectInfo> {
     let stdout = child
         .stdout
         .take()
@@ -136,15 +158,24 @@ async fn read_connect(child: &mut Child) -> Result<(u16, Vec<u8>)> {
         .context("timed out waiting for the server to start")?
 }
 
-/// Parse a `MISH CONNECT <port> <hex-cert>` line.
-fn parse_connect(line: &str) -> Option<(u16, Vec<u8>)> {
+/// Parse a `MISH CONNECT <port> <server-cert> <client-cert> <client-key>` line
+/// (all hex). Older single-cert lines (no client credentials) are rejected, so a
+/// stale server can't silently downgrade to no client auth.
+fn parse_connect(line: &str) -> Option<ConnectInfo> {
     let mut it = line.split_whitespace();
     if it.next()? != "MOSH" || it.next()? != "CONNECT" {
         return None;
     }
     let port: u16 = it.next()?.parse().ok()?;
-    let cert = from_hex(it.next()?)?;
-    Some((port, cert))
+    let server_cert = from_hex(it.next()?)?;
+    let client_cert = from_hex(it.next()?)?;
+    let client_key = from_hex(it.next()?)?;
+    Some(ConnectInfo {
+        port,
+        server_cert,
+        client_cert,
+        client_key,
+    })
 }
 
 /// Lowercase-hex encode (used by `mish-server` to print the cert DER).
@@ -191,12 +222,21 @@ mod tests {
 
     #[test]
     fn parse_connect_line() {
-        let line = format!("MISH CONNECT 51234 {}", to_hex(&[0xde, 0xad, 0xbe, 0xef]));
-        assert_eq!(
-            parse_connect(&line),
-            Some((51234, vec![0xde, 0xad, 0xbe, 0xef]))
+        let line = format!(
+            "MISH CONNECT 51234 {} {} {}",
+            to_hex(&[0xde, 0xad]),
+            to_hex(&[0xbe, 0xef]),
+            to_hex(&[0x01, 0x02])
         );
-        assert_eq!(parse_connect("garbage"), None);
-        assert_eq!(parse_connect("MISH CONNECT notaport ff"), None);
+        let info = parse_connect(&line).expect("valid line");
+        assert_eq!(info.port, 51234);
+        assert_eq!(info.server_cert, vec![0xde, 0xad]);
+        assert_eq!(info.client_cert, vec![0xbe, 0xef]);
+        assert_eq!(info.client_key, vec![0x01, 0x02]);
+
+        assert!(parse_connect("garbage").is_none());
+        assert!(parse_connect("MISH CONNECT notaport ff ee dd").is_none());
+        // A legacy single-cert line is rejected (no silent downgrade).
+        assert!(parse_connect("MISH CONNECT 51234 dead").is_none());
     }
 }

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use mish::bootstrap;
 use mish::client::{run_client, ClientInput};
-use mish_quic::{transport, CertificateDer};
+use mish_quic::transport;
 use mish_ssp::clock::{Clock, SystemClock};
 use mish_terminal::predict::PredictMode;
 use tokio::sync::mpsc;
@@ -27,12 +27,17 @@ async fn local_bootstrap_starts_server_and_connects() {
         .await
         .expect("bootstrap should start the server and parse MISH CONNECT");
     assert_ne!(boot.addr.port(), 0, "got a real UDP port");
-    assert!(!boot.cert_der.is_empty(), "got a certificate");
+    assert!(!boot.server_cert_der.is_empty(), "got a server certificate");
+    assert!(!boot.client_key_der.is_empty(), "got client credentials");
 
-    // Connect over QUIC, trusting exactly the bootstrapped certificate.
-    let cert = CertificateDer::from(boot.cert_der.clone());
-    let endpoint =
-        transport::client_endpoint("0.0.0.0:0".parse().unwrap(), cert).expect("client endpoint");
+    // Connect over QUIC with mutual auth using the bootstrapped credentials.
+    let endpoint = transport::authenticated_client_endpoint(
+        "0.0.0.0:0".parse().unwrap(),
+        &boot.server_cert_der,
+        &boot.client_cert_der,
+        &boot.client_key_der,
+    )
+    .expect("client endpoint");
     let t = transport::connect(&endpoint, boot.addr, "localhost")
         .await
         .expect("connect to bootstrapped server");
