@@ -9,7 +9,10 @@
 //! so the fork happens in a single-threaded process. The child then builds the
 //! runtime and constructs the Quinn endpoint from the inherited socket.
 //!
-//! Usage: `mish-server [--detach] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [bind-port] [-- command]`
+//! Usage: `mish-server [--detach] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [bind-port] [-- command]`
+//!
+//! With no `-- command`, the user's `$SHELL` is started as a **login shell**
+//! (`-l`). `-4`/`-6` select the bind address family (default IPv4 `0.0.0.0`).
 //!
 //! Env: `MOSH_SERVER_NETWORK_TMOUT` (mid-session idle, default 300s),
 //! `MOSH_SERVER_SIGNAL_TMOUT` (wait for the first connection, default 60s).
@@ -29,6 +32,8 @@ struct Options {
     ports: Vec<u16>,
     /// Locale/env assignments to export to the child (`-l KEY=VAL`).
     locale: Vec<(String, String)>,
+    /// Address to bind: IPv4 `0.0.0.0` (default) or IPv6 `::`.
+    bind_ip: String,
     command: Option<String>,
 }
 
@@ -37,12 +42,22 @@ fn parse_args() -> Result<Options> {
         detach: false,
         ports: Vec::new(),
         locale: Vec::new(),
+        bind_ip: "0.0.0.0".to_string(),
         command: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--detach" => opts.detach = true,
+            "-4" => opts.bind_ip = "0.0.0.0".to_string(),
+            "-6" => opts.bind_ip = "::".to_string(),
+            "--family" => {
+                opts.bind_ip = match args.next().as_deref() {
+                    Some("inet") | Some("4") => "0.0.0.0".to_string(),
+                    Some("inet6") | Some("6") => "::".to_string(),
+                    other => bail!("--family expects inet|inet6 (got {other:?})"),
+                };
+            }
             "-p" => {
                 let spec = args.next().context("-p needs a value")?;
                 opts.ports = parse_ports(&spec)?;
@@ -84,10 +99,10 @@ fn parse_ports(spec: &str) -> Result<Vec<u16>> {
     }
 }
 
-fn bind_in_range(ports: &[u16]) -> Result<std::net::UdpSocket> {
+fn bind_in_range(ports: &[u16], bind_ip: &str) -> Result<std::net::UdpSocket> {
     let mut last_err = None;
     for &p in ports {
-        match std::net::UdpSocket::bind(("0.0.0.0", p)) {
+        match std::net::UdpSocket::bind((bind_ip, p)) {
             Ok(s) => return Ok(s),
             Err(e) => last_err = Some(e),
         }
@@ -95,7 +110,23 @@ fn bind_in_range(ports: &[u16]) -> Result<std::net::UdpSocket> {
     Err(last_err.unwrap().into())
 }
 
+/// Disable core dumps: a core file could contain the per-session client private
+/// key (and terminal contents). Best-effort; done before any secret is minted.
+#[cfg(unix)]
+fn suppress_core_dumps() {
+    let zero = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &zero);
+    }
+}
+#[cfg(not(unix))]
+fn suppress_core_dumps() {}
+
 fn main() -> Result<()> {
+    suppress_core_dumps();
     let opts = parse_args()?;
 
     // Export locale/env overrides for the child shell.
@@ -124,7 +155,7 @@ fn main() -> Result<()> {
     // authenticated SSH channel (the MISH CONNECT line below), so only the
     // SSH-authenticated party can connect and inject input.
     let (server_config, auth) = mish_quic::config::authenticated_server_config();
-    let socket = bind_in_range(&opts.ports).context("binding UDP socket")?;
+    let socket = bind_in_range(&opts.ports, &opts.bind_ip).context("binding UDP socket")?;
     let port = socket.local_addr()?.port();
 
     use mish::bootstrap::to_hex;
@@ -153,8 +184,6 @@ async fn serve(
     server_config: mish_quic::ServerConfig,
     command: Option<String>,
 ) -> Result<()> {
-    let command =
-        command.unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
     let (cols, rows) = (80u16, 24u16);
 
     let endpoint = mish_quic::transport::server_from_socket(socket, server_config)
@@ -172,7 +201,13 @@ async fn serve(
         };
     eprintln!("client connected from {}", t.remote_address());
 
-    let pty = PtyProcess::spawn(&command, cols, rows).context("spawning PTY child")?;
+    // An explicit `-- command` runs as given; with no command we start the
+    // user's $SHELL as a login shell (reads the login profile, like `mosh host`).
+    let pty = match command {
+        Some(cmd) => PtyProcess::spawn(&cmd, cols, rows),
+        None => PtyProcess::spawn_login_shell(cols, rows),
+    }
+    .context("spawning PTY child")?;
     let clock = Arc::new(SystemClock::new());
     let network_timeout = Some(env_secs("MOSH_SERVER_NETWORK_TMOUT", 300));
 

@@ -95,9 +95,12 @@ overlay) are all done. These are the remaining parity polish:
 - **SSP: ECN frame-rate throttle, `attempt_prospective_resend_optimization`,
   SIGUSR1-conditional idle shutdown of disconnected sessions, `apply_diff`
   echo_ack monotonicity enforcement.**
-- **Server ops: login shell + `TERM`/`STY`/`PWD` env, syslog, `RLIMIT_CORE`
-  suppression, `-s`/`SSH_CONNECTION` & `-i`/`--family`/`-4`/`-6` bind modes.**
-  (utmp/wtmp stays deferred — blocked by portable-pty hiding the pts name.)
+- **Server ops** — *mostly done.* The child now starts as a **login shell**
+  (`$SHELL -l`) with `TERM` set, `RLIMIT_CORE` is suppressed (no core dump can
+  leak the client key), and `-4`/`-6`/`--family` select the bind family.
+  *Remaining (lower value):* syslog connection logging, `-s`/`SSH_CONNECTION`
+  interface binding, and `STY`/`PWD` unsetting. utmp/wtmp stays deferred (blocked
+  by portable-pty hiding the pts name).
 - **CLI/bootstrap: `--predict`/`-a`/`-n` + `MOSH_PREDICTION_*` env, `-p`/range
   plumbing, `--ssh` shell-split + `ssh -tt`/`-n`/`--no-ssh-pty`, server
   `--version`/`--help`, `--no-init` (`MOSH_NO_TERM_INIT`), `-c` color advertise.**

@@ -21,8 +21,20 @@ pub struct PtyProcess {
 }
 
 impl PtyProcess {
-    /// Spawn `command` on a new PTY of the given size.
+    /// Spawn `command` (a single program) on a new PTY of the given size.
     pub fn spawn(command: &str, cols: u16, rows: u16) -> Result<Self> {
+        Self::spawn_argv(vec![command.to_string()], cols, rows)
+    }
+
+    /// Spawn the user's `$SHELL` (or `/bin/sh`) as a **login shell** — invoked
+    /// with `-l` so it reads the login profile (`.profile`/`.bash_profile`/…),
+    /// matching how `mosh host` (and a real SSH login) starts a session.
+    pub fn spawn_login_shell(cols: u16, rows: u16) -> Result<Self> {
+        Self::spawn_argv(login_shell_argv(), cols, rows)
+    }
+
+    /// Spawn from an explicit argv (`argv[0]` is the program).
+    pub fn spawn_argv(argv: Vec<String>, cols: u16, rows: u16) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -31,7 +43,7 @@ impl PtyProcess {
             pixel_height: 0,
         })?;
 
-        let mut cmd = CommandBuilder::new(command);
+        let mut cmd = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
         cmd.env("TERM", "xterm-256color");
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave); // child holds the slave now
@@ -83,5 +95,28 @@ impl PtyProcess {
         });
 
         Ok(Self { output, control })
+    }
+}
+
+/// argv for a login shell: the user's `$SHELL` (or `/bin/sh`) invoked with `-l`.
+/// (`portable-pty` execs `argv[0]`, so we can't use the `-bash` argv[0]
+/// convention; `-l` gives the same login-profile behavior for bash/zsh/dash.)
+pub fn login_shell_argv() -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    login_argv_for(&shell)
+}
+
+fn login_argv_for(shell: &str) -> Vec<String> {
+    vec![shell.to_string(), "-l".to_string()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_argv_invokes_shell_with_dash_l() {
+        assert_eq!(login_argv_for("/bin/bash"), vec!["/bin/bash", "-l"]);
+        assert_eq!(login_argv_for("/usr/bin/zsh"), vec!["/usr/bin/zsh", "-l"]);
     }
 }
