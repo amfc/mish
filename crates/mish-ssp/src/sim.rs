@@ -20,6 +20,14 @@ use crate::state::SyncState;
 pub struct SimConfig {
     /// Drop probability per datagram, in `[0.0, 1.0]`.
     pub loss: f64,
+    /// Probability per datagram that a *duplicate* is also delivered (with its
+    /// own independent delay, so the copy may arrive before or after).
+    pub dup: f64,
+    /// Probability per datagram that its bytes are corrupted in flight. A
+    /// corrupted datagram is re-decoded; if decode fails it is silently dropped
+    /// (exactly as a real receiver discards garbage), otherwise the mangled
+    /// instruction is delivered.
+    pub corrupt: f64,
     /// Minimum one-way delay (ms).
     pub min_delay: Millis,
     /// Maximum one-way delay (ms); variability reorders datagrams.
@@ -34,6 +42,8 @@ impl Default for SimConfig {
     fn default() -> Self {
         Self {
             loss: 0.0,
+            dup: 0.0,
+            corrupt: 0.0,
             min_delay: 10,
             max_delay: 10,
             seed: 0x1234_5678_9ABC_DEF0,
@@ -88,6 +98,8 @@ pub struct NetworkSim<L: SyncState, R: SyncState> {
     pub sent: u64,
     pub dropped: u64,
     pub delivered: u64,
+    pub duplicated: u64,
+    pub corrupted: u64,
 }
 
 impl<L: SyncState, R: SyncState> NetworkSim<L, R> {
@@ -102,6 +114,8 @@ impl<L: SyncState, R: SyncState> NetworkSim<L, R> {
             sent: 0,
             dropped: 0,
             delivered: 0,
+            duplicated: 0,
+            corrupted: 0,
         }
     }
 
@@ -129,24 +143,55 @@ impl<L: SyncState, R: SyncState> NetworkSim<L, R> {
         self.b.remote_state()
     }
 
+    /// Size of each core's received-state queue — for bounded-memory assertions
+    /// under sustained fault injection.
+    pub fn received_counts(&self) -> (usize, usize) {
+        (self.a.received_state_count(), self.b.received_state_count())
+    }
+
     fn schedule(&mut self, from: Dest, instrs: Vec<Instruction>) {
+        let dest = match from {
+            Dest::A => Dest::B,
+            Dest::B => Dest::A,
+        };
         for inst in instrs {
             self.sent += 1;
             if self.rng.next_f64() < self.cfg.loss {
                 self.dropped += 1;
                 continue;
             }
-            let delay = self.rng.delay(self.cfg.min_delay, self.cfg.max_delay);
-            let dest = match from {
-                Dest::A => Dest::B,
-                Dest::B => Dest::A,
-            };
-            self.in_flight.push(InFlight {
-                deliver: self.now + delay,
-                dest,
-                inst,
-            });
+            self.enqueue(dest, &inst);
+            // Duplication: a second, independently-delayed copy may also arrive.
+            // (`dup > 0.0` short-circuits so zero-config runs draw no extra RNG and
+            // stay byte-for-byte reproducible against the loss/reorder tests.)
+            if self.cfg.dup > 0.0 && self.rng.next_f64() < self.cfg.dup {
+                self.duplicated += 1;
+                self.enqueue(dest, &inst);
+            }
         }
+    }
+
+    /// Queue one copy of `inst` for delivery to `dest`.
+    ///
+    /// Corruption is modeled as it actually behaves on mosh's wire: the transport
+    /// is authenticated (QUIC/TLS, AES-OCB in real mosh), so a datagram whose bytes
+    /// were flipped fails authentication and is *dropped* — mangled content never
+    /// reaches the SSP layer. We therefore treat corruption as an extra loss
+    /// source here; an attacker injecting *well-formed-but-malicious* instructions
+    /// is a different threat, covered (for safety/bounded-memory) by the
+    /// `fuzz_hostile` core tests rather than for liveness here.
+    fn enqueue(&mut self, dest: Dest, inst: &Instruction) {
+        let delay = self.rng.delay(self.cfg.min_delay, self.cfg.max_delay);
+        if self.cfg.corrupt > 0.0 && self.rng.next_f64() < self.cfg.corrupt {
+            self.corrupted += 1;
+            self.dropped += 1; // authentication rejects it
+            return;
+        }
+        self.in_flight.push(InFlight {
+            deliver: self.now + delay,
+            dest,
+            inst: inst.clone(),
+        });
     }
 
     /// Advance to the next event (a datagram delivery and/or a due tick) and
