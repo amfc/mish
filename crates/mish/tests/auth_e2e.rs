@@ -27,25 +27,21 @@ async fn real_server_rejects_unauthenticated_client() {
     let boot = spawn_server().await;
     // The insecure client config presents no client cert.
     let ep = transport::insecure_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
-    match tokio::time::timeout(
+    // If `connect` itself fails, the handshake was rejected — fine. If it
+    // completes client-side, the server must then reject + close the connection
+    // (a legitimate client's connection would stay open and deliver the initial
+    // screen).
+    if let Ok(Ok(conn)) = tokio::time::timeout(
         Duration::from_secs(10),
         transport::connect(&ep, boot.addr, "localhost"),
     )
     .await
     {
-        Ok(Ok(conn)) => {
-            // Handshake completed client-side; the server must reject + close it
-            // (a legitimate client's connection would stay open and deliver the
-            // initial screen).
-            let closed =
-                tokio::time::timeout(Duration::from_secs(8), conn.connection().closed()).await;
-            assert!(
-                closed.is_ok(),
-                "server must close (reject) an unauthenticated client's connection"
-            );
-        }
-        // connect itself failed → rejected at the handshake, also fine.
-        _ => {}
+        let closed = tokio::time::timeout(Duration::from_secs(8), conn.connection().closed()).await;
+        assert!(
+            closed.is_ok(),
+            "server must close (reject) an unauthenticated client's connection"
+        );
     }
     drop(boot);
 }
