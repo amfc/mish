@@ -2,8 +2,10 @@
 //! side-channels, reading from the shared emulator's scrollback.
 //!
 //! Runs alongside [`crate::server::run_server`]: the session loop feeds the live
-//! screen over datagrams as usual, while this task accepts side-channel streams
-//! and serves [`HistoryRequest`]s from the *same* emulator (shared via
+//! screen over datagrams as usual, while the side-channel dispatcher
+//! ([`crate::forward::serve_side_channels`]) accepts streams and routes the
+//! [`StreamHello::History`](crate::forward::StreamHello::History)-tagged ones
+//! here, serving [`HistoryRequest`]s from the *same* emulator (shared via
 //! `Arc<Mutex<…>>`). History never touches the per-frame diff — it's fetched on
 //! demand, reliably, only when the user scrolls up.
 
@@ -15,24 +17,20 @@ use mish_ssp::framing::{read_message, write_message, MAX_MESSAGE_LEN};
 use mish_terminal::emulator::Emulator;
 use mish_terminal::history::{answer_history, HistoryRequest};
 
-/// Accept side-channel streams on `transport` and answer each as a one-shot
-/// history request/response, until the connection goes away. Each request is
-/// served on its own task so a slow client can't block others.
+use crate::forward::StreamHello;
+
+/// Accept side-channel streams and serve scrollback history only (forwarding
+/// disabled). A thin wrapper over [`crate::forward::serve_side_channels`] kept
+/// for the history-only callers and tests; the binary uses the dispatcher
+/// directly so it can also enable port forwarding.
 pub async fn serve_history(transport: Arc<QuicTransport>, emu: Arc<Mutex<Emulator>>) {
-    loop {
-        let (send, recv) = match transport.accept_side_channel().await {
-            Ok(s) => s,
-            Err(_) => return, // connection closed / gone
-        };
-        let emu = emu.clone();
-        tokio::spawn(async move {
-            serve_one(send, recv, emu).await;
-        });
-    }
+    crate::forward::serve_side_channels(transport, emu, false).await;
 }
 
-/// Serve a single side-channel: read one [`HistoryRequest`], answer it, finish.
-async fn serve_one(mut send: SendStream, mut recv: RecvStream, emu: Arc<Mutex<Emulator>>) {
+/// Serve a single history side-channel: read one [`HistoryRequest`], answer it,
+/// finish. The [`StreamHello`] tag has already been consumed by the dispatcher,
+/// so the next frame is the request itself.
+pub(crate) async fn serve_one(mut send: SendStream, mut recv: RecvStream, emu: Arc<Mutex<Emulator>>) {
     let bytes = match read_message(&mut recv, MAX_MESSAGE_LEN).await {
         Ok(Some(b)) => b,
         _ => return, // empty or malformed framing
@@ -57,6 +55,9 @@ pub async fn fetch_history(
     req: &HistoryRequest,
 ) -> Option<mish_terminal::history::HistoryResponse> {
     let (mut send, mut recv) = transport.open_side_channel().await.ok()?;
+    // Tag the stream as a history request so the server's dispatcher routes it
+    // here, then send the request itself.
+    write_message(&mut send, &StreamHello::History.encode()).await.ok()?;
     write_message(&mut send, &req.encode()).await.ok()?;
     send.finish().ok()?;
     let bytes = read_message(&mut recv, MAX_MESSAGE_LEN).await.ok()??;

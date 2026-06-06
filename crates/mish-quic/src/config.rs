@@ -41,11 +41,14 @@ pub fn init_crypto() {
     });
 }
 
-/// Max concurrent inbound bidi streams a peer may open. Side-channels are
-/// short-lived request/response exchanges (one stream per in-flight request), so
-/// a small cap bounds memory while comfortably covering bursts of history
-/// fetches. Per-stream flow control bounds each stream's buffering.
-const MAX_SIDE_CHANNELS: u32 = 16;
+/// Max concurrent inbound bidi streams a peer may open. Side-channels are mostly
+/// short-lived request/response exchanges (one stream per in-flight history
+/// fetch), but **port forwarding** maps each live forwarded TCP connection to one
+/// bidi stream, so the cap doubles as the ceiling on concurrent tunneled
+/// connections. 256 comfortably covers a browser's connection fan-out while still
+/// bounding memory; per-stream flow control bounds each stream's buffering, and
+/// forwarding is opt-in (`-L`/`-R`) and server-disablable (`--no-forward`).
+const MAX_SIDE_CHANNELS: u32 = 256;
 
 /// Transport config shared by client and server: datagrams on, plus a bounded
 /// number of reliable bidi streams for side-channels (scrollback, …).

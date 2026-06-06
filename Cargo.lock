@@ -1428,6 +1428,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
  "bytes",
  "crossterm",
  "libc",
@@ -1437,6 +1438,7 @@ dependencies = [
  "portable-pty",
  "proptest",
  "russh",
+ "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",
