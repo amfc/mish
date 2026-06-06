@@ -65,18 +65,24 @@ impl Instruction {
     /// so a shared cross-message window would desync on the first loss.
     pub fn encode(&self) -> Vec<u8> {
         let raw = bincode::serialize(self).expect("Instruction serialization is infallible");
-        let deflated = deflate(&raw);
-        if deflated.len() + 1 < raw.len() {
-            let mut out = Vec::with_capacity(deflated.len() + 1);
-            out.push(DEFLATED);
-            out.extend_from_slice(&deflated);
-            out
-        } else {
-            let mut out = Vec::with_capacity(raw.len() + 1);
-            out.push(RAW);
-            out.extend_from_slice(&raw);
-            out
+        // Don't even attempt deflate on tiny payloads — keystroke diffs and empty
+        // keepalive acks (the most frequent datagrams by far) can't usefully
+        // compress past zlib's own ~6-byte overhead, so deflating them is pure CPU.
+        // Larger screen diffs (repeated SGR/CSI runs) still compress and are worth it.
+        const DEFLATE_THRESHOLD: usize = 64;
+        if raw.len() >= DEFLATE_THRESHOLD {
+            let deflated = deflate(&raw);
+            if deflated.len() + 1 < raw.len() {
+                let mut out = Vec::with_capacity(deflated.len() + 1);
+                out.push(DEFLATED);
+                out.extend_from_slice(&deflated);
+                return out;
+            }
         }
+        let mut out = Vec::with_capacity(raw.len() + 1);
+        out.push(RAW);
+        out.extend_from_slice(&raw);
+        out
     }
 
     /// Decode from a received datagram. Returns `None` on malformed input
@@ -204,6 +210,18 @@ mod tests {
                 "encoding must not expand the payload"
             );
             assert_eq!(Instruction::decode(&enc), Some(inst));
+        }
+    }
+
+    /// Tiny payloads (keystrokes, empty acks) skip deflate entirely — they encode
+    /// RAW and still round-trip. Guards the `DEFLATE_THRESHOLD` fast path.
+    #[test]
+    fn tiny_payloads_skip_deflate() {
+        for diff in [Vec::new(), b"a".to_vec(), b"echo hi\r".to_vec()] {
+            let inst = inst_with_diff(diff);
+            let enc = inst.encode();
+            assert_eq!(enc[0], RAW, "tiny payload must not be deflated");
+            assert_eq!(Instruction::decode(&enc), Some(inst), "round-trips");
         }
     }
 

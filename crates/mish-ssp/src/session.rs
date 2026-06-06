@@ -245,7 +245,9 @@ where
             }
 
             // 3. Sleep until the next protocol event, or until something happens.
-            let wait = self.core.wait_time(self.clock.now_ms());
+            // `tick` above already refreshed the timers, so read them directly
+            // rather than recomputing (`calculate_timers` clones + scans state).
+            let wait = self.core.pending_wait(self.clock.now_ms());
             let sleep = tokio::time::sleep(Duration::from_millis(wait.unwrap_or(3_600_000)));
             tokio::pin!(sleep);
 

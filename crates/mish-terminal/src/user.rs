@@ -118,6 +118,9 @@ impl SyncState for UserStream {
         }
     }
 
+    // `subtract` trims acknowledged events, so rationalization is NOT a no-op here.
+    const SUBTRACT_IS_NOOP: bool = false;
+
     fn subtract(&mut self, prev: &Self) {
         // Drop events the receiver (`prev`) is known to already hold.
         let drop_to = prev.total();

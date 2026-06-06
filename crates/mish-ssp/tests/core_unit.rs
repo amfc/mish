@@ -94,7 +94,7 @@ fn ack_advances_sender_to_synced() {
 
     // B's reply carries an ack for A's state; once A hears it, A is synced.
     // Advance time so B emits its delayed ack.
-    let mut now = 0;
+    let mut now: u64 = 0;
     for _ in 0..100 {
         now += 20;
         for inst in b.tick(now) {
@@ -119,7 +119,7 @@ fn shutdown_handshake_both_sides_close() {
     let mut b = Core::new(0);
 
     a.start_shutdown();
-    let mut now = 0;
+    let mut now: u64 = 0;
     for _ in 0..100 {
         now += 20;
         for inst in a.tick(now) {
@@ -344,4 +344,41 @@ fn congestion_pacing_can_be_disabled() {
         20,
         "no backoff when pacing is disabled"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Timer-recompute elision (pending_wait after tick == wait_time)
+// ---------------------------------------------------------------------------
+
+/// The driver reads `pending_wait` instead of recomputing timers via `wait_time`.
+/// They must agree right after a `tick`, across the protocol's distinct states:
+/// fresh, with pending data, just-sent (unacked retransmit pending), and idle.
+#[test]
+fn pending_wait_matches_wait_time_after_tick() {
+    let mut a = Core::new(0);
+    let mut now: u64 = 0;
+    let check = |a: &mut Core, now: u64, ctx: &str| {
+        a.tick(now); // leaves timers fresh
+        let pending = a.pending_wait(now);
+        let recomputed = a.wait_time(now); // recomputes calculate_timers
+        assert_eq!(
+            pending, recomputed,
+            "pending_wait diverged from wait_time: {ctx}"
+        );
+    };
+
+    check(&mut a, now, "initial");
+
+    // Pending local data not yet due to send.
+    a.set_current_state(BytesState::new(b"hello".to_vec()));
+    check(&mut a, now, "data pending");
+
+    // Advance past the send time so the next tick actually sends; afterwards the
+    // retransmit timer must be the one both agree on.
+    now += 50;
+    check(&mut a, now, "after a data send");
+
+    // Idle for a while: still must agree.
+    now += 5000;
+    check(&mut a, now, "idle");
 }

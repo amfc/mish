@@ -420,6 +420,14 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
 
     /// Drop information already known to the acked receiver state, bounding memory.
     fn rationalize_states(&mut self) {
+        // When `subtract` is a no-op (e.g. the `Screen` direction), the whole
+        // routine — a full clone of the acked state plus a `subtract` across every
+        // retained sent state — does nothing but burn CPU. Skip it. This runs on
+        // every tick, so for the high-cell-count server→client direction it's the
+        // single biggest per-frame saving.
+        if L::SUBTRACT_IS_NOOP {
+            return;
+        }
         let known = self.sent_states.front().expect("never empty").state.clone();
         self.current_state.subtract(&known);
         for s in self.sent_states.iter_mut() {
@@ -501,6 +509,24 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         self.next_wakeup(now).map(|w| w.saturating_sub(now))
     }
 
+    /// Like [`wait_time`](SspCore::wait_time) but **reads the already-computed
+    /// timers without recomputing them**. Valid only immediately after
+    /// [`tick`](SspCore::tick), which leaves the timers fresh; the driver uses it
+    /// to avoid a second full `calculate_timers` (clone + per-state scans) every
+    /// loop iteration. `now` may be a fresh clock read for an accurate sleep.
+    pub fn pending_wait(&self, now: Millis) -> Option<Millis> {
+        let next = if self.shutdown_in_progress {
+            self.next_send_time
+        } else {
+            self.next_ack_time.min(self.next_send_time)
+        };
+        if next == NEVER {
+            None
+        } else {
+            Some(next.saturating_sub(now))
+        }
+    }
+
     // ----- Sending -----
 
     /// Run the protocol's send logic. Returns instructions to put on the wire
@@ -546,6 +572,14 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             self.send_to_receiver(now, diff, &mut out);
             self.mindelay_clock = None;
         }
+        // Sending (or the empty-diff timer bookkeeping above) just changed our
+        // state, so refresh the timers now — in particular `send_to_receiver` set
+        // `next_send_time = NEVER`, and this is what re-derives the retransmit
+        // wake. Leaving them fresh lets the driver read them via `pending_wait`
+        // instead of recomputing (one fewer `calculate_timers` per loop on the
+        // common no-send path). The early `now < …` return above already has
+        // fresh timers from the top of `tick`.
+        self.calculate_timers(now);
         out
     }
 

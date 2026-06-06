@@ -28,10 +28,20 @@ pub trait SyncState: Clone {
     /// Apply a diff produced by [`SyncState::diff_from`] to `self` in place.
     fn apply_diff(&mut self, diff: &[u8]);
 
+    /// Whether [`subtract`](SyncState::subtract) does nothing for this type, so
+    /// the core can skip "rationalization" entirely (it clones the acked state and
+    /// calls `subtract` across every retained sent state each tick — pure waste
+    /// when `subtract` is a no-op). Defaults to `true` to match the default no-op
+    /// `subtract`; **any type that overrides `subtract` to do real work must set
+    /// this to `false`** or its rationalization will be silently skipped.
+    const SUBTRACT_IS_NOOP: bool = true;
+
     /// Discard from `self` any information that `prev` is already known to hold.
     ///
     /// Used to bound memory (mosh calls this "rationalization"). The default is a
-    /// no-op, which is always correct but may retain more than necessary.
+    /// no-op, which is always correct but may retain more than necessary. Types
+    /// that override this must also set [`SUBTRACT_IS_NOOP`](SyncState::SUBTRACT_IS_NOOP)
+    /// to `false`.
     fn subtract(&mut self, _prev: &Self) {}
 
     /// Protocol-level equality. Must be reflexive/symmetric/transitive and
