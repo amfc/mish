@@ -170,10 +170,12 @@ pub fn program_on_path(prog: &str) -> bool {
     false
 }
 
-/// Build the `mish-server` argument list: optional `--detach`, an optional named
-/// reattachable `--session NAME`, an ephemeral port, then an optional `-- command`.
+/// Build the `mish-server` argument list: optional `--detach`, optional
+/// `--shared` (multi-client), an optional named reattachable `--session NAME`,
+/// an ephemeral port, then an optional `-- command`.
 fn server_args(
     detach: bool,
+    shared: bool,
     session: Option<&str>,
     port: &str,
     command: Option<&str>,
@@ -181,6 +183,9 @@ fn server_args(
     let mut args = Vec::new();
     if detach {
         args.push("--detach".to_string());
+    }
+    if shared {
+        args.push("--shared".to_string());
     }
     if let Some(name) = session {
         args.push("--session".to_string());
@@ -197,13 +202,14 @@ fn server_args(
 /// Start `mish-server` locally as a child process (no SSH). Used for `--local`.
 pub async fn local(
     server_cmd: &str,
+    shared: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
     // Local mode: keep the server in the foreground as a managed child (no
     // detach — we kill it when the session ends).
     let mut child = Command::new(server_cmd)
-        .args(server_args(false, session, "0", command))
+        .args(server_args(false, shared, session, "0", command))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -233,6 +239,7 @@ pub async fn ssh(
     ssh_pty: bool,
     host: &str,
     server_cmd: &str,
+    shared: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
@@ -250,7 +257,7 @@ pub async fn ssh(
     cmd.arg(host)
         .arg("--")
         .arg(server_cmd)
-        .args(server_args(true, session, "0", command));
+        .args(server_args(true, shared, session, "0", command));
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -301,6 +308,7 @@ pub async fn builtin(
     host: &str,
     port: Option<u16>,
     server_cmd: &str,
+    shared: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
@@ -345,7 +353,7 @@ pub async fn builtin(
     // (`--detach` so the server survives this connection closing); each is
     // shell-quoted because sshd runs the whole string through the login shell.
     let argv = std::iter::once(server_cmd.to_string())
-        .chain(server_args(true, session, "0", command))
+        .chain(server_args(true, shared, session, "0", command))
         .map(|a| shell_quote(&a))
         .collect::<Vec<_>>()
         .join(" ");

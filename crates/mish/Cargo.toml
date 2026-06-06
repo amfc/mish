@@ -7,6 +7,15 @@ authors.workspace = true
 description = "mish client and server binaries: a roaming, low-latency remote shell over QUIC."
 default-run = "mish-server"
 
+[features]
+default = ["multi-client"]
+# Shared multi-client sessions: `mish-server --shared` lets several clients
+# attach to one session at once (one read-write owner + read-only viewers,
+# NEXT_FEATURES.md #3). Off → the `--shared` flag is rejected and the server
+# only ever serves a single client at a time. Opt out for a minimal,
+# single-client-only build (`--no-default-features`).
+multi-client = []
+
 [dependencies]
 mish-ssp = { path = "../mish-ssp" }
 mish-quic = { path = "../mish-quic" }

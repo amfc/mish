@@ -9,13 +9,16 @@
 //! so the fork happens in a single-threaded process. The child then builds the
 //! runtime and constructs the Quinn endpoint from the inherited socket.
 //!
-//! Usage: `mish-server [--detach] [--persist] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [bind-port] [-- command]`
+//! Usage: `mish-server [--detach] [--persist] [--shared] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [bind-port] [-- command]`
 //!
 //! With no `-- command`, the user's `$SHELL` is started as a **login shell**
 //! (`-l`). `-4`/`-6` select the bind address family (default IPv4 `0.0.0.0`).
 //! With `--persist` the PTY + terminal state survive client disconnects and the
 //! server accepts **reattach** connections (until the shell exits or no client
-//! reattaches within `MISH_SERVER_REATTACH_TMOUT`).
+//! reattaches within `MISH_SERVER_REATTACH_TMOUT`). With `--shared` (a build-time
+//! `multi-client` feature, on by default) several clients may attach at once — one
+//! read-write owner + read-only viewers (NEXT_FEATURES.md #3); it implies
+//! `--persist`.
 //!
 //! Env: `MOSH_SERVER_NETWORK_TMOUT` (mid-session idle, default 300s),
 //! `MOSH_SERVER_SIGNAL_TMOUT` (wait for the first connection, default 60s),
@@ -41,6 +44,11 @@ struct Options {
     /// Keep the session alive across client disconnects and accept reattaches
     /// (`--persist`), instead of exiting when the client leaves.
     persist: bool,
+    /// Shared multi-client session (`--shared`): accept several concurrent
+    /// clients — one read-write owner + read-only viewers (NEXT_FEATURES.md #3).
+    /// Implies a persistent session. Always `false` without the `multi-client`
+    /// build feature.
+    shared: bool,
     /// Named, reattachable session (`--session NAME`): on start, reattach to an
     /// existing live session of this name (reprint its connect line and exit),
     /// else register a new one. Implies `--persist`.
@@ -59,6 +67,7 @@ fn parse_args() -> Result<Options> {
         locale: Vec::new(),
         bind_ip: "0.0.0.0".to_string(),
         persist: false,
+        shared: false,
         session: None,
         command: None,
         log_file: None,
@@ -69,6 +78,15 @@ fn parse_args() -> Result<Options> {
         match arg.as_str() {
             "--detach" => opts.detach = true,
             "--persist" => opts.persist = true,
+            "--shared" => {
+                #[cfg(feature = "multi-client")]
+                {
+                    opts.shared = true;
+                    opts.persist = true; // a shared session must persist
+                }
+                #[cfg(not(feature = "multi-client"))]
+                bail!("--shared requires building mish with the `multi-client` feature");
+            }
             "--session" => {
                 opts.session = Some(args.next().context("--session needs a NAME")?);
                 opts.persist = true; // a reattachable session must persist
@@ -243,7 +261,13 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    let result = runtime.block_on(serve(socket, server_config, opts.command, opts.persist));
+    let result = runtime.block_on(serve(
+        socket,
+        server_config,
+        opts.command,
+        opts.persist,
+        opts.shared,
+    ));
 
     // Deregister on a clean exit (shell quit / reattach window elapsed). A daemon
     // killed abruptly leaves a stale entry, which `find_live` reaps on next lookup.
@@ -258,6 +282,7 @@ async fn serve(
     server_config: mish_quic::ServerConfig,
     command: Option<String>,
     persist: bool,
+    shared: bool,
 ) -> Result<()> {
     let (cols, rows) = (80u16, 24u16);
 
@@ -289,6 +314,13 @@ async fn serve(
     let network_timeout = Some(env_secs("MOSH_SERVER_NETWORK_TMOUT", 300));
     // Shared emulator: the session loop feeds it; the scrollback server reads it.
     let emu = mish_terminal::emulator::Emulator::shared(cols, rows);
+
+    #[cfg(feature = "multi-client")]
+    if shared {
+        return serve_shared(endpoint, t, emu, clock, network_timeout, pty).await;
+    }
+    #[cfg(not(feature = "multi-client"))]
+    let _ = shared;
 
     if persist {
         return serve_persistent(endpoint, t, emu, clock, network_timeout, pty).await;
@@ -407,6 +439,118 @@ async fn serve_persistent(
             }
         }
     }
+}
+
+/// Shared mode (`--shared`): keep the PTY + emulator alive and accept **several
+/// concurrent clients** — one read-write owner + read-only viewers
+/// (NEXT_FEATURES.md #3). Each connection runs its own [`attach`] over the shared
+/// [`PersistentSession`]; the first to claim the (single) writer slot is the
+/// owner and the rest are viewers. Unlike [`serve_persistent`] a newcomer *joins*
+/// rather than preempting. The session ends when the shell exits or no client is
+/// attached for `MISH_SERVER_REATTACH_TMOUT`.
+///
+/// [`attach`]: mish::persist::PersistentSession::attach
+/// [`PersistentSession`]: mish::persist::PersistentSession
+#[cfg(feature = "multi-client")]
+async fn serve_shared(
+    endpoint: mish_quic::Endpoint,
+    first: mish_quic::transport::QuicTransport,
+    emu: std::sync::Arc<std::sync::Mutex<mish_terminal::emulator::Emulator>>,
+    clock: Arc<SystemClock>,
+    network_timeout: Option<Duration>,
+    pty: PtyProcess,
+) -> Result<()> {
+    use mish::persist::{AttachEnd, PersistentSession};
+    use std::sync::atomic::AtomicBool;
+    use tokio::task::JoinSet;
+
+    let session = Arc::new(PersistentSession::spawn(
+        emu.clone(),
+        clock,
+        pty.output,
+        pty.control,
+    ));
+    let reattach_timeout = env_secs("MISH_SERVER_REATTACH_TMOUT", 86_400);
+    // The single read-write slot: the first attachment to claim it owns the
+    // session; everyone else watches read-only until it's released.
+    let has_owner = Arc::new(AtomicBool::new(false));
+    let mut tasks: JoinSet<AttachEnd> = JoinSet::new();
+
+    let role = spawn_attachment(&session, &emu, &has_owner, network_timeout, first, &mut tasks);
+    eprintln!("client attached as {role:?} (shared session)");
+
+    loop {
+        tokio::select! {
+            // A new client joins the shared session (owner if the writer slot is
+            // free, else a read-only viewer).
+            incoming = mish_quic::transport::accept(&endpoint) => {
+                let conn = incoming.context("accepting a shared-session client")?;
+                let remote = conn.remote_address();
+                let role =
+                    spawn_attachment(&session, &emu, &has_owner, network_timeout, conn, &mut tasks);
+                eprintln!("client attached from {remote} as {role:?}");
+                tracing::info!(target: "mish::server", %remote, ?role, "shared-session client attached");
+            }
+            // An attachment finished. ChildExited ends the whole session; a
+            // Disconnected / idle just drops that one client (the writer slot, if
+            // it held it, was already released by the task).
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Ok(AttachEnd::ChildExited)) = joined {
+                    eprintln!("session ended (shell exited)");
+                    return Ok(());
+                }
+            }
+            // No clients attached: end the session unless one (re)attaches within
+            // the window.
+            _ = tokio::time::sleep(reattach_timeout), if tasks.is_empty() => {
+                eprintln!("no clients within the reattach window; ending shared session");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Spawn one shared-session attachment task and return the role it took. Claims
+/// the writer slot ([`Role::Owner`]) if free, else attaches read-only
+/// ([`Role::Viewer`]); the task releases the slot when an owner leaves. Each
+/// attachment carries its own scrollback side-channel.
+///
+/// [`Role::Owner`]: mish::persist::Role::Owner
+/// [`Role::Viewer`]: mish::persist::Role::Viewer
+#[cfg(feature = "multi-client")]
+fn spawn_attachment(
+    session: &Arc<mish::persist::PersistentSession>,
+    emu: &std::sync::Arc<std::sync::Mutex<mish_terminal::emulator::Emulator>>,
+    has_owner: &Arc<std::sync::atomic::AtomicBool>,
+    network_timeout: Option<Duration>,
+    conn: mish_quic::transport::QuicTransport,
+    tasks: &mut tokio::task::JoinSet<mish::persist::AttachEnd>,
+) -> mish::persist::Role {
+    use mish::persist::Role;
+    use std::sync::atomic::Ordering;
+
+    let transport = Arc::new(conn);
+    let is_owner = has_owner
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    let role = if is_owner { Role::Owner } else { Role::Viewer };
+
+    let session = session.clone();
+    let emu = emu.clone();
+    let has_owner = has_owner.clone();
+    tasks.spawn(async move {
+        let hist = tokio::spawn(mish::scrollback::serve_history(transport.clone(), emu));
+        let end = session
+            .attach(transport, network_timeout, std::future::pending::<()>(), role)
+            .await;
+        hist.abort();
+        // Free the writer slot so a later client can become owner.
+        if matches!(role, Role::Owner) {
+            has_owner.store(false, Ordering::Release);
+        }
+        end
+    });
+    role
 }
 
 fn env_secs(var: &str, default: u64) -> Duration {
