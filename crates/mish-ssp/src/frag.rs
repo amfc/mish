@@ -17,6 +17,12 @@ use bytes::Bytes;
 /// Bytes of per-fragment header: `id: u32 | count: u16 | index: u16` (LE).
 pub const FRAGMENT_HEADER: usize = 8;
 
+/// Cap on total bytes held across all in-progress reassemblies. `count` is
+/// peer-controlled, so without this a hostile peer could pin large memory by
+/// opening many never-completed reassemblies; the oldest are dropped to stay
+/// under it (SSP resends). Generous next to a real in-flight instruction.
+const MAX_REASSEMBLY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Splits encoded instructions into datagram-sized fragments.
 #[derive(Default)]
 pub struct Fragmenter {
@@ -86,6 +92,22 @@ impl Defragmenter {
         Self::default()
     }
 
+    /// Test/fuzz support: an estimate of the bytes currently held across all
+    /// in-progress reassemblies — the pre-allocated chunk-slot vectors (sized from
+    /// the peer-supplied `count`) plus the buffered fragment bodies. The
+    /// `frag_memory_bounds` fuzz target asserts a hostile peer can't drive this
+    /// unbounded.
+    #[doc(hidden)]
+    pub fn buffered_bytes(&self) -> usize {
+        self.in_progress
+            .values()
+            .map(|p| {
+                p.chunks.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
+                    + p.chunks.iter().flatten().map(Vec::len).sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Feed one received datagram. Returns the full payload once the last
     /// missing fragment of some instruction arrives; otherwise `None`.
     /// Malformed datagrams are ignored (treated as drops).
@@ -132,12 +154,18 @@ impl Defragmenter {
             return Some(payload);
         }
 
-        // Bound memory: if too many half-finished instructions pile up, drop the
-        // oldest (lowest id) — SSP will resend whatever we discard.
-        if self.in_progress.len() > self.max_in_progress {
-            if let Some(&oldest) = self.in_progress.keys().min() {
-                self.in_progress.remove(&oldest);
-            }
+        // Bound memory: drop the oldest (lowest id) half-finished instructions
+        // until we're under *both* caps — SSP resends whatever we discard. The
+        // byte cap matters because `count` is peer-controlled (up to 65535), so a
+        // hostile peer could open many ids each pre-allocating a huge chunk table;
+        // capping only the entry count leaves total memory unbounded.
+        while self.in_progress.len() > self.max_in_progress
+            || self.buffered_bytes() > MAX_REASSEMBLY_BYTES
+        {
+            let Some(&oldest) = self.in_progress.keys().min() else {
+                break;
+            };
+            self.in_progress.remove(&oldest);
         }
         None
     }
@@ -146,6 +174,28 @@ impl Defragmenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security regression (`frag_memory_bounds` target): a hostile peer opens many
+    /// reassemblies, each declaring the max fragment `count` (so a huge chunk table
+    /// is pre-allocated) with a single tiny body, and never completes them. Total
+    /// buffered memory must stay bounded, not grow to ~count×entries.
+    #[test]
+    fn reassembly_memory_is_bounded_against_hostile_count() {
+        let mut d = Defragmenter::new();
+        for id in 0..500u32 {
+            let mut dg = Vec::new();
+            dg.extend_from_slice(&id.to_le_bytes()); // id
+            dg.extend_from_slice(&u16::MAX.to_le_bytes()); // count = 65535
+            dg.extend_from_slice(&0u16.to_le_bytes()); // index 0
+            dg.push(0xab); // 1-byte body
+            d.push(&dg);
+        }
+        assert!(
+            d.buffered_bytes() <= 16 * 1024 * 1024,
+            "reassembler held {} bytes against a hostile peer",
+            d.buffered_bytes()
+        );
+    }
 
     #[test]
     fn single_fragment_roundtrip() {
