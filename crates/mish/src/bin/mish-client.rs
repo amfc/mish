@@ -95,9 +95,11 @@ struct Options {
     /// The ssh command, shell-split (e.g. `["ssh", "-p", "2222"]`). Used by the
     /// `ssh` bootstrap transport.
     ssh_argv: Vec<String>,
-    /// SSH port for the builtin bootstrap transport (`--ssh-port`, default 22).
-    /// The system `ssh` transport takes its port from `--ssh "ssh -p N"` instead.
-    ssh_port: u16,
+    /// SSH port for the builtin bootstrap transport (`--ssh-port`). `None` means
+    /// "unset" — let `~/.ssh/config` (`Port`) decide, falling back to 22. An
+    /// explicit value wins over the config. The system `ssh` transport takes its
+    /// port from `--ssh "ssh -p N"` instead.
+    ssh_port: Option<u16>,
     /// Allocate a remote PTY (`ssh -tt`); cleared by `--no-ssh-pty`. Applies to
     /// the `ssh` transport only.
     ssh_pty: bool,
@@ -144,7 +146,7 @@ fn parse_args() -> Result<Options> {
         local: false,
         bootstrap: BootstrapMode::default(),
         ssh_argv: vec!["ssh".into()],
-        ssh_port: 22,
+        ssh_port: None,
         ssh_pty: true,
         server_cmd: None,
         // Default adaptive, overridable by env then by an explicit flag (mosh's
@@ -181,11 +183,12 @@ fn parse_args() -> Result<Options> {
                 }
             }
             "--ssh-port" => {
-                opts.ssh_port = args
-                    .next()
-                    .context("--ssh-port needs a number")?
-                    .parse()
-                    .context("--ssh-port must be a number")?;
+                opts.ssh_port = Some(
+                    args.next()
+                        .context("--ssh-port needs a number")?
+                        .parse()
+                        .context("--ssh-port must be a number")?,
+                );
             }
             "--no-ssh-pty" => opts.ssh_pty = false,
             "--server" => opts.server_cmd = Some(args.next().context("--server needs a value")?),
@@ -306,7 +309,7 @@ async fn main() -> Result<()> {
         // Pick the SSH transport: the system `ssh` binary, or the builtin russh
         // client. In `auto` mode we use `ssh` when it is on PATH, else builtin.
         if opts.bootstrap.use_builtin(&opts.ssh_argv[0]) {
-            eprintln!("[mish-client] builtin ssh → {host}:{} {server}…", opts.ssh_port);
+            eprintln!("[mish-client] builtin ssh → {host} {server}…");
             bootstrap::builtin(
                 &host,
                 opts.ssh_port,

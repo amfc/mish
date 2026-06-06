@@ -194,19 +194,25 @@ All lower-value polish — no correctness or security stakes remain. Ranked:
    advertise.*
    - **Builtin (russh) bootstrap** (`--bootstrap=builtin`) is tested at four
      levels: (a) **unit** — `BootstrapMode` parsing, `program_on_path`,
-     `split_user_host`, `shell_quote`; (b) **security** — host-key verdicts
-     (`classify_host_key`) against a temp `known_hosts` with real ed25519 keys
-     proving a *changed* key is rejected and an unknown one is TOFU, `shell_quote`
-     injection-resistance through a real `/bin/sh`, and the memory-**bounded**
-     `MISH CONNECT` scanner (`scan_connect`); (c) **fuzz** — a proptest
-     (`fuzz_parse_never_panics`, `scan_connect_stays_bounded`,
-     `shell_quote_round_trips_through_split`) plus the coverage-guided
-     `bootstrap_parse` libFuzzer target; (d) **e2e** —
+     `split_user_host`, `shell_quote`; `~/.ssh/config` resolution + precedence
+     (`resolve_from`), ProxyJump spec/chain parsing (`parse_jump_spec`,
+     `split_proxy_jump`), `~` expansion, and **passphrase-protected key**
+     decryption (`load_secret_key`/`load_identity` over an encrypted ed25519
+     fixture: needs-passphrase signalled, right/wrong passphrase, non-interactive
+     skip); (b) **security** — host-key verdicts (`classify_host_key`) against a
+     temp `known_hosts` with real ed25519 keys proving a *changed* key is rejected
+     and an unknown one is TOFU, `shell_quote` injection-resistance through a real
+     `/bin/sh`, and the memory-**bounded** `MISH CONNECT` scanner (`scan_connect`);
+     (c) **fuzz** — a proptest (`fuzz_parse_never_panics`,
+     `scan_connect_stays_bounded`, `shell_quote_round_trips_through_split`) plus
+     the coverage-guided `bootstrap_parse` libFuzzer target; (d) **e2e** —
      [`scripts/test-builtin-bootstrap.sh`](scripts/test-builtin-bootstrap.sh)
-     runs the real client over both the builtin and system-ssh transports against
-     a live sshd (provisioning a throwaway key/agent, cleaned up), asserting a
-     command's output traverses the session, that `auto` falls back to builtin
-     when `ssh` is absent, and that an unknown user is rejected.
+     runs the real client against a live sshd (throwaway key/agent, cleaned up):
+     builtin + system-ssh transports both carry a command, `auto` falls back to
+     builtin when `ssh` is absent, an unknown user is rejected, a `~/.ssh/config`
+     alias resolves, and a **ProxyJump** tunnel (localhost as its own jump) works.
+     The passphrase-prompt path is additionally verified end-to-end against the
+     live sshd with an encrypted IdentityFile and no agent.
 3. **`#38`** — *done.* PTY `IUTF8` flag set via the master fd
    (`pty::enable_iutf8`, `iutf8_set_via_master_reaches_slave`); three-leg
    shutdown handshake confirmed loss-tolerant

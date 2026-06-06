@@ -23,8 +23,18 @@ crossterm = "0.29"
 anyhow = "1"
 # Built-in, pure-Rust SSH client for the `--bootstrap=built-in` transport (no
 # external `ssh` needed; the path toward a Windows mish). `ring` backend to
-# match the rest of the workspace and stay off aws-lc-rs's C toolchain.
+# match the rest of the workspace and stay off aws-lc-rs's C toolchain. The
+# default ssh-key `encryption` feature (passphrase-protected OpenSSH keys) is
+# already pinned by russh, so no extra feature is needed for that.
 russh = { version = "0.61", default-features = false, features = ["ring", "flate2", "rsa"] }
+# Pure-Rust ~/.ssh/config parser (Host/HostName/Port/User/IdentityFile/ProxyJump,
+# wildcards) for the builtin bootstrap, from the russh project. (ssh2-config is
+# more featureful but drags in a `git2` build-dep → libgit2/openssl/libssh2 C
+# libraries, which would break the no-C Windows goal.)
+russh-config = "0.58"
+# No-echo passphrase/password prompt for the builtin bootstrap; unix + windows,
+# no C libraries (libc / windows-sys FFI only).
+rpassword = "7.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

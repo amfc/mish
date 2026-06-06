@@ -130,6 +130,35 @@ check "builtin rejects an unknown user" 1 \
   python3 "$TMP/drive.py" "$CLIENT" --bootstrap=builtin --ssh-port "$PORT" \
     --predict never --server "$SERVER" "nosuchuser_xyz_$$@$HOST"
 
+# A temp ssh_config (via $MISH_SSH_CONFIG) exercising config resolution and
+# ProxyJump. `viajump` tunnels through 127.0.0.1 to reach 127.0.0.1 (localhost as
+# its own jump host) — enough to drive the whole ProxyJump code path.
+cat > "$TMP/ssh_config" <<EOF
+Host mishtarget
+    HostName $HOST
+    User $(whoami)
+    Port $PORT
+Host viajump
+    HostName $HOST
+    User $(whoami)
+    Port $PORT
+    ProxyJump $(whoami)@$HOST:$PORT
+EOF
+
+# 5. ~/.ssh/config resolution: connect by alias (HostName/User/Port from config).
+check "config alias resolves (HostName/User/Port)" 0 \
+  env MISH_SSH_CONFIG="$TMP/ssh_config" python3 "$TMP/drive.py" "$CLIENT" \
+    --bootstrap=builtin --predict never --server "$SERVER" "mishtarget"
+
+# 6. ProxyJump: bootstrap tunnels through the jump host, then runs the command.
+check "ProxyJump tunnel carries command output" 0 \
+  env MISH_SSH_CONFIG="$TMP/ssh_config" python3 "$TMP/drive.py" "$CLIENT" \
+    --bootstrap=builtin --predict never --server "$SERVER" "viajump"
+
+# Note: passphrase-protected keys, password, and keyboard-interactive auth are
+# interactive (TTY prompts) and covered by the unit tests + code; they aren't
+# scripted here.
+
 echo
 echo "==> $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

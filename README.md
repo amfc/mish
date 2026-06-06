@@ -93,9 +93,13 @@ way:
 - `--bootstrap=ssh` — shell out to the system `ssh` binary, exactly like upstream
   mosh (full ssh-config / agent / proxy support; pass extra flags via `--ssh`).
 - `--bootstrap=builtin` — a builtin, pure-Rust SSH client ([`russh`]) that needs
-  no external `ssh`. It authenticates via the ssh-agent or your default
-  `~/.ssh/id_{ed25519,ecdsa,rsa}` keys, checks the host key against
-  `~/.ssh/known_hosts`, and takes the SSH port from `--ssh-port` (default 22).
+  no external `ssh` (and no C libraries — important for the Windows goal). It
+  reads **`~/.ssh/config`** (`HostName`/`Port`/`User`/`IdentityFile`/`ProxyJump`;
+  `$MISH_SSH_CONFIG` overrides the path), authenticates via the **ssh-agent →
+  identity files (prompting for a key passphrase) → keyboard-interactive →
+  password**, tunnels through any **ProxyJump** hosts, checks the host key against
+  `~/.ssh/known_hosts`, and takes the SSH port from `--ssh-port` (or the config,
+  default 22).
 - `--bootstrap=auto` (the default) — use the system `ssh` if it's on `PATH`, else
   fall back to the builtin client.
 

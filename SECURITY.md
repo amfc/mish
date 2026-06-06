@@ -17,8 +17,12 @@ boundary is explicit.
     accepted trust-on-first-use (logged, not persisted). So the bootstrap channel
     is confidential and integrity-protected against a passive attacker, but a
     first-contact active MITM on an unknown host is not caught; `--bootstrap=ssh`
-    is the stricter choice when that matters. Auth uses the ssh-agent or
-    unencrypted on-disk keys only (see [`FUTURE_WORK.md`](FUTURE_WORK.md)).
+    is the stricter choice when that matters. Auth supports the ssh-agent,
+    identity files (incl. **passphrase-protected** keys, prompted on the TTY),
+    keyboard-interactive, and password — the latter two prompt for and send a
+    secret, but only over this confidential, host-verified channel. `ProxyJump`
+    tunnels the SSH bootstrap through jump hosts (each host-key-verified the same
+    way). See [`FUTURE_WORK.md`](FUTURE_WORK.md) for remaining gaps.
 
 [`russh`]: https://crates.io/crates/russh
 - The **UDP/QUIC path** is hostile: an attacker can observe, drop, duplicate,
