@@ -32,6 +32,8 @@
 //!   --predict <mode>   adaptive|always|never|experimental (default: adaptive);
 //!     -a/-n            also via MOSH_PREDICTION_DISPLAY; -a=always, -n=never
 //!   --no-init          don't enter the alternate screen (MOSH_NO_TERM_INIT)
+//!   -L [bind:]port:host:hostport  forward a local port to a remote target (ssh -L)
+//!   -R [bind:]port:host:hostport  forward a remote port to a local target (ssh -R)
 //!   --version          print version and exit
 //! ```
 
@@ -116,6 +118,12 @@ struct Options {
     /// (the hex `<server-cert> <client-cert> <client-key>` from its MISH CONNECT
     /// line). Mirrors `mosh-client IP PORT` + `$MOSH_KEY`; used by test harnesses.
     attach: Option<(String, u16)>,
+    /// `-L [bind:]port:host:hostport` local forwards: listen locally, the server
+    /// dials the target. Repeatable.
+    local_forwards: Vec<mish::forward::ForwardSpec>,
+    /// `-R [bind:]port:host:hostport` remote forwards: the server listens, the
+    /// client dials the target. Repeatable.
+    remote_forwards: Vec<mish::forward::ForwardSpec>,
     host: Option<String>,
     command: Option<String>,
     /// Write a JSON event log here (`--log-file`); `None` disables logging.
@@ -156,6 +164,8 @@ fn parse_args() -> Result<Options> {
         no_init: std::env::var_os("MOSH_NO_TERM_INIT").is_some(),
         session: None,
         attach: None,
+        local_forwards: Vec::new(),
+        remote_forwards: Vec::new(),
         host: None,
         command: None,
         log_file: None,
@@ -196,6 +206,27 @@ fn parse_args() -> Result<Options> {
             "-a" | "--predict-always" => opts.predict = PredictMode::Always,
             "-n" | "--predict-never" => opts.predict = PredictMode::Never,
             "--no-init" => opts.no_init = true,
+            // Port forwarding, ssh-style: `-L [bind:]port:host:hostport` (local
+            // listen, server dials) and `-R …` (server listen, client dials).
+            // Accept both the separate (`-L spec`) and glued (`-Lspec`) forms.
+            "-L" => {
+                let spec = args.next().context("-L needs [bind:]port:host:hostport")?;
+                opts.local_forwards
+                    .push(mish::forward::ForwardSpec::parse(&spec, "127.0.0.1").map_err(anyhow::Error::msg)?);
+            }
+            "-R" => {
+                let spec = args.next().context("-R needs [bind:]port:host:hostport")?;
+                opts.remote_forwards
+                    .push(mish::forward::ForwardSpec::parse(&spec, "127.0.0.1").map_err(anyhow::Error::msg)?);
+            }
+            s if s.starts_with("-L") => {
+                opts.local_forwards
+                    .push(mish::forward::ForwardSpec::parse(&s[2..], "127.0.0.1").map_err(anyhow::Error::msg)?);
+            }
+            s if s.starts_with("-R") => {
+                opts.remote_forwards
+                    .push(mish::forward::ForwardSpec::parse(&s[2..], "127.0.0.1").map_err(anyhow::Error::msg)?);
+            }
             "--session" => opts.session = Some(args.next().context("--session needs a NAME")?),
             "--attach" => {
                 let ip = args.next().context("--attach needs IP PORT")?;
@@ -251,6 +282,8 @@ fn print_usage() {
          \x20 --predict <mode>     adaptive|always|never|experimental (default: adaptive)\n\
          \x20 -a, --predict-always always echo locally; -n, --predict-never  disable\n\
          \x20 --no-init            don't enter the alternate screen (MOSH_NO_TERM_INIT)\n\
+         \x20 -L [bind:]port:host:hostport  forward a local port to host:hostport (repeatable)\n\
+         \x20 -R [bind:]port:host:hostport  forward a remote port to host:hostport (repeatable)\n\
          \x20 --session <name>     reattachable persistent session (never lose your shell)\n\
          \x20 --attach IP PORT     attach to a running server ($MISH_CONNECT creds; for testing)\n\
          \x20 --log-file <path>    write a JSON event log (for debugging)\n\
@@ -289,7 +322,15 @@ async fn main() -> Result<()> {
     // credentials from $MISH_CONNECT, no bootstrap. (Used by test harnesses;
     // mirrors `mosh-client IP PORT` + $MOSH_KEY.)
     if let Some((ip, port)) = opts.attach.clone() {
-        attach_session(&ip, port, opts.predict, opts.no_init).await?;
+        attach_session(
+            &ip,
+            port,
+            opts.predict,
+            opts.no_init,
+            opts.local_forwards,
+            opts.remote_forwards,
+        )
+        .await?;
         exit_now();
     }
 
@@ -346,8 +387,15 @@ async fn main() -> Result<()> {
         .context("connecting to server")?;
     tracing::info!(target: "mish::client", addr = %boot.addr, "connected to server");
 
-    // 3. Drive the local terminal.
-    run_terminal(t, opts.predict, opts.no_init).await;
+    // 3. Drive the local terminal (with any -L/-R forwards over the same conn).
+    run_terminal(
+        t,
+        opts.predict,
+        opts.no_init,
+        opts.local_forwards,
+        opts.remote_forwards,
+    )
+    .await;
     tracing::info!(target: "mish::client", "client session ended; tearing down");
 
     // Dropping `boot` tears down the server / ssh channel.
@@ -373,7 +421,14 @@ fn exit_now() -> ! {
 
 /// Attach directly to a running server at `ip:port`, with the credential triple
 /// (hex `server-cert client-cert client-key`) in `$MISH_CONNECT`. No bootstrap.
-async fn attach_session(ip: &str, port: u16, predict: PredictMode, no_init: bool) -> Result<()> {
+async fn attach_session(
+    ip: &str,
+    port: u16,
+    predict: PredictMode,
+    no_init: bool,
+    local_forwards: Vec<mish::forward::ForwardSpec>,
+    remote_forwards: Vec<mish::forward::ForwardSpec>,
+) -> Result<()> {
     let creds = std::env::var("MISH_CONNECT").context(
         "--attach requires $MISH_CONNECT = hex `<server-cert> <client-cert> <client-key>`",
     )?;
@@ -400,12 +455,18 @@ async fn attach_session(ip: &str, port: u16, predict: PredictMode, no_init: bool
     let t = transport::connect(&endpoint, addr, "localhost")
         .await
         .context("connecting to server")?;
-    run_terminal(t, predict, no_init).await;
+    run_terminal(t, predict, no_init, local_forwards, remote_forwards).await;
     Ok(())
 }
 
 /// Put the TTY in raw mode and run the client session until detach or close.
-async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init: bool) {
+async fn run_terminal(
+    t: transport::QuicTransport,
+    predict: PredictMode,
+    no_init: bool,
+    local_forwards: Vec<mish::forward::ForwardSpec>,
+    remote_forwards: Vec<mish::forward::ForwardSpec>,
+) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
     if crossterm::terminal::enable_raw_mode().is_err() {
@@ -621,6 +682,12 @@ async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init
     let history: Arc<dyn mish::client::HistoryFetcher> =
         Arc::new(QuicHistory(transport.clone()));
 
+    // Port forwarding (`-L`/`-R`): set up before the session runs, sharing the
+    // same authenticated connection. These run as independent tasks; the held
+    // `_remote_forwards` keep the server's `-R` listeners alive for the session.
+    setup_local_forwards(&transport, local_forwards).await;
+    let _remote_forwards = setup_remote_forwards(&transport, remote_forwards).await;
+
     // Run until the session ends or the user detaches (Ctrl-] → ClientInput::
     // Detach, which triggers a clean shutdown handshake inside run_client).
     // Predictive echo mode comes from --predict / MOSH_PREDICTION_DISPLAY.
@@ -638,6 +705,62 @@ async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init
 
     drop(_guard);
     writer.abort();
+}
+
+/// Bind each `-L` local forward and start its accept loop. A bind failure (port
+/// in use, etc.) is reported but doesn't abort the session — the rest of the
+/// forwards and the shell still come up.
+async fn setup_local_forwards(
+    transport: &Arc<transport::QuicTransport>,
+    specs: Vec<mish::forward::ForwardSpec>,
+) {
+    for spec in specs {
+        let desc = format!(
+            "{}:{} -> {}:{}",
+            spec.bind_host, spec.bind_port, spec.target_host, spec.target_port
+        );
+        match mish::forward::run_local_forward(transport.clone(), spec).await {
+            Ok(addr) => eprintln!("[mish-client] -L listening on {addr} (forwarding to {desc})"),
+            Err(e) => eprintln!("[mish-client] -L {desc} failed: {e}"),
+        }
+    }
+}
+
+/// Request each `-R` remote forward from the server and, if any succeed, start
+/// the accept loop that dials the client-local targets. Returns the live forward
+/// handles, which must be kept alive for the forwards to persist.
+async fn setup_remote_forwards(
+    transport: &Arc<transport::QuicTransport>,
+    specs: Vec<mish::forward::ForwardSpec>,
+) -> Vec<mish::forward::RemoteForward> {
+    if specs.is_empty() {
+        return Vec::new();
+    }
+    // The accept loop only ever dials targets the user configured here.
+    let targets = mish::forward::remote_targets(&specs);
+    let mut handles = Vec::new();
+    for spec in &specs {
+        match mish::forward::request_remote_forward(transport, spec).await {
+            Ok(rf) => {
+                eprintln!(
+                    "[mish-client] -R remote {}:{} -> {}:{}",
+                    spec.bind_host, rf.bound_port, spec.target_host, spec.target_port
+                );
+                handles.push(rf);
+            }
+            Err(e) => eprintln!(
+                "[mish-client] -R {}:{} -> {}:{} failed: {e}",
+                spec.bind_host, spec.bind_port, spec.target_host, spec.target_port
+            ),
+        }
+    }
+    if !handles.is_empty() {
+        tokio::spawn(mish::forward::serve_forwarded_connections(
+            transport.clone(),
+            targets,
+        ));
+    }
+    handles
 }
 
 /// Scrollback history fetcher backed by the session's QUIC connection: each

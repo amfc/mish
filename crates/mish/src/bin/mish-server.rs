@@ -9,7 +9,10 @@
 //! so the fork happens in a single-threaded process. The child then builds the
 //! runtime and constructs the Quinn endpoint from the inherited socket.
 //!
-//! Usage: `mish-server [--detach] [--persist] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [bind-port] [-- command]`
+//! Usage: `mish-server [--detach] [--persist] [--no-forward] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [bind-port] [-- command]`
+//!
+//! `--no-forward` hard-disables `ssh -L`/`-R`-style port forwarding (otherwise
+//! the SSH-authenticated client may request forwards; see `docs/port-forwarding.md`).
 //!
 //! With no `-- command`, the user's `$SHELL` is started as a **login shell**
 //! (`-l`). `-4`/`-6` select the bind address family (default IPv4 `0.0.0.0`).
@@ -46,6 +49,11 @@ struct Options {
     /// else register a new one. Implies `--persist`.
     session: Option<String>,
     command: Option<String>,
+    /// Whether to honor client port-forwarding requests (`-L`/`-R`). On by
+    /// default — the connecting peer is the SSH-authenticated owner — and
+    /// hard-disabled with `--no-forward`. Forwards are still only created when
+    /// the client explicitly requests them.
+    forward: bool,
     /// Write a JSON event log here (`--log-file`); `None` disables logging.
     log_file: Option<std::path::PathBuf>,
     /// Max verbosity for the event log (`--log-level`, default debug).
@@ -61,6 +69,7 @@ fn parse_args() -> Result<Options> {
         persist: false,
         session: None,
         command: None,
+        forward: true,
         log_file: None,
         log_level: tracing::Level::DEBUG,
     };
@@ -69,6 +78,7 @@ fn parse_args() -> Result<Options> {
         match arg.as_str() {
             "--detach" => opts.detach = true,
             "--persist" => opts.persist = true,
+            "--no-forward" => opts.forward = false,
             "--session" => {
                 opts.session = Some(args.next().context("--session needs a NAME")?);
                 opts.persist = true; // a reattachable session must persist
@@ -243,7 +253,13 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    let result = runtime.block_on(serve(socket, server_config, opts.command, opts.persist));
+    let result = runtime.block_on(serve(
+        socket,
+        server_config,
+        opts.command,
+        opts.persist,
+        opts.forward,
+    ));
 
     // Deregister on a clean exit (shell quit / reattach window elapsed). A daemon
     // killed abruptly leaves a stale entry, which `find_live` reaps on next lookup.
@@ -258,6 +274,7 @@ async fn serve(
     server_config: mish_quic::ServerConfig,
     command: Option<String>,
     persist: bool,
+    forward: bool,
 ) -> Result<()> {
     let (cols, rows) = (80u16, 24u16);
 
@@ -291,14 +308,15 @@ async fn serve(
     let emu = mish_terminal::emulator::Emulator::shared(cols, rows);
 
     if persist {
-        return serve_persistent(endpoint, t, emu, clock, network_timeout, pty).await;
+        return serve_persistent(endpoint, t, emu, clock, network_timeout, pty, forward).await;
     }
 
     // Non-persistent (default): one connection, exit when the client or shell goes.
     let transport = Arc::new(t);
-    tokio::spawn(mish::scrollback::serve_history(
+    tokio::spawn(mish::forward::serve_side_channels(
         transport.clone(),
         emu.clone(),
+        forward,
     ));
     run_server(
         transport,
@@ -324,6 +342,7 @@ async fn serve_persistent(
     clock: Arc<SystemClock>,
     network_timeout: Option<Duration>,
     pty: PtyProcess,
+    forward: bool,
 ) -> Result<()> {
     use mish::persist::{AttachEnd, PersistentSession};
 
@@ -338,10 +357,12 @@ async fn serve_persistent(
     let mut conn = first;
     loop {
         let transport = Arc::new(conn);
-        // Scrollback for this connection (aborted when the attachment ends).
-        let hist = tokio::spawn(mish::scrollback::serve_history(
+        // Side-channels (scrollback + forwarding) for this connection (aborted
+        // when the attachment ends).
+        let hist = tokio::spawn(mish::forward::serve_side_channels(
             transport.clone(),
             emu.clone(),
+            forward,
         ));
 
         // Run this attachment, but let a *new* incoming connection preempt it. A
