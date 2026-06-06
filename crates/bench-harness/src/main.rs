@@ -616,7 +616,13 @@ async fn run_session(
         // Longer display window: under burst loss, fewer fresh markers get
         // through, so a wider window keeps the median statistically meaningful.
         Metric::Display => measure_display(&client, Duration::from_secs(6)).await,
-        Metric::Keyboard => measure_keyboard(&client, 12).await,
+        Metric::Keyboard => {
+            let kn = std::env::var("BENCH_KSAMPLES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(12);
+            measure_keyboard(&client, kn).await
+        }
     };
     drop(client); // kills the client; `_server` drops at fn end (kill_on_drop)
     Ok(out)
@@ -632,15 +638,54 @@ async fn matrix_cell(
     seeds: u64,
 ) -> (f64, f64, usize) {
     let mut all = Vec::new();
+    let mut seed_medians = Vec::new();
     for s in 0..seeds {
         let seed = 0x9E3779B1u64.wrapping_mul(s + 1);
         match run_session(target, bins, faults, seed, predict, metric).await {
-            Ok(mut v) => all.append(&mut v),
+            Ok(v) => {
+                if !v.is_empty() {
+                    seed_medians.push(pct(v.clone(), 0.5));
+                }
+                all.extend(v);
+            }
             Err(e) => eprintln!("  (session error: {e})"),
         }
     }
     let n = all.len();
+    // Deep stats (MISH_STATS=1): pooled mean±stdev over every individual
+    // sample, plus the spread of the per-seed medians (the run-to-run "noise").
+    if std::env::var_os("MISH_STATS").is_some() && n > 0 {
+        let mean = all.iter().sum::<f64>() / n as f64;
+        let var = all.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        let sd = var.sqrt();
+        let (mm, ms) = mean_sd(&seed_medians);
+        let p = match predict {
+            Predict::Never => "off",
+            Predict::Always => "on",
+        };
+        let m = match metric {
+            Metric::Display => "disp",
+            Metric::Keyboard => "kbd",
+        };
+        eprintln!(
+            "[stats {:>6} {m}-{p}] n={n}  mean={mean:.1}  sd={sd:.1}  median={:.1}  p90={:.1}  | per-seed medians: mean={mm:.1} sd={ms:.1} ({} seeds)",
+            target.label(),
+            pct(all.clone(), 0.5),
+            pct(all.clone(), 0.9),
+            seed_medians.len(),
+        );
+    }
     (pct(all.clone(), 0.5), pct(all, 0.9), n)
+}
+
+/// Mean and population standard deviation of a slice.
+fn mean_sd(v: &[f64]) -> (f64, f64) {
+    if v.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64;
+    (mean, var.sqrt())
 }
 
 #[tokio::main]
@@ -720,7 +765,14 @@ async fn main() -> Result<()> {
             },
         ),
     ];
-    let seeds = 1;
+    // BENCH_SEEDS bumps the number of loss realizations per cell (more samples
+    // for tighter mean/sd); BENCH_KBD_ONLY skips the display + predict-on cells
+    // (just the keyboard-off round trip) for a fast, deep keyboard measurement.
+    let seeds: u64 = std::env::var("BENCH_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let kbd_only = std::env::var_os("BENCH_KBD_ONLY").is_some();
 
     println!(
         "keyboard = time until the typed glyph paints at the cursor cell. Each keyboard\n\
@@ -752,6 +804,20 @@ async fn main() -> Result<()> {
             "  DISPLAY 1-way (predict off)    KEYBOARD round-trip to-glyph (predict off / on)"
         );
         for &t in targets {
+            if kbd_only {
+                // Just the keyboard-off round trip — the deep-stats path prints
+                // mean/sd via MISH_STATS; this line is the median summary.
+                let (k_med, k_p90, kn) =
+                    matrix_cell(t, &bins, faults, Predict::Never, Metric::Keyboard, seeds).await;
+                println!(
+                    "  {:>7}: KEYBOARD off  median {:>6.1} / p90 {:>6.1} ms {} (n={kn})",
+                    t.label(),
+                    k_med,
+                    k_p90,
+                    floor_tag(k_med, floor),
+                );
+                continue;
+            }
             let (d_med, d_p90, dn) =
                 matrix_cell(t, &bins, faults, Predict::Never, Metric::Display, seeds).await;
             let (k_med, _, kn) =
