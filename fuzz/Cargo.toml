@@ -92,3 +92,10 @@ path = "fuzz_targets/bootstrap_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "resized_view"
+path = "fuzz_targets/resized_view.rs"
+test = false
+doc = false
+bench = false

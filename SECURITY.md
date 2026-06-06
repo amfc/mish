@@ -41,6 +41,7 @@ boundary is explicit.
 | Pre-handshake junk doesn't exhaust the server | quinn endpoint drops invalid packets | `wire_attacks.rs::server_survives_pre_handshake_junk_flood` |
 | Client key not leaked to logs | only on the SSH-tunneled stdout line, never stderr | `mosh/tests/key_hygiene.rs` |
 | Malformed/hostile SSP input is safe | no-panic, bounded memory, compression-bomb cap | `fuzz_hostile.rs`, `fuzz_driver_live.rs`, `instruction.rs` |
+| A shared-session viewer can't OOM the server with an absurd terminal size | the viewer-screen crop clamps client-reported dimensions to the `MAX_SCREEN_CELLS` budget before allocating | `screen.rs` `resized_view_*` (proptest), `fuzz/.../resized_view.rs` |
 | Builtin bootstrap rejects a *changed* host key | `classify_host_key` over russh `check_known_hosts` (match→accept, mismatch→refuse, unknown→TOFU) | `bootstrap.rs` `host_key_{matching,mismatch,unknown}_*` |
 | Builtin bootstrap can't be shell-injected | `shell_quote` single-quote escaping of the remote command/session name | `bootstrap.rs` `shell_quote_resists_injection_in_real_sh` (real `/bin/sh`), `shell_quote_round_trips_through_split` |
 | Hostile/buggy server can't exhaust client memory at bootstrap | bounded `MISH CONNECT` scan (`MAX_CONNECT_SCAN`, both transports) | `bootstrap.rs` `scan_connect_*`, `bootstrap_parse` fuzz target |
@@ -103,6 +104,15 @@ properties:
   shell never sees them. Read-only is enforced where input is applied, not by
   asking the client to behave. There is exactly one writer slot (the owner);
   while it's held, every other attachment is a viewer.
+- **A viewer's reported size can't exhaust server memory.** Because the owner
+  drives the shell geometry, a viewer's screen is cropped to *its own* reported
+  terminal size (`Screen::resized_view`) — and that size is client-controlled
+  (it rides the viewer's `UserStream` resize). The crop **clamps** the
+  dimensions (`MAX_VIEW_DIM`, the same cell budget as the `apply_diff`
+  `MAX_SCREEN_CELLS` guard) before allocating, so a read-only viewer reporting an
+  absurd terminal (e.g. `65535×65535`) can't OOM the shared server. Bounded +
+  panic-free for any dimensions, covered by a proptest and the `resized_view`
+  libFuzzer target.
 - **All attached clients see all output.** A shared session is a broadcast of the
   one screen to every client, so anyone attached can read everything on it
   (including anything the owner types that echoes). Treat attaching someone as

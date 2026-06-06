@@ -113,7 +113,7 @@ jobs:
       # for a long out-of-band fuzzing campaign.
       - name: Fuzz targets
         run: |
-          for t in instruction_decode screen_apply diff_roundtrip frag_reassemble userstream_decode differential_emulator answerback_safety tty_emission_safety frag_memory_bounds client_render_safety; do
+          for t in instruction_decode screen_apply diff_roundtrip frag_reassemble userstream_decode differential_emulator answerback_safety tty_emission_safety frag_memory_bounds client_render_safety resized_view; do
             # Replay checked-in regression seeds first (deterministic gate), then
             # a bounded coverage-guided run.
             if [ -d "fuzz/regressions/$t" ] && [ -n "$(ls -A fuzz/regressions/$t)" ]; then

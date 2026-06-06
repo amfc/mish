@@ -376,8 +376,9 @@ There are coverage-guided libFuzzer targets for the protocol core
 (`instruction_decode`, `screen_apply`, `diff_roundtrip`, `frag_reassemble`,
 `userstream_decode`, `differential_emulator`) and for the security seams
 (`answerback_safety`, `tty_emission_safety`, `frag_memory_bounds`,
-`client_render_safety`, and `bootstrap_parse` — the session-bootstrap parsers +
-bounded `MISH CONNECT` scanner). CI smoke-runs each for 40 s as a regression gate; for a
+`client_render_safety`, `bootstrap_parse` — the session-bootstrap parsers +
+bounded `MISH CONNECT` scanner — and `resized_view`, asserting a shared-session
+viewer's client-controlled terminal size can't OOM the server). CI smoke-runs each for 40 s as a regression gate; for a
 real campaign, **[`scripts/fuzz-overnight.sh`](scripts/fuzz-overnight.sh)** runs
 all of them at once in libFuzzer fork mode, saturating every core and surviving
 crashes (each saved, fuzzing continues), with a per-target time budget:

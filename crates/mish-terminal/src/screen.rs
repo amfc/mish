@@ -215,7 +215,16 @@ impl Screen {
     /// (title, mouse/cursor/paste modes, clipboard, `echo_ack`, …) is preserved —
     /// only the grid geometry changes. This is a viewport crop, **not** a terminal
     /// reflow: long lines are cut, never rewrapped.
+    ///
+    /// The target dimensions are **clamped to [`MAX_VIEW_DIM`]** before
+    /// allocating. A viewer's geometry is client-controlled (it arrives as a
+    /// `UserStream` resize), so an absurd size — e.g. `65535×65535` ≈ 4.3 billion
+    /// cells — must not let a read-only viewer OOM the shared server. The cap
+    /// mirrors [`MAX_SCREEN_CELLS`]; a real terminal is never near it, so clamping
+    /// only ever affects hostile or buggy input.
     pub fn resized_view(&self, cols: u16, rows: u16) -> Screen {
+        let cols = cols.min(MAX_VIEW_DIM);
+        let rows = rows.min(MAX_VIEW_DIM);
         if self.cols == cols && self.rows == rows {
             return self.clone();
         }
@@ -250,6 +259,14 @@ const FLAG_ALT_SCREEN: u8 = 1 << 0;
 /// Upper bound on a synchronized screen's cell count, to reject malformed or
 /// hostile diffs that would allocate an absurd grid (a generous ~2000×2000).
 const MAX_SCREEN_CELLS: u32 = 4_000_000;
+
+/// Per-dimension clamp for [`Screen::resized_view`], whose target geometry is
+/// client-controlled (a viewer's `UserStream` resize). Capping each side keeps
+/// the cell count within [`MAX_SCREEN_CELLS`] so a read-only viewer can't OOM the
+/// server by reporting an enormous terminal. No real terminal approaches this.
+const MAX_VIEW_DIM: u16 = 2000;
+// The clamp is only sound if a fully-clamped grid stays within the cell budget.
+const _: () = assert!((MAX_VIEW_DIM as u64) * (MAX_VIEW_DIM as u64) <= MAX_SCREEN_CELLS as u64);
 
 impl SyncState for Screen {
     fn new_initial() -> Self {
@@ -343,6 +360,7 @@ impl SyncState for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// Regression (found by the `screen_apply` cargo-fuzz target): a diff header
     /// declaring a zero dimension slips past the cell-count guard (0 × huge == 0)
@@ -424,6 +442,53 @@ mod tests {
         assert_eq!(big.to_lines()[0], "abcd"); // trailing blanks trimmed
         assert_eq!(big.to_lines()[3], ""); // padded row is blank
         assert_eq!((big.cursor_row, big.cursor_col), (2, 3));
+    }
+
+    /// Security: a viewer's reported geometry is client-controlled, so an absurd
+    /// size must be clamped rather than allocated — a read-only viewer must not be
+    /// able to OOM the shared server (the analogue of `apply_diff`'s
+    /// `MAX_SCREEN_CELLS` guard). The worst case (`65535×65535` ≈ 4.3 billion
+    /// cells) must not panic and must stay within the cell budget.
+    #[test]
+    fn resized_view_bounds_hostile_dimensions() {
+        let s = Screen::blank(80, 24);
+        let big = s.resized_view(u16::MAX, u16::MAX);
+        assert!(
+            big.cells.len() as u32 <= MAX_SCREEN_CELLS,
+            "resized_view allocated {} cells, over the {MAX_SCREEN_CELLS} budget",
+            big.cells.len()
+        );
+        assert!(big.cols <= MAX_VIEW_DIM && big.rows <= MAX_VIEW_DIM);
+        assert_eq!(big.cells.len(), big.cols as usize * big.rows as usize);
+    }
+
+    proptest! {
+        // Each case can allocate up to a clamped 2000×2000 grid, so keep the case
+        // count modest — the hostile-dimension space is small and well-covered.
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// For *any* client-reported target geometry (full u16 range) and a small
+        /// source screen, `resized_view` never panics, the result is internally
+        /// consistent (cells == cols*rows), the cursor stays in range, and the
+        /// allocation stays within the cell budget.
+        #[test]
+        fn resized_view_is_panic_free_and_bounded(
+            src_cols in 0u16..120,
+            src_rows in 0u16..50,
+            cols in any::<u16>(),
+            rows in any::<u16>(),
+        ) {
+            let src = Screen::blank(src_cols, src_rows);
+            let out = src.resized_view(cols, rows);
+            prop_assert_eq!(out.cells.len(), out.cols as usize * out.rows as usize);
+            prop_assert!(out.cells.len() as u32 <= MAX_SCREEN_CELLS);
+            prop_assert!(out.cols <= MAX_VIEW_DIM && out.rows <= MAX_VIEW_DIM);
+            if out.cols > 0 {
+                prop_assert!(out.cursor_col < out.cols);
+            }
+            if out.rows > 0 {
+                prop_assert!(out.cursor_row < out.rows);
+            }
+        }
     }
 
     #[test]
