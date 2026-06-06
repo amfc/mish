@@ -432,9 +432,11 @@ mod tests {
         // Only the end-entity is consulted: attacker-supplied intermediates can't
         // turn a wrong cert into an accept, nor a right cert into a reject.
         let bogus = CertificateDer::from(vec![0u8; 48]);
-        assert!(v.verify_client_cert(&pinned, &[bogus.clone()], now).is_ok());
         assert!(v
-            .verify_client_cert(&other, &[pinned.clone()], now)
+            .verify_client_cert(&pinned, std::slice::from_ref(&bogus), now)
+            .is_ok());
+        assert!(v
+            .verify_client_cert(&other, std::slice::from_ref(&pinned), now)
             .is_err());
     }
 
