@@ -9,10 +9,21 @@ matched network impairment.
 - **Display latency** (one-way, server→client): a child program (`bench-child`)
   paints a wall-clock marker every 30 ms; the harness reads it off the client's
   reconstructed screen and subtracts. Both processes share the machine clock.
-- **Keyboard latency** (round-trip echo): the harness types a character into the
-  client and times until it appears on the client's screen. The server child is
-  `cat`, whose PTY line discipline echoes input — so the sample is a full
-  client→server→client round trip.
+- **Keyboard latency**: the harness types a character and times until **that exact
+  glyph paints at the cursor cell** of the reconstructed screen. The server child
+  is `cat`, whose PTY line discipline echoes input.
+
+  It watches the destination cell for the typed character specifically — *not*
+  "any screen content changed". That distinction matters: a client may move the
+  cursor, repaint, or paint a prediction elsewhere faster than the network could
+  ever deliver an echo, and an any-change detector would clock that as the
+  "keyboard latency", producing samples below the physical round-trip floor. With
+  prediction **off**, the glyph only appears once the server echo round-trips
+  (≥ the link RTT); with prediction **on**, the client paints the predicted glyph
+  locally first (well under the RTT). Each keyboard number is tagged against the
+  round-trip floor (2×one-way delay): `rt` = a real echo round-trip, `loc` =
+  painted locally before any echo could arrive. So the two columns are interpreted
+  identically for both clients instead of conflating different events.
 
 Each is run with predictive echo **off** and **on**.
 
@@ -48,27 +59,40 @@ mish by ~5 ms). Absolute numbers are machine-dependent; read the
 mish-vs-mosh *gap*, not the raw values:
 
 ```
-=== LAN    (rtt~2ms,  0% loss) ===
-  DISPLAY (server→client, predict off)   KEYBOARD echo (predict off / on)
-   mish:   15.9/  17.6 ms               27.9 ms /    2.2 ms
-     mosh:   12.5/  13.5 ms               12.7 ms /    2.4 ms
+                                   KEYBOARD to-glyph (predict off / on)
+=== LAN    (floor ~2 ms) ===   DISPLAY 1-way
+   mish:   16.2/  17.9 ms          27.9 ms rt  /   2.1 ms rt
+     mosh:   12.5/  13.6 ms          12.9 ms rt  /   2.3 ms rt
 
-=== WAN    (rtt~80ms, 5% loss) ===
-   mish:   64.1/  74.3 ms              112.2 ms /    2.2 ms
-     mosh:   59.6/  72.1 ms               55.2 ms /   53.3 ms
+=== DSL    (floor ~40 ms) ===
+   mish:   35.9/  38.6 ms          70.1 ms rt  /   2.1 ms loc
+     mosh:   33.2/  35.0 ms          56.0 ms rt  /   2.4 ms loc
 
-=== LOSSY  (rtt~120ms, 15% loss) ===
-   mish:   87.4/ 103.3 ms              165.4 ms /    2.2 ms
-     mosh:   88.5/ 102.0 ms              154.9 ms /  154.9 ms
+=== WAN    (floor ~80 ms) ===
+   mish:   62.9/  75.5 ms         111.8 ms rt  /   2.2 ms loc
+     mosh:   60.5/  70.7 ms         102.6 ms rt  /   2.1 ms loc
+
+=== LOSSY  (floor ~120 ms) ===
+   mish:   89.1/ 103.3 ms         164.0 ms rt  /   2.1 ms loc
+     mosh:   83.7/  98.7 ms         152.1 ms rt  /   2.2 ms loc
 ```
 
 Takeaways from this run:
 - Display: mish trails mosh by ~3 ms on a LAN, and the gap closes as the link
-  degrades (they're even on LOSSY) — consistent with QUIC vs UDP/OCB framing.
-- Keyboard with prediction *off*, mish's echo round-trip is meaningfully
-  slower than mosh's on good links (27.9 vs 12.7 ms LAN) — a real difference in
-  the server→client echo path, worth a closer look.
-- Predictive echo: mish is strong and stable (~2.2 ms across all conditions);
-  mosh's adaptive prediction engages inconsistently at higher RTT.
+  degrades (even on LOSSY) — consistent with QUIC vs UDP/OCB framing.
+- Keyboard, prediction off: every sample is a real round-trip (`rt`) for both, and
+  the gap is modest and RTT-dominated at distance (WAN 111.8 vs 102.6, LOSSY 164
+  vs 152). On a LAN, though, mish's round-trip (27.9 ms) is ~15 ms over mosh's
+  (12.9 ms) despite near-identical displays — so mish's *client→server*
+  keystroke leg carries extra latency (likely SSP send pacing) that only shows
+  when the RTT is tiny. This is the one keyboard difference worth chasing.
+- Predictive echo: both clients paint locally at ~2 ms (`loc`) across DSL/WAN/
+  LOSSY — they are equivalent here. (At LAN the floor is ~2 ms, so even a local
+  paint tags `rt`; prediction can't be distinguished from a round-trip when the
+  RTT is already as fast as the prediction.)
 
-These are a starting point for tuning, not a fixed verdict.
+Earlier versions of this harness compared "any screen change" and reported
+mish winning prediction decisively while losing keyboard echo ~2× on WAN. Both
+were artifacts of catching non-glyph changes below the round-trip floor; the
+glyph+floor method above corrects them. These are a starting point for tuning,
+not a fixed verdict.

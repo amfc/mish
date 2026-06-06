@@ -342,6 +342,23 @@ impl ClientPty {
         self.emu.lock().unwrap().snapshot().to_lines()
     }
 
+    /// `(cursor_row, cursor_col, char-at-cursor)` from the reconstructed screen.
+    /// Used to watch the exact cell a typed character will echo into.
+    fn cursor_cell(&self) -> (u16, u16, char) {
+        let s = self.emu.lock().unwrap().snapshot();
+        let (r, c) = (s.cursor_row, s.cursor_col);
+        let idx = r as usize * s.cols as usize + c as usize;
+        let ch = s.cells.get(idx).map(|cell| cell.c).unwrap_or(' ');
+        (r, c, ch)
+    }
+
+    /// The character at a specific cell of the reconstructed screen.
+    fn char_at(&self, row: u16, col: u16) -> char {
+        let s = self.emu.lock().unwrap().snapshot();
+        let idx = row as usize * s.cols as usize + col as usize;
+        s.cells.get(idx).map(|cell| cell.c).unwrap_or(' ')
+    }
+
     fn type_bytes(&self, b: &[u8]) {
         let mut w = self.writer.lock().unwrap();
         let _ = w.write_all(b);
@@ -390,25 +407,58 @@ async fn measure_display(client: &ClientPty, duration: Duration) -> Vec<f64> {
     samples
 }
 
-/// Measure keyboard round-trip echo latency: type a char, time until the client
-/// screen content changes (the echo arrives). `cat` child = line-discipline echo.
+/// Measure keyboard latency: type a character and time until **that exact glyph
+/// appears at the cursor cell** on the reconstructed screen.
+///
+/// This is deliberately glyph-specific, not "any screen content changed": the
+/// old version tripped on cursor moves / repaints / a prediction painted
+/// elsewhere, which let a client register a "keyboard" sample faster than the
+/// network could possibly deliver an echo. Watching the destination cell for the
+/// typed character measures one well-defined event for both clients:
+///
+/// * prediction off → the glyph only appears once the server echo round-trips,
+///   so the sample is a true round trip (≥ the link RTT);
+/// * prediction on  → the client paints the predicted glyph locally first, so
+///   the sample is the local prediction latency (well under the RTT).
+///
+/// The caller compares the medians against the known RTT floor to tell which is
+/// which (see [`run_matrix`]'s annotation), so the two columns are interpreted
+/// identically for mish and mosh instead of conflating different events.
+///
+/// `cat` is the server child: its PTY line discipline echoes input, so the
+/// confirmed glyph lands at the cursor.
 async fn measure_keyboard(client: &ClientPty, n: usize) -> Vec<f64> {
     let mut samples = Vec::new();
     for i in 0..n {
-        let before = client.screen_lines();
-        let ch = [b'a' + (i % 26) as u8];
+        // The cell the next echoed/predicted glyph will occupy, and what it
+        // holds now — so we can pick a character that actually differs from it.
+        let (row, col, present) = client.cursor_cell();
+        if col >= COLS.saturating_sub(1) {
+            // Near the right margin: go to a fresh line so the glyph lands in a
+            // blank cell (cat echoes the CR, advancing to the next row).
+            client.type_bytes(b"\r");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            continue;
+        }
+        // A printable char distinct from both the cell's current contents and a
+        // blank, so the match is unambiguous.
+        let ch = {
+            let mut c = b'a' + (i % 26) as u8;
+            if c as char == present {
+                c = if c == b'z' { b'a' } else { c + 1 };
+            }
+            c
+        };
         let t0 = Instant::now();
-        client.type_bytes(&ch);
-        // Wait for the screen *content* to change (a 500ms idle repaint doesn't
-        // change content, so this is the echo).
+        client.type_bytes(&[ch]);
         let deadline = t0 + Duration::from_secs(3);
         loop {
-            if client.screen_lines() != before {
+            if client.char_at(row, col) == ch as char {
                 samples.push(t0.elapsed().as_secs_f64() * 1000.0);
                 break;
             }
             if Instant::now() > deadline {
-                break; // dropped beyond our patience; skip this sample
+                break; // never echoed within patience; skip this sample
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -557,9 +607,20 @@ async fn main() -> Result<()> {
     ];
     let seeds = 1;
 
+    println!(
+        "keyboard = time until the typed glyph paints at the cursor cell. Each keyboard\n\
+         number is tagged against the round-trip floor (2×one-way delay): `rt` = a real\n\
+         server echo (≥ floor), `loc` = painted locally before any echo could arrive\n\
+         (i.e. predictive echo). A `loc` in the predict-off column, or an `rt` in the\n\
+         predict-on column, means that client isn't behaving as the mode label claims.\n"
+    );
+
     for (name, faults) in conditions {
-        println!("=== {name} ===");
-        println!("  DISPLAY (server→client, predict off)   KEYBOARD echo (predict off / on)");
+        // Minimum a real echo round-trip can take: the relay delays each
+        // direction by `delay_ms`, so type→server→echo→client is ≥ 2×delay.
+        let floor = 2.0 * faults.delay_ms as f64;
+        println!("=== {name} ===   [echo round-trip floor ~{floor:.0} ms]");
+        println!("  DISPLAY 1-way (predict off)    KEYBOARD to-glyph (predict off / on)");
         for &t in targets {
             let (d_med, d_p90, dn) =
                 matrix_cell(t, &bins, faults, Predict::Never, Metric::Display, seeds).await;
@@ -568,15 +629,31 @@ async fn main() -> Result<()> {
             let (kp_med, _, kpn) =
                 matrix_cell(t, &bins, faults, Predict::Always, Metric::Keyboard, seeds).await;
             println!(
-                "  {:>7}: {:>6.1}/{:>6.1} ms (n={dn:>3})    {:>6.1} ms (n={kn:>2}) / {:>6.1} ms (n={kpn:>2})",
+                "  {:>7}: {:>6.1}/{:>6.1} ms (n={dn:>3})    {:>6.1} ms {} (n={kn:>2}) / {:>6.1} ms {} (n={kpn:>2})",
                 t.label(),
                 d_med,
                 d_p90,
                 k_med,
+                floor_tag(k_med, floor),
                 kp_med,
+                floor_tag(kp_med, floor),
             );
         }
         println!();
     }
     Ok(())
+}
+
+/// Tag a keyboard median against the round-trip floor: `rt` if it's at least a
+/// real echo round-trip, `loc` if it painted faster than the link could deliver
+/// an echo (so it was a local prediction), `--` if there were no samples.
+fn floor_tag(median_ms: f64, floor_ms: f64) -> &'static str {
+    if median_ms.is_nan() {
+        "-- "
+    } else if median_ms + 1.0 < floor_ms {
+        // 1 ms slack so a sample right at the floor isn't misclassified.
+        "loc"
+    } else {
+        "rt "
+    }
 }
