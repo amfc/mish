@@ -257,7 +257,8 @@ async fn main() -> Result<()> {
     // credentials from $MISH_CONNECT, no bootstrap. (Used by test harnesses;
     // mirrors `mosh-client IP PORT` + $MOSH_KEY.)
     if let Some((ip, port)) = opts.attach.clone() {
-        return attach_session(&ip, port, opts.predict, opts.no_init).await;
+        attach_session(&ip, port, opts.predict, opts.no_init).await?;
+        exit_now();
     }
 
     // 1. Bootstrap: get (udp addr, cert) by starting mish-server locally or via SSH.
@@ -304,7 +305,23 @@ async fn main() -> Result<()> {
 
     // Dropping `boot` tears down the server / ssh channel.
     drop(boot);
-    Ok(())
+    exit_now();
+}
+
+/// Exit the process immediately after the session has ended and the terminal has
+/// been restored.
+///
+/// The stdin reader runs a `tokio::io::stdin()` read on the blocking-thread pool,
+/// parked in a `read(2)` syscall that can't be cancelled. If we returned from
+/// `main` normally, the tokio runtime's shutdown would block on that thread until
+/// the kernel delivers a line — so the process would appear to hang after
+/// "connection closed" until the user pressed Enter. By the time we get here the
+/// `TerminalGuard` has restored cooked mode and `drop(boot)` has torn down the
+/// server/SSH child, so there is nothing left to clean up: exit now.
+fn exit_now() -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    std::process::exit(0);
 }
 
 /// Attach directly to a running server at `ip:port`, with the credential triple

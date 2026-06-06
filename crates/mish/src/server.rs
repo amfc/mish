@@ -17,6 +17,13 @@ use mish_terminal::screen::Screen;
 use mish_terminal::user::{UserEvent, UserStream};
 use tokio::sync::mpsc;
 
+/// Max PTY output (bytes) the session feeds the emulator per wake-up before it
+/// must publish and loop back to `select!`. Big enough that a typical flood's
+/// backlog is swallowed in one batch (so the screen converges in a single
+/// snapshot, not one per 8 KiB chunk), but bounded so a never-ending flood can't
+/// monopolize the loop and delay client input (Ctrl-C). ~1 MiB ≈ 128 chunks.
+const COALESCE_BUDGET: usize = 1 << 20;
+
 /// A control message from the session to the child PTY.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PtyControl {
@@ -82,6 +89,33 @@ pub async fn run_server<T: Transport>(
                         let screen = {
                             let mut e = emu.lock().unwrap();
                             e.feed(&bytes);
+                            // Coalesce: feed everything already queued in one batch,
+                            // then snapshot/publish once. A flood (`yes`) otherwise
+                            // buffers a deep backlog of 8 KiB chunks; processing it
+                            // one chunk per loop — a full-screen snapshot + a driver
+                            // state push each time — is what makes Ctrl-C take
+                            // seconds to take effect (the server is still chewing
+                            // stale output long after SIGINT killed the writer).
+                            // Mosh likewise reads all available PTY output before
+                            // diffing. The session-ending `None` (child exited) is
+                            // handled by the next outer `recv()`.
+                            //
+                            // Cap the batch so a producer that refills as fast as we
+                            // drain (a non-stop flood) can't pin us in this loop —
+                            // and pin the emulator lock — starving the client-input
+                            // branch of this `select!`. Past the budget we publish
+                            // what we have and come back around, keeping Ctrl-C
+                            // responsive even mid-flood.
+                            let mut budget = COALESCE_BUDGET.saturating_sub(bytes.len());
+                            while budget > 0 {
+                                match pty_output.try_recv() {
+                                    Ok(more) => {
+                                        budget = budget.saturating_sub(more.len());
+                                        e.feed(&more);
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
                             // Host answerbacks (DA/DSR/CPR/OSC color/size replies)
                             // the child's query sequences produced must go back to
                             // its input, or programs that probe the terminal hang.
