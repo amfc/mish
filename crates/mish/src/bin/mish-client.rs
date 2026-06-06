@@ -147,6 +147,11 @@ fn parse_predict(name: &str) -> Result<PredictMode> {
     }
 }
 
+/// Parse an ssh-style `-L`/`-R` forward spec, defaulting the bind to loopback.
+fn parse_forward(spec: &str) -> Result<mish::forward::ForwardSpec> {
+    mish::forward::ForwardSpec::parse(spec, "127.0.0.1").map_err(anyhow::Error::msg)
+}
+
 fn parse_args() -> Result<Options> {
     let mut opts = Options {
         local: false,
@@ -211,22 +216,14 @@ fn parse_args() -> Result<Options> {
             // Accept both the separate (`-L spec`) and glued (`-Lspec`) forms.
             "-L" => {
                 let spec = args.next().context("-L needs [bind:]port:host:hostport")?;
-                opts.local_forwards
-                    .push(mish::forward::ForwardSpec::parse(&spec, "127.0.0.1").map_err(anyhow::Error::msg)?);
+                opts.local_forwards.push(parse_forward(&spec)?);
             }
             "-R" => {
                 let spec = args.next().context("-R needs [bind:]port:host:hostport")?;
-                opts.remote_forwards
-                    .push(mish::forward::ForwardSpec::parse(&spec, "127.0.0.1").map_err(anyhow::Error::msg)?);
+                opts.remote_forwards.push(parse_forward(&spec)?);
             }
-            s if s.starts_with("-L") => {
-                opts.local_forwards
-                    .push(mish::forward::ForwardSpec::parse(&s[2..], "127.0.0.1").map_err(anyhow::Error::msg)?);
-            }
-            s if s.starts_with("-R") => {
-                opts.remote_forwards
-                    .push(mish::forward::ForwardSpec::parse(&s[2..], "127.0.0.1").map_err(anyhow::Error::msg)?);
-            }
+            s if s.starts_with("-L") => opts.local_forwards.push(parse_forward(&s[2..])?),
+            s if s.starts_with("-R") => opts.remote_forwards.push(parse_forward(&s[2..])?),
             "--session" => opts.session = Some(args.next().context("--session needs a NAME")?),
             "--attach" => {
                 let ip = args.next().context("--attach needs IP PORT")?;

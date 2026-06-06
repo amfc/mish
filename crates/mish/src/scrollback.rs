@@ -30,7 +30,11 @@ pub async fn serve_history(transport: Arc<QuicTransport>, emu: Arc<Mutex<Emulato
 /// Serve a single history side-channel: read one [`HistoryRequest`], answer it,
 /// finish. The [`StreamHello`] tag has already been consumed by the dispatcher,
 /// so the next frame is the request itself.
-pub(crate) async fn serve_one(mut send: SendStream, mut recv: RecvStream, emu: Arc<Mutex<Emulator>>) {
+pub(crate) async fn serve_one(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    emu: Arc<Mutex<Emulator>>,
+) {
     let bytes = match read_message(&mut recv, MAX_MESSAGE_LEN).await {
         Ok(Some(b)) => b,
         _ => return, // empty or malformed framing
