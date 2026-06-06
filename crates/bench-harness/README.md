@@ -62,45 +62,63 @@ Two floors per condition: **display is one-way** (server→client), so it can't
 beat a single relay delay; **keyboard is a round trip**, so it can't beat 2× that
 delay. The `rt`/`loc` tag is against the keyboard (round-trip) floor.
 
+The relay models several **loss/impairment regimes**, because they stress a
+protocol very differently:
+- **iid** — independent per-packet loss (the easy case).
+- **Gilbert-Elliott burst loss** — a two-state (GOOD/BAD) Markov chain, so loss
+  comes in *bursts*. Real links (wifi fade, buffer overrun) do this, and it's far
+  harder than the same average loss spread out.
+- **reordering** — a fraction of packets held back so they arrive late/out of order.
+
+Two floors per condition: **display is one-way** (server→client), so it can't
+beat a single relay delay; **keyboard is a round trip**, so it can't beat 2× that
+delay. The `rt`/`loc` tag is against the keyboard (round-trip) floor.
+
 ```
-                              DISPLAY 1-way     KEYBOARD round-trip
-                              med / p90         predict off / on
-=== LAN   (disp floor ~1 ms · kbd floor ~2 ms) ===
-   mish:                    16.2/  17.9 ms    27.9 ms rt  /   2.1 ms rt
-     mosh:                    12.5/  13.6 ms    12.9 ms rt  /   2.3 ms rt
-
-=== DSL   (disp floor ~20 ms · kbd floor ~40 ms) ===
-   mish:                    35.9/  38.6 ms    70.1 ms rt  /   2.1 ms loc
-     mosh:                    33.2/  35.0 ms    56.0 ms rt  /   2.4 ms loc
-
-=== WAN   (disp floor ~40 ms · kbd floor ~80 ms) ===
-   mish:                    62.9/  75.5 ms   111.8 ms rt  /   2.2 ms loc
-     mosh:                    60.5/  70.7 ms   102.6 ms rt  /   2.1 ms loc
-
-=== LOSSY (disp floor ~60 ms · kbd floor ~120 ms) ===
-   mish:                    89.1/ 103.3 ms   164.0 ms rt  /   2.1 ms loc
-     mosh:                    83.7/  98.7 ms   152.1 ms rt  /   2.2 ms loc
+                                   DISPLAY 1-way    KEYBOARD round-trip
+                                   med / p90        predict off / on
+=== LAN     (rtt~2ms, 0% iid) ===
+   mish:                         15.5/  17.1 ms    27.2 ms rt  /  2.2 ms rt
+     mosh:                         12.6/  13.6 ms    13.9 ms rt  /  2.3 ms rt
+=== WAN     (rtt~80ms, 5% iid) ===
+   mish:                         62.7/  75.1 ms   112.8 ms rt  /  2.1 ms loc
+     mosh:                         60.7/  72.3 ms   102.1 ms rt  /  2.2 ms loc
+=== LOSSY   (rtt~120ms, 15% iid) ===
+   mish:                         87.9/ 100.5 ms   164.6 ms rt  /  2.2 ms loc
+     mosh:                         86.1/  98.8 ms   162.9 ms rt  /  2.2 ms loc
+=== BURSTY  (rtt~80ms, ~14% burst) ===
+   mish:                         64.9/  78.6 ms   113.9 ms rt  /  2.1 ms loc
+     mosh:                         64.0/  76.0 ms   108.2 ms rt  /  2.1 ms loc
+=== REORDER (rtt~60ms, 1% loss, 12% reorder) ===
+   mish:                         55.3/  68.6 ms    98.2 ms rt  /  2.1 ms loc
+     mosh:                         52.8/  64.7 ms   103.7 ms rt  /  2.1 ms loc
+=== BRUTAL  (rtt~140ms, bursty + reorder) ===
+   mish:                        108.3/ 123.3 ms   260.3 ms rt  /  2.1 ms loc
+     mosh:                        101.7/ 118.8 ms   212.5 ms rt  /  2.2 ms loc
 ```
 
-(So e.g. WAN display at 60–75 ms is *not* below its floor: display's floor is the
-~40 ms one-way delay, not the ~80 ms round-trip floor that governs keyboard.)
+`BENCH_ONLY=LOSSY,BRUTAL` restricts the run to matching conditions (fast A/B).
 
-Takeaways from this run:
-- Display: mish trails mosh by ~3 ms on a LAN, and the gap closes as the link
-  degrades (even on LOSSY) — consistent with QUIC vs UDP/OCB framing.
-- Keyboard, prediction off: every sample is a real round-trip (`rt`) for both, and
-  the gap is modest and RTT-dominated at distance (WAN 111.8 vs 102.6, LOSSY 164
-  vs 152). On a LAN, though, mish's round-trip (27.9 ms) is ~15 ms over mosh's
-  (12.9 ms) despite near-identical displays — so mish's *client→server*
-  keystroke leg carries extra latency (likely SSP send pacing) that only shows
-  when the RTT is tiny. This is the one keyboard difference worth chasing.
-- Predictive echo: both clients paint locally at ~2 ms (`loc`) across DSL/WAN/
-  LOSSY — they are equivalent here. (At LAN the floor is ~2 ms, so even a local
-  paint tags `rt`; prediction can't be distinguished from a round-trip when the
-  RTT is already as fast as the prediction.)
+Takeaways:
+- Display: mish trails mosh by ~2–3 ms (QUIC vs UDP/OCB framing); the gap
+  doesn't widen under loss/bursts/reorder.
+- Keyboard under loss: at parity with mosh on the realistic regimes — LOSSY
+  164 vs 163, BURSTY 114 vs 108, and REORDER mish actually *beats* mosh. Only
+  BRUTAL (the extreme: 140 ms RTT + bursts + 10% reorder) still trails by ~50 ms,
+  in the noisy n=12 tail.
+- LAN keyboard is ~13 ms over mosh — the known client→server-leg overhead that
+  only shows when the RTT is tiny; loss-independent.
+- Predictive echo: both paint locally at ~2 ms (`loc`).
 
-Earlier versions of this harness compared "any screen change" and reported
-mish winning prediction decisively while losing keyboard echo ~2× on WAN. Both
-were artifacts of catching non-glyph changes below the round-trip floor; the
-glyph+floor method above corrects them. These are a starting point for tuning,
-not a fixed verdict.
+### How we got here — congestion pacing was the bottleneck
+
+An earlier build trailed mosh **2.5× on LOSSY keyboard (423 vs 163 ms)**. The
+cause: an app-layer "congestion-aware pacing" experiment that stretched the SSP
+send interval under loss. mosh deliberately does the opposite — it keeps blasting
+the latest state at the frame rate, because latest-wins makes a dropped frame
+harmless — and QUIC already congestion-controls the wire underneath. Stacking a
+second backoff on top just added interactive latency exactly when it hurt most.
+Removing it restored parity (this is precisely the kind of regression the bad-
+network conditions above exist to catch). `MISH_CC=bbr` selects quinn's
+(experimental) BBR controller as an opt-in, but with pacing gone it's not a clear
+win, so Cubic stays the default.

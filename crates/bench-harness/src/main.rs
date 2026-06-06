@@ -36,9 +36,83 @@ const MARKER_ROW: usize = 10;
 
 #[derive(Clone, Copy)]
 struct Faults {
-    loss: f64,
+    /// One-way base delay added in each direction (ms).
     delay_ms: u64,
+    /// Uniform random delay added on top, 0..=jitter_ms (ms). Because each packet
+    /// is delayed independently, jitter already produces some reordering.
     jitter_ms: u64,
+    loss: LossModel,
+    /// Probability a forwarded packet is *held back* by `reorder_extra_ms`, so it
+    /// arrives after packets sent later — explicit reordering on top of jitter.
+    reorder_prob: f64,
+    reorder_extra_ms: u64,
+}
+
+impl Faults {
+    /// Independent (Bernoulli) per-packet loss — the classic, *easy* loss model.
+    fn iid(loss: f64, delay_ms: u64, jitter_ms: u64) -> Self {
+        Self {
+            delay_ms,
+            jitter_ms,
+            loss: LossModel::Iid(loss),
+            reorder_prob: 0.0,
+            reorder_extra_ms: 0,
+        }
+    }
+}
+
+/// How packet loss is generated.
+#[derive(Clone, Copy)]
+enum LossModel {
+    /// Independent per-packet loss probability.
+    Iid(f64),
+    /// Gilbert-Elliott burst loss: a two-state Markov chain (GOOD/BAD) with a
+    /// per-state loss probability. Real links lose packets in *bursts* (fading,
+    /// buffer overrun), which is far harder on a protocol than the same average
+    /// loss spread out — it's where QUIC's cwnd collapse (vs mosh's blast-anyway)
+    /// would actually bite.
+    Gilbert {
+        good_loss: f64,
+        bad_loss: f64,
+        /// P(GOOD→BAD) per packet.
+        p_enter_bad: f64,
+        /// P(BAD→GOOD) per packet (mean burst length ≈ 1 / p_leave_bad packets).
+        p_leave_bad: f64,
+    },
+}
+
+/// Per-direction loss state (the Gilbert-Elliott chain's current state).
+struct LossState {
+    in_bad: bool,
+}
+
+impl LossState {
+    fn new() -> Self {
+        Self { in_bad: false }
+    }
+
+    /// Advance the model one packet and decide whether to drop it.
+    fn drops(&mut self, model: &LossModel, r: &mut Rng) -> bool {
+        match *model {
+            LossModel::Iid(p) => r.f64() < p,
+            LossModel::Gilbert {
+                good_loss,
+                bad_loss,
+                p_enter_bad,
+                p_leave_bad,
+            } => {
+                if self.in_bad {
+                    if r.f64() < p_leave_bad {
+                        self.in_bad = false;
+                    }
+                } else if r.f64() < p_enter_bad {
+                    self.in_bad = true;
+                }
+                let loss = if self.in_bad { bad_loss } else { good_loss };
+                r.f64() < loss
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,63 +170,85 @@ async fn spawn_relay(server: SocketAddr, faults: Faults, seed: u64) -> Result<So
     let listen = client_sock.local_addr()?;
     let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
-    let rng = Arc::new(Mutex::new(Rng(seed | 1)));
 
-    let forward = move |data: Vec<u8>,
-                        sock: Arc<UdpSocket>,
-                        to: SocketAddr,
-                        rng: Arc<Mutex<Rng>>,
-                        faults: Faults| {
-        let (drop, delay) = {
-            let mut r = rng.lock().unwrap();
-            let drop = r.f64() < faults.loss;
-            let jitter = if faults.jitter_ms > 0 {
-                r.next() % (faults.jitter_ms + 1)
-            } else {
-                0
-            };
-            (drop, faults.delay_ms + jitter)
-        };
-        if drop {
+    // Decide a forwarded packet's fate (drop, or a delay to send it after) using
+    // this direction's own RNG + Gilbert-Elliott state.
+    fn schedule(
+        data: Vec<u8>,
+        sock: Arc<UdpSocket>,
+        to: SocketAddr,
+        rng: &mut Rng,
+        state: &mut LossState,
+        faults: &Faults,
+    ) {
+        if state.drops(&faults.loss, rng) {
             return;
         }
+        let jitter = if faults.jitter_ms > 0 {
+            rng.next() % (faults.jitter_ms + 1)
+        } else {
+            0
+        };
+        let reorder = if faults.reorder_prob > 0.0 && rng.f64() < faults.reorder_prob {
+            faults.reorder_extra_ms
+        } else {
+            0
+        };
+        let delay = faults.delay_ms + jitter + reorder;
         tokio::spawn(async move {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             let _ = sock.send_to(&data, to).await;
         });
-    };
+    }
 
-    // client → server
+    // client → server: its own loss process (loss is not correlated between
+    // directions on a real path, and each direction has its own GE state).
     {
-        let (cs, ss, ca, rng, fwd) = (
+        let (cs, ss, ca) = (
             client_sock.clone(),
             server_sock.clone(),
             client_addr.clone(),
-            rng.clone(),
-            forward,
         );
         tokio::spawn(async move {
+            let mut rng = Rng(seed | 1);
+            let mut state = LossState::new();
             let mut buf = [0u8; 2048];
             loop {
                 if let Ok((n, from)) = cs.recv_from(&mut buf).await {
                     *ca.lock().unwrap() = Some(from);
-                    fwd(buf[..n].to_vec(), ss.clone(), server, rng.clone(), faults);
+                    schedule(
+                        buf[..n].to_vec(),
+                        ss.clone(),
+                        server,
+                        &mut rng,
+                        &mut state,
+                        &faults,
+                    );
                 }
             }
         });
     }
     // server → client
     {
-        let (cs, ss, ca, rng, fwd) = (client_sock, server_sock, client_addr, rng, forward);
+        let (cs, ss, ca) = (client_sock, server_sock, client_addr);
         tokio::spawn(async move {
+            let mut rng = Rng(seed ^ 0x9E37_79B9_7F4A_7C15);
+            let mut state = LossState::new();
             let mut buf = [0u8; 2048];
             loop {
                 if let Ok((n, _from)) = ss.recv_from(&mut buf).await {
                     let dest = *ca.lock().unwrap();
                     if let Some(dest) = dest {
-                        fwd(buf[..n].to_vec(), cs.clone(), dest, rng.clone(), faults);
+                        schedule(
+                            buf[..n].to_vec(),
+                            cs.clone(),
+                            dest,
+                            &mut rng,
+                            &mut state,
+                            &faults,
+                        );
                     }
                 }
             }
@@ -517,8 +613,10 @@ async fn run_session(
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
     let out = match metric {
-        Metric::Display => measure_display(&client, Duration::from_secs(4)).await,
-        Metric::Keyboard => measure_keyboard(&client, 20).await,
+        // Longer display window: under burst loss, fewer fresh markers get
+        // through, so a wider window keeps the median statistically meaningful.
+        Metric::Display => measure_display(&client, Duration::from_secs(6)).await,
+        Metric::Keyboard => measure_keyboard(&client, 12).await,
     };
     drop(client); // kills the client; `_server` drops at fn end (kill_on_drop)
     Ok(out)
@@ -572,36 +670,53 @@ async fn main() -> Result<()> {
     );
 
     let conditions = [
+        ("LAN     (rtt~2ms,  0% iid loss)", Faults::iid(0.0, 1, 0)),
+        ("WAN     (rtt~80ms, 5% iid loss)", Faults::iid(0.05, 40, 5)),
+        // Heavy loss, two ways: independent vs bursty at the *same ~15% average*.
+        // This is the headline contrast — bursts are where QUIC's cwnd collapse
+        // (vs mosh blasting through) should show, if it shows anywhere.
         (
-            "LAN    (rtt~2ms,  0% loss)",
-            Faults {
-                loss: 0.0,
-                delay_ms: 1,
-                jitter_ms: 0,
-            },
+            "LOSSY   (rtt~120ms, 15% iid loss)",
+            Faults::iid(0.15, 60, 15),
         ),
         (
-            "DSL    (rtt~40ms, 1% loss)",
+            "BURSTY  (rtt~80ms, ~14% BURST loss)",
             Faults {
-                loss: 0.01,
-                delay_ms: 20,
-                jitter_ms: 3,
-            },
-        ),
-        (
-            "WAN    (rtt~80ms, 5% loss)",
-            Faults {
-                loss: 0.05,
                 delay_ms: 40,
-                jitter_ms: 5,
+                jitter_ms: 10,
+                loss: LossModel::Gilbert {
+                    good_loss: 0.005,
+                    bad_loss: 0.7,
+                    p_enter_bad: 0.0625,
+                    p_leave_bad: 0.25, // mean burst ~4 packets, P(bad)~20%
+                },
+                reorder_prob: 0.0,
+                reorder_extra_ms: 0,
             },
         ),
         (
-            "LOSSY  (rtt~120ms,15% loss)",
+            "REORDER (rtt~60ms, 1% loss, 12% reorder)",
             Faults {
-                loss: 0.15,
-                delay_ms: 60,
-                jitter_ms: 15,
+                delay_ms: 30,
+                jitter_ms: 8,
+                loss: LossModel::Iid(0.01),
+                reorder_prob: 0.12,
+                reorder_extra_ms: 60,
+            },
+        ),
+        (
+            "BRUTAL  (rtt~140ms, bursty + reorder)",
+            Faults {
+                delay_ms: 70,
+                jitter_ms: 25,
+                loss: LossModel::Gilbert {
+                    good_loss: 0.01,
+                    bad_loss: 0.6,
+                    p_enter_bad: 0.04,
+                    p_leave_bad: 0.2, // mean burst ~5 packets
+                },
+                reorder_prob: 0.10,
+                reorder_extra_ms: 80,
             },
         ),
     ];
@@ -615,7 +730,15 @@ async fn main() -> Result<()> {
          predict-on column, means that client isn't behaving as the mode label claims.\n"
     );
 
+    // `BENCH_ONLY=LOSSY,BRUTAL` restricts to conditions whose label contains any
+    // of the comma-separated terms — handy for fast A/B iteration on a subset.
+    let only = std::env::var("BENCH_ONLY").ok();
     for (name, faults) in conditions {
+        if let Some(filter) = &only {
+            if !filter.split(',').any(|t| name.contains(t.trim())) {
+                continue;
+            }
+        }
         // Two different floors. Display is one-way (server→client), so it can't
         // beat a single relay delay. Keyboard is a round trip (type→server→echo→
         // client), so it can't beat 2× the delay. The `rt`/`loc` tag is against
@@ -625,7 +748,9 @@ async fn main() -> Result<()> {
         println!(
             "=== {name} ===   [display 1-way floor ~{one_way:.0} ms · keyboard round-trip floor ~{floor:.0} ms]"
         );
-        println!("  DISPLAY 1-way (predict off)    KEYBOARD round-trip to-glyph (predict off / on)");
+        println!(
+            "  DISPLAY 1-way (predict off)    KEYBOARD round-trip to-glyph (predict off / on)"
+        );
         for &t in targets {
             let (d_med, d_p90, dn) =
                 matrix_cell(t, &bins, faults, Predict::Never, Metric::Display, seeds).await;
