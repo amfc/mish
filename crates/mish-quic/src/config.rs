@@ -20,9 +20,16 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DistinguishedName, SignatureScheme};
 
-/// Datagram receive/send buffer sizes (bytes). Generous; the SSP layer keeps
-/// instructions small.
-const DATAGRAM_BUFFER: usize = 1024 * 1024;
+/// Datagram receive buffer (bytes): holds datagrams that have arrived but not yet
+/// been read. Modest — the driver drains promptly and the SSP layer keeps
+/// instructions small (a full repaint is a handful of MTU-sized fragments).
+const DATAGRAM_RECV_BUFFER: usize = 256 * 1024;
+/// Datagram *send* buffer (bytes): deliberately small. SSP is latest-wins, so if
+/// the link stalls we want stale screen diffs **dropped** (quinn evicts oldest
+/// when full) and the next send to re-diff to the current screen — not a backlog
+/// of obsolete frames played out late (bufferbloat). 64 KiB is dozens of frames'
+/// headroom for normal bursts while still bounding stall-time latency.
+const DATAGRAM_SEND_BUFFER: usize = 64 * 1024;
 
 /// Install the ring crypto provider as the process default, once. rustls 0.23
 /// requires a default provider for the convenience constructors we use.
@@ -44,8 +51,8 @@ const MAX_SIDE_CHANNELS: u32 = 16;
 /// number of reliable bidi streams for side-channels (scrollback, …).
 fn transport_config() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
-    tc.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
-    tc.datagram_send_buffer_size(DATAGRAM_BUFFER);
+    tc.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
+    tc.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     // Allow a bounded number of reliable bidi streams for side-channels; no uni
     // streams (every side-channel is request/response, so it needs both halves).
     tc.max_concurrent_bidi_streams(MAX_SIDE_CHANNELS.into());
@@ -53,6 +60,19 @@ fn transport_config() -> Arc<TransportConfig> {
     // Keep idle connections alive across roaming gaps (mosh tolerates long naps).
     tc.keep_alive_interval(Some(Duration::from_secs(5)));
     tc.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+    // The assumed RTT before the first sample sizes the first PTO. quinn's default
+    // (333 ms) means an early-lost packet on a fast link waits a third of a second
+    // to recover — terrible for an interactive first keystroke / reconnect. 100 ms
+    // is a safe floor: above realistic LAN/metro RTTs (so no spurious early
+    // retransmits) but ~3× faster recovery than the default.
+    tc.initial_rtt(Duration::from_millis(100));
+    // Ask the peer not to sit on ACKs: the default lets a receiver delay an ACK up
+    // to ~25 ms, which loosens our RTT estimate and PTO. For tiny interactive
+    // datagrams the ACK cost is negligible, so cap the delay at 5 ms — tighter RTT
+    // and faster loss detection on the echo path (quinn↔quinn only).
+    let mut ack = quinn::AckFrequencyConfig::default();
+    ack.max_ack_delay(Some(Duration::from_millis(5)));
+    tc.ack_frequency_config(Some(ack));
     Arc::new(tc)
 }
 
@@ -379,9 +399,9 @@ mod tests {
         let mut adversarial: Vec<Vec<u8>> = vec![
             other.as_ref().to_vec(),
             Vec::new(),
-            pin[..pin.len() - 1].to_vec(),     // truncated
-            [pin, &[0u8]].concat(),            // extended
-            pin[..pin.len() / 2].to_vec(),     // prefix
+            pin[..pin.len() - 1].to_vec(), // truncated
+            [pin, &[0u8]].concat(),        // extended
+            pin[..pin.len() / 2].to_vec(), // prefix
         ];
         for i in 0..pin.len() {
             let mut flipped = pin.to_vec();
@@ -389,7 +409,11 @@ mod tests {
             adversarial.push(flipped);
         }
         for bytes in adversarial {
-            assert_ne!(bytes.as_slice(), pin, "test bug: perturbation equals pinned");
+            assert_ne!(
+                bytes.as_slice(),
+                pin,
+                "test bug: perturbation equals pinned"
+            );
             let cert = CertificateDer::from(bytes);
             assert!(
                 v.verify_client_cert(&cert, &[], now).is_err(),
@@ -401,7 +425,9 @@ mod tests {
         // turn a wrong cert into an accept, nor a right cert into a reject.
         let bogus = CertificateDer::from(vec![0u8; 48]);
         assert!(v.verify_client_cert(&pinned, &[bogus.clone()], now).is_ok());
-        assert!(v.verify_client_cert(&other, &[pinned.clone()], now).is_err());
+        assert!(v
+            .verify_client_cert(&other, &[pinned.clone()], now)
+            .is_err());
     }
 
     /// Client side of seam #0 — server pinning. The client trusts exactly the one
