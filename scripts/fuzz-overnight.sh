@@ -32,6 +32,10 @@ TARGETS=(
   instruction_decode      # wire instruction decode
   frag_reassemble         # fragment reassembler
   userstream_decode       # keystroke / UserStream decode
+  # security-seam targets
+  answerback_safety       # answerback loopback can't inject into the shell (no CR/LF)
+  tty_emission_safety     # OSC title/URI can't break framing on the client TTY
+  frag_memory_bounds      # reassembler memory stays bounded under a hostile peer
 )
 [ "$#" -gt 0 ] && TARGETS=("$@")
 
