@@ -63,6 +63,13 @@ pub struct SspConfig {
     /// `attempt_prospective_resend_optimization`). On by default; exposed mainly
     /// so benchmarks can A/B its effect.
     pub prospective_resend: bool,
+    /// Enable congestion-aware frame pacing: when the transport reports
+    /// congestion (QUIC's ECN-CE / loss signal, via
+    /// [`SspCore::note_congestion`]), stretch the send interval so we coalesce
+    /// harder and stop adding frames to a congested path. Bounded by
+    /// `send_interval_max`, and decays back quickly once the path clears. On by
+    /// default; off restores a purely RTT-paced cadence.
+    pub congestion_pacing: bool,
 }
 
 impl Default for SspConfig {
@@ -78,9 +85,23 @@ impl Default for SspConfig {
             max_sent_states: 32,
             max_received_states: 1024,
             prospective_resend: true,
+            congestion_pacing: true,
         }
     }
 }
+
+/// Congestion backoff multiplied into the send interval per congestion event,
+/// capped at [`CONGESTION_MAX_BACKOFF`]. Gentle so a single ECN-CE / loss event
+/// nudges rather than slams the cadence (interactivity stays the priority).
+const CONGESTION_GROWTH: f64 = 1.3;
+/// Hard cap on the congestion backoff multiplier. The send interval is *also*
+/// clamped to `send_interval_max`, so this only matters when the RTT-paced base
+/// is already well below that ceiling.
+const CONGESTION_MAX_BACKOFF: f64 = 2.0;
+/// Half-life (ms) of the backoff once congestion stops: after this long with no
+/// new events, the multiplier has decayed halfway back to 1.0. Short, so a brief
+/// congestion blip doesn't keep penalizing a path that has recovered.
+const CONGESTION_HALFLIFE_MS: f64 = 500.0;
 
 #[derive(Clone, Debug)]
 struct Timestamped<S> {
@@ -162,6 +183,18 @@ pub struct SspCore<L: SyncState, R: SyncState> {
     saved_timestamp: Option<u16>,
     saved_timestamp_received_at: Millis,
 
+    // ---- Congestion-aware pacing ----
+    /// Backoff multiplier at the moment of the last congestion event (≥ 1.0).
+    /// The *effective* multiplier decays from here toward 1.0 over time — see
+    /// [`SspCore::congestion_backoff`].
+    congestion_peak: f64,
+    /// Clock time of the last congestion event the transport reported.
+    last_congestion_ms: Millis,
+    /// Highest cumulative congestion-event count we've already folded in, so
+    /// repeated [`note_congestion`](SspCore::note_congestion) calls only react to
+    /// genuinely new events.
+    congestion_events_seen: u64,
+
     // ---- Shutdown handshake ----
     /// We have initiated a clean shutdown (sending num = SHUTDOWN_NUM).
     shutdown_in_progress: bool,
@@ -205,6 +238,9 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             rtt: Rtt::new(),
             saved_timestamp: None,
             saved_timestamp_received_at: 0,
+            congestion_peak: 1.0,
+            last_congestion_ms: now,
+            congestion_events_seen: 0,
             shutdown_in_progress: false,
             shutdown_acked: false,
             peer_shutdown: false,
@@ -245,6 +281,13 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         } else {
             self.cfg.rto as f64
         }
+    }
+
+    /// Current data-frame send interval (ms) at `now`, including any congestion
+    /// backoff — the cadence [`tick`](SspCore::tick) actually paces to.
+    /// Introspection for tests and benchmarks.
+    pub fn send_interval_ms(&self, now: Millis) -> Millis {
+        self.send_interval(now)
     }
 
     /// Begin a clean shutdown: subsequent ticks send `SHUTDOWN_NUM` instructions
@@ -299,16 +342,47 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
 
     // ----- Timing -----
 
-    fn send_interval(&self) -> Millis {
+    fn send_interval(&self, now: Millis) -> Millis {
         // Aim for ~2 frames per RTT, clamped to the configured bounds. Falls back
         // to the minimum interval until we have an RTT sample.
         let lo = self.cfg.send_interval_min.min(self.cfg.send_interval_max);
-        if self.rtt.initialized {
-            (self.rtt.srtt / 2.0).ceil() as Millis
+        let base = if self.rtt.initialized {
+            (self.rtt.srtt / 2.0).ceil()
         } else {
-            self.cfg.send_interval_min
+            self.cfg.send_interval_min as f64
+        };
+        // Stretch the cadence under congestion so we stop adding frames to a
+        // congested path; bounded by send_interval_max either way.
+        let interval = (base * self.congestion_backoff(now)).ceil() as Millis;
+        interval.clamp(lo, self.cfg.send_interval_max)
+    }
+
+    /// Note the transport's *cumulative* congestion-event count (QUIC's ECN-CE
+    /// and loss signal). Each genuinely-new event nudges the send-interval
+    /// backoff up by [`CONGESTION_GROWTH`] (capped at [`CONGESTION_MAX_BACKOFF`]);
+    /// the effect then decays — see [`SspCore::congestion_backoff`]. A no-op when
+    /// `congestion_pacing` is off or the count hasn't advanced, so a quiet path
+    /// (and every in-memory-transport test) keeps the exact RTT-paced cadence.
+    pub fn note_congestion(&mut self, now: Millis, cumulative_events: u64) {
+        if !self.cfg.congestion_pacing || cumulative_events <= self.congestion_events_seen {
+            return;
         }
-        .clamp(lo, self.cfg.send_interval_max)
+        self.congestion_events_seen = cumulative_events;
+        let current = self.congestion_backoff(now);
+        self.congestion_peak = (current * CONGESTION_GROWTH).min(CONGESTION_MAX_BACKOFF);
+        self.last_congestion_ms = now;
+    }
+
+    /// The current send-interval backoff multiplier (≥ 1.0): the peak set at the
+    /// last congestion event, decayed toward 1.0 with a [`CONGESTION_HALFLIFE_MS`]
+    /// half-life so a transient blip doesn't keep penalizing a recovered path.
+    fn congestion_backoff(&self, now: Millis) -> f64 {
+        if !self.cfg.congestion_pacing || self.congestion_peak <= 1.0 {
+            return 1.0;
+        }
+        let elapsed = now.saturating_sub(self.last_congestion_ms) as f64;
+        let decay = 0.5_f64.powf(elapsed / CONGESTION_HALFLIFE_MS);
+        (1.0 + (self.congestion_peak - 1.0) * decay).max(1.0)
     }
 
     /// Floor for the RTT-derived RTO (ms), so a tiny RTT can't make us
@@ -381,10 +455,11 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
                 .mindelay_clock
                 .unwrap()
                 .saturating_add(self.cfg.send_mindelay);
-            self.next_send_time = mindelay.max(back.timestamp.saturating_add(self.send_interval()));
+            self.next_send_time =
+                mindelay.max(back.timestamp.saturating_add(self.send_interval(now)));
         } else if !self.current_state.equals(&self.assumed().state) && active {
             // Sent, but not yet (assumed) delivered — retransmit at frame rate.
-            self.next_send_time = back.timestamp.saturating_add(self.send_interval());
+            self.next_send_time = back.timestamp.saturating_add(self.send_interval(now));
             if let Some(mc) = self.mindelay_clock {
                 self.next_send_time = self
                     .next_send_time
@@ -402,7 +477,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
 
         if self.ack_num == u64::MAX {
             // shutdown special-case (reserved)
-            self.next_ack_time = back.timestamp.saturating_add(self.send_interval());
+            self.next_ack_time = back.timestamp.saturating_add(self.send_interval(now));
         }
     }
 
@@ -438,7 +513,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             let mut out = Vec::new();
             if now >= self.next_send_time {
                 self.emit_shutdown(now, &mut out);
-                self.next_send_time = now.saturating_add(self.send_interval());
+                self.next_send_time = now.saturating_add(self.send_interval(now));
             }
             return out;
         }

@@ -270,3 +270,78 @@ fn prospective_resend_recovers_from_a_lost_datagram() {
         "peer recovers from the lost datagram in a single step"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Congestion-aware frame pacing
+// ---------------------------------------------------------------------------
+
+use mish_ssp::core::SspConfig;
+
+/// With no RTT sample yet, the base send interval is `send_interval_min` (20 ms);
+/// a reported congestion event stretches it (ECN-CE / loss → back off the cadence).
+#[test]
+fn congestion_event_stretches_send_interval() {
+    let mut a = Core::new(0);
+    assert_eq!(a.send_interval_ms(0), 20, "base interval with no RTT");
+    a.note_congestion(0, 1); // one new cumulative congestion event
+    assert_eq!(a.send_interval_ms(0), 26, "20 ms * 1.3 backoff");
+    assert!(a.send_interval_ms(0) > 20);
+}
+
+/// The backoff is capped (here 2×), so even sustained congestion can't run the
+/// cadence away — and it's still further clamped to `send_interval_max`.
+#[test]
+fn congestion_backoff_is_capped() {
+    let mut a = Core::new(0);
+    for events in 1..=50 {
+        a.note_congestion(0, events); // each a genuinely-new cumulative count
+    }
+    assert_eq!(a.send_interval_ms(0), 40, "20 ms * 2.0 cap, no further");
+}
+
+/// Once congestion stops, the backoff decays back toward the base interval.
+#[test]
+fn congestion_backoff_decays_when_path_clears() {
+    let mut a = Core::new(0);
+    a.note_congestion(0, 1);
+    let hot = a.send_interval_ms(0);
+    assert!(hot > 20);
+    // Four half-lives later (4 × 500 ms) the multiplier is ~1.02.
+    let cooled = a.send_interval_ms(2000);
+    assert!(
+        cooled < hot,
+        "interval relaxes as the path clears: {cooled} !< {hot}"
+    );
+    assert!(
+        cooled <= 21,
+        "decayed essentially back to base, got {cooled}"
+    );
+}
+
+/// A repeated cumulative count is not new congestion, so it doesn't keep backing
+/// off — only genuinely-new events do.
+#[test]
+fn repeated_congestion_count_is_idempotent() {
+    let mut a = Core::new(0);
+    a.note_congestion(0, 3); // 0 → 3: one bump
+    let after = a.send_interval_ms(0);
+    a.note_congestion(0, 3); // same count: no-op
+    assert_eq!(a.send_interval_ms(0), after);
+}
+
+/// With `congestion_pacing` off, the cadence is purely RTT-paced regardless of
+/// reported congestion — the escape hatch / A-B control.
+#[test]
+fn congestion_pacing_can_be_disabled() {
+    let cfg = SspConfig {
+        congestion_pacing: false,
+        ..SspConfig::default()
+    };
+    let mut a = Core::with_config(0, cfg);
+    a.note_congestion(0, 10);
+    assert_eq!(
+        a.send_interval_ms(0),
+        20,
+        "no backoff when pacing is disabled"
+    );
+}

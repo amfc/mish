@@ -209,6 +209,12 @@ where
         loop {
             let now = self.clock.now_ms();
 
+            // 0. Feed the transport's congestion signal (QUIC ECN-CE / loss) into
+            //    the pacer so the next tick can stretch the cadence if the path is
+            //    congested. Cheap; a no-op for transports that report none.
+            self.core
+                .note_congestion(now, self.transport.congestion_events());
+
             // 1. Run the protocol and flush any instructions to the wire.
             for inst in self.core.tick(now) {
                 self.send(inst).await?;

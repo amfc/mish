@@ -45,4 +45,14 @@ pub trait Transport: Send + Sync + 'static {
     fn max_datagram_size(&self) -> usize {
         usize::MAX
     }
+
+    /// Cumulative count of congestion events the transport's congestion
+    /// controller has observed — QUIC folds both ECN-CE marks and loss-based
+    /// congestion into this. The protocol samples it to pace frames away from a
+    /// congested path (see [`SspCore::note_congestion`](crate::core::SspCore::note_congestion)).
+    /// Defaults to 0 for transports without a congestion controller (the
+    /// in-memory test transport), which keeps the cadence purely RTT-paced.
+    fn congestion_events(&self) -> u64 {
+        0
+    }
 }

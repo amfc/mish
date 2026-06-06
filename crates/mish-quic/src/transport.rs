@@ -96,6 +96,13 @@ impl Transport for QuicTransport {
         // so the fragmenter never produces 1-byte fragments.
         self.conn.max_datagram_size().unwrap_or(1200).max(512)
     }
+
+    fn congestion_events(&self) -> u64 {
+        // Quinn increments this on both ECN-CE marks (process_ecn) and loss-based
+        // congestion, so it's the ECN-aware "the path is congested" signal the
+        // SSP pacer wants. `stats()` is a cheap copy of counters.
+        self.conn.stats().path.congestion_events
+    }
 }
 
 /// Build a server endpoint bound to `addr` (use port 0 for an ephemeral port).
