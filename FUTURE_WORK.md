@@ -137,33 +137,45 @@ overlay) are all done. These are the remaining parity polish:
 
 ## Built-in SSH bootstrap (`--bootstrap=builtin`)
 
-The session bootstrap can now run over a builtin, pure-Rust SSH client
-([`russh`]) instead of the system `ssh` binary, selected with `--bootstrap`
-(`auto` — the default — uses the system `ssh` if it's on `PATH`, else the
-builtin client; `ssh` and `builtin` force one). This is the groundwork for an
-`mish` that runs where upstream mosh never could — primarily **Windows**, which
-has no external `ssh` to rely on. (`bootstrap::builtin`, `bootstrap_e2e.rs`
-covers the local path; the builtin path is exercised manually against a real
-sshd.)
+The session bootstrap can run over a builtin, pure-Rust SSH client ([`russh`])
+instead of the system `ssh` binary, selected with `--bootstrap` (`auto` — the
+default — uses the system `ssh` if it's on `PATH`, else the builtin client; `ssh`
+and `builtin` force one). This is the groundwork for an `mish` that runs where
+upstream mosh never could — primarily **Windows**, which has no external `ssh`.
 
-Intentionally scoped out of this first pass, in rough effort order:
+**Now implemented** (all pure-Rust, no C deps — important for the Windows goal):
+
+- **Auth.** ssh-agent (Unix) → identity files, **prompting for a passphrase on an
+  encrypted key** (`rpassword`) → **keyboard-interactive** → **password**. The
+  method order follows the server's advertised set; the two interactive
+  fallbacks prompt only when stdin is a terminal.
+- **`~/.ssh/config`.** `HostName`/`Port`/`User`/`IdentityFile`/`ProxyJump` are
+  resolved via `russh-config` (command-line user/port win); `~` in identity paths
+  is expanded. `$MISH_SSH_CONFIG` overrides the config path.
+- **ProxyJump.** A jump chain is tunnelled with chained direct-tcpip channels;
+  each hop authenticates independently and its handle is held for the session.
+- **Host keys.** Checked against `~/.ssh/known_hosts`: mismatch rejected, unknown
+  accepted trust-on-first-use.
+
+Remaining, in rough effort order:
 
 - **Windows port itself** — *the actual goal this unblocks.* The builtin
   bootstrap removes the hard `ssh` dependency, but the client/server still use
   Unix PTYs, signals (`SIGWINCH`/`SIGCONT`/`SIGTSTP`), and `libc`. A Windows
   build needs a ConPTY server side and a crossterm-based client side. *Larger.*
-- **Auth methods.** The builtin client tries the ssh-agent (Unix socket only)
-  then unencrypted `~/.ssh/id_{ed25519,ecdsa,rsa}`. No password /
-  keyboard-interactive (needs a TTY prompt), no passphrase-locked keys (needs a
-  prompt + caching), no `IdentityFile`/`IdentitiesOnly` from `~/.ssh/config`, and
-  on Windows no named-pipe agent. Fall back to `--bootstrap=ssh` meanwhile.
-- **Host-key trust.** Matches `~/.ssh/known_hosts` and rejects a *mismatch*, but
-  an *unknown* host is accepted trust-on-first-use and **not written back** (so
-  it re-warns each run). Persisting accepted keys (and an interactive
-  accept/reject prompt) is future work.
-- **SSH port / config.** The builtin path takes its port from `--ssh-port`
-  (default 22) and does no `~/.ssh/config` parsing (`Host`/`HostName`/`Port`/
-  `User`/`ProxyJump`), unlike shelling out to `ssh`.
+  (On Windows the builtin client also needs the named-pipe ssh-agent; the Unix
+  socket agent is `#[cfg(unix)]`.)
+- **Auth polish.** No passphrase **caching** (re-prompts per key), no
+  `IdentitiesOnly`/`AddKeysToAgent`, no PKCS#11. `known_hosts` trust-on-first-use
+  is **not written back** (re-warns each run); persisting accepted keys + an
+  interactive accept/reject prompt is future work.
+- **ssh_config gaps.** `russh-config` handles `Host` wildcards but **not `Match`
+  or `Include`**, and we read `ProxyJump` but not `ProxyCommand`. (`ssh2-config`
+  is more complete but drags in a `git2` build-dependency → libgit2/openssl/
+  libssh2 C libraries, which would break the no-C Windows goal, so it's avoided.)
+- **ProxyJump UDP.** Only the **SSH bootstrap** is tunnelled; the mosh UDP session
+  still connects directly to the resolved target (mosh roaming isn't tunnelled),
+  so the target must be UDP-reachable. Tunnelling UDP would be a larger change.
 - **IPv6 UDP target.** Shared with the `ssh` path: the QUIC client endpoint binds
   `0.0.0.0:0` (IPv4), so if the host resolves to an IPv6 address first the
   follow-on QUIC connect fails. The endpoint should bind to match the resolved

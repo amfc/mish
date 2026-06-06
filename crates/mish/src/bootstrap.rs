@@ -37,6 +37,7 @@
 //! close; we run the server with `--detach` over SSH, so the daemon survives
 //! either transport closing.)
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -44,7 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use russh::client::{self};
+use russh::client::{self, KeyboardInteractiveAuthResponse};
 use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use russh::{ChannelMsg, Disconnect};
 use tokio::process::{Child, Command};
@@ -77,9 +78,17 @@ enum Guard {
     /// more diagnostic to stderr *before* it forks the `--detach` daemon, so
     /// closing the channel early could deliver SIGPIPE to the parent before it
     /// detaches. The daemon (post-fork, stdio redirected to /dev/null) outlives
-    /// this connection regardless. Held only for its `Drop`; never read.
+    /// this connection regardless.
+    ///
+    /// For a `ProxyJump` connection the `jumps` handles must also stay alive: the
+    /// target's stream rides a direct-tcpip channel on the last jump, which rides
+    /// the previous jump, … back to the TCP connection on `jumps[0]`. Dropping any
+    /// of them collapses the tunnel. Held only for their `Drop`; never read.
     #[allow(dead_code)]
-    Connection(client::Handle<BuiltinHandler>),
+    Connection {
+        target: client::Handle<BuiltinHandler>,
+        jumps: Vec<client::Handle<BuiltinHandler>>,
+    },
 }
 
 impl Drop for Guard {
@@ -161,10 +170,12 @@ pub fn program_on_path(prog: &str) -> bool {
     false
 }
 
-/// Build the `mish-server` argument list: optional `--detach`, an optional named
-/// reattachable `--session NAME`, an ephemeral port, then an optional `-- command`.
+/// Build the `mish-server` argument list: optional `--detach`, optional
+/// `--shared` (multi-client), an optional named reattachable `--session NAME`,
+/// an ephemeral port, then an optional `-- command`.
 fn server_args(
     detach: bool,
+    shared: bool,
     session: Option<&str>,
     port: &str,
     command: Option<&str>,
@@ -172,6 +183,9 @@ fn server_args(
     let mut args = Vec::new();
     if detach {
         args.push("--detach".to_string());
+    }
+    if shared {
+        args.push("--shared".to_string());
     }
     if let Some(name) = session {
         args.push("--session".to_string());
@@ -188,13 +202,14 @@ fn server_args(
 /// Start `mish-server` locally as a child process (no SSH). Used for `--local`.
 pub async fn local(
     server_cmd: &str,
+    shared: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
     // Local mode: keep the server in the foreground as a managed child (no
     // detach — we kill it when the session ends).
     let mut child = Command::new(server_cmd)
-        .args(server_args(false, session, "0", command))
+        .args(server_args(false, shared, session, "0", command))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -224,6 +239,7 @@ pub async fn ssh(
     ssh_pty: bool,
     host: &str,
     server_cmd: &str,
+    shared: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
@@ -241,7 +257,7 @@ pub async fn ssh(
     cmd.arg(host)
         .arg("--")
         .arg(server_cmd)
-        .args(server_args(true, session, "0", command));
+        .args(server_args(true, shared, session, "0", command));
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -272,45 +288,72 @@ pub async fn ssh(
 /// Bootstrap with the builtin, pure-Rust SSH client ([`russh`]) instead of the
 /// system `ssh` binary — `--bootstrap=builtin`.
 ///
-/// `host` is `[user@]hostname` (no `ssh -p` parsing — the port comes from
-/// `port`, the client's `--ssh-port`). We connect, authenticate (ssh-agent first,
-/// then the default `~/.ssh/id_*` keys), `exec` `mish-server --detach …` over a
-/// session channel, and read its `MISH CONNECT` line. As with the `ssh`
-/// transport the server daemonizes, so the QUIC/UDP session outlives this
-/// connection.
+/// `host` is `[user@]alias` and `port` is the explicit `--ssh-port` (or `None`).
+/// We resolve the alias through `~/.ssh/config` (`HostName`/`Port`/`User`/
+/// `IdentityFile`/`ProxyJump`; an explicit command-line user/port wins), connect
+/// — directly, or tunnelled through the `ProxyJump` chain — authenticate
+/// (ssh-agent → identity files, prompting for a passphrase on an encrypted key →
+/// keyboard-interactive → password), then `exec` `mish-server --detach …` and
+/// read its `MISH CONNECT` line. The server daemonizes, so the QUIC/UDP session
+/// outlives this connection.
 ///
-/// Auth is intentionally limited for this first pass: ssh-agent and unencrypted
-/// on-disk keys only (no password / keyboard-interactive). Host keys are checked
-/// against `~/.ssh/known_hosts` — a mismatch is rejected; an unknown host is
-/// accepted on a trust-on-first-use basis (logged, but not written back).
+/// Host keys are checked against `~/.ssh/known_hosts`: a mismatch is rejected, an
+/// unknown host is accepted trust-on-first-use (logged, not persisted). Password
+/// and passphrase prompts happen only when stdin is a real terminal.
+///
+/// `ProxyJump` tunnels only the **SSH bootstrap**; the mosh UDP session still
+/// connects directly to the resolved target address (mosh roaming uses its own
+/// path and is not tunnelled), so the target must be reachable by UDP.
 pub async fn builtin(
     host: &str,
-    port: u16,
+    port: Option<u16>,
     server_cmd: &str,
+    shared: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
-    let (user, hostname) = split_user_host(host);
-    let user = user.unwrap_or_else(default_user);
+    let (cli_user, alias) = split_user_host(host);
+    let target = resolve_host(&alias, cli_user.as_deref(), port);
 
-    let config = Arc::new(client::Config::default());
-    let handler = BuiltinHandler {
-        host: hostname.clone(),
-        port,
+    let rconfig = Arc::new(client::Config::default());
+
+    // Connect to the target — directly, or through the ProxyJump chain.
+    let (mut handle, jumps) = if target.proxy_jump.is_empty() {
+        let handler = BuiltinHandler {
+            host: target.hostname.clone(),
+            port: target.port,
+        };
+        let h = client::connect(
+            rconfig.clone(),
+            (target.hostname.as_str(), target.port),
+            handler,
+        )
+        .await
+        .with_context(|| format!("connecting to {}:{}", target.hostname, target.port))?;
+        (h, Vec::new())
+    } else {
+        let (stream, jumps) = open_proxy_chain(&target, &rconfig).await?;
+        let handler = BuiltinHandler {
+            host: target.hostname.clone(),
+            port: target.port,
+        };
+        let h = client::connect_stream(rconfig.clone(), stream, handler)
+            .await
+            .with_context(|| {
+                format!("connecting to {}:{} via ProxyJump", target.hostname, target.port)
+            })?;
+        (h, jumps)
     };
-    let mut handle = client::connect(config, (hostname.as_str(), port), handler)
-        .await
-        .with_context(|| format!("connecting to {hostname}:{port}"))?;
 
-    authenticate(&mut handle, &user)
+    authenticate(&mut handle, &target.user, &target.identities)
         .await
-        .with_context(|| format!("authenticating to {user}@{hostname}"))?;
+        .with_context(|| format!("authenticating to {}@{}", target.user, target.hostname))?;
 
     // Build the remote command line. The args mirror the `ssh` transport's
     // (`--detach` so the server survives this connection closing); each is
     // shell-quoted because sshd runs the whole string through the login shell.
     let argv = std::iter::once(server_cmd.to_string())
-        .chain(server_args(true, session, "0", command))
+        .chain(server_args(true, shared, session, "0", command))
         .map(|a| shell_quote(&a))
         .collect::<Vec<_>>()
         .join(" ");
@@ -329,19 +372,23 @@ pub async fn builtin(
 
     let creds = read_connect_channel(&mut channel).await?;
 
-    // The UDP session goes to the same host we SSHed to; resolve its address.
-    let ip = tokio::net::lookup_host((hostname.as_str(), creds.port))
+    // The UDP session goes directly to the resolved target host (even when SSH was
+    // tunnelled through a jump); resolve its address.
+    let ip = tokio::net::lookup_host((target.hostname.as_str(), creds.port))
         .await
-        .with_context(|| format!("resolving {hostname}"))?
+        .with_context(|| format!("resolving {}", target.hostname))?
         .next()
-        .ok_or_else(|| anyhow!("no address for {hostname}"))?;
+        .ok_or_else(|| anyhow!("no address for {}", target.hostname))?;
 
     Ok(Bootstrap {
         addr: ip,
         server_cert_der: creds.server_cert,
         client_cert_der: creds.client_cert,
         client_key_der: creds.client_key,
-        _guard: Guard::Connection(handle),
+        _guard: Guard::Connection {
+            target: handle,
+            jumps,
+        },
     })
 }
 
@@ -454,13 +501,182 @@ impl client::Handler for BuiltinHandler {
     }
 }
 
-/// Authenticate `handle` as `user`: try every ssh-agent identity first (Unix
-/// only), then the default unencrypted `~/.ssh/id_*` keys. Errors if none work.
-async fn authenticate(handle: &mut client::Handle<BuiltinHandler>, user: &str) -> Result<()> {
-    // 1. ssh-agent (the common case: keys unlocked once, held by the agent).
-    //    Unix-only for now — the Windows named-pipe agent is future work.
+// ---- host / config resolution -------------------------------------------------
+
+/// A connection target resolved from the command line + `~/.ssh/config`.
+struct ResolvedHost {
+    hostname: String,
+    port: u16,
+    user: String,
+    /// Identity files to try (config `IdentityFile`s, tilde-expanded).
+    identities: Vec<PathBuf>,
+    /// `ProxyJump` chain (`[user@]host[:port]` hops), nearest jump first.
+    proxy_jump: Vec<String>,
+}
+
+/// Path to the ssh config to consult: `$MISH_SSH_CONFIG`, else `~/.ssh/config`.
+fn ssh_config_path() -> Option<PathBuf> {
+    std::env::var_os("MISH_SSH_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".ssh").join("config")))
+}
+
+/// Parse the ssh config as it applies to `alias`. Returns empty defaults (the
+/// alias used verbatim) when there is no config file or it won't parse.
+fn ssh_config_for(alias: &str) -> russh_config::Config {
+    if let Some(p) = ssh_config_path() {
+        if p.is_file() {
+            if let Ok(c) = russh_config::parse_path(&p, alias) {
+                return c;
+            }
+        }
+    }
+    russh_config::Config::default(alias)
+}
+
+/// Resolve `alias` against the ssh config. A command-line `user`/`port` wins over
+/// the config (mirroring OpenSSH); otherwise fall back to the config's
+/// HostName/Port/User, then the literal alias, the local login, and port 22.
+fn resolve_host(alias: &str, cli_user: Option<&str>, cli_port: Option<u16>) -> ResolvedHost {
+    resolve_from(ssh_config_for(alias), cli_user, cli_port)
+}
+
+/// The precedence + field-mapping core of [`resolve_host`], split out so it can be
+/// unit-tested against a parsed config without touching the filesystem.
+fn resolve_from(c: russh_config::Config, cli_user: Option<&str>, cli_port: Option<u16>) -> ResolvedHost {
+    ResolvedHost {
+        // `host()` is the resolved HostName (falling back to the alias).
+        hostname: c.host().to_string(),
+        port: cli_port.or(c.host_config.port).or(c.port).unwrap_or(22),
+        user: cli_user
+            .map(str::to_string)
+            .or_else(|| c.host_config.user.clone())
+            .or_else(|| c.user.clone())
+            .unwrap_or_else(default_user),
+        identities: c
+            .host_config
+            .identity_file
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .map(|p| expand_tilde(p))
+            .collect(),
+        proxy_jump: c
+            .host_config
+            .proxy_jump
+            .as_deref()
+            .map(split_proxy_jump)
+            .unwrap_or_default(),
+    }
+}
+
+/// Split a `ProxyJump` value (`jump1, user@jump2:2222`) into hops, nearest first.
+fn split_proxy_jump(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+/// Parse one ProxyJump hop spec `[user@]host[:port]` into its parts. A trailing
+/// `:NNNN` is a port only when it's numeric (so `host` without a port is left
+/// intact). Pure, so it can be unit-tested.
+fn parse_jump_spec(spec: &str) -> (Option<String>, String, Option<u16>) {
+    let (user, rest) = split_user_host(spec);
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse::<u16>().ok()),
+        _ => (rest, None),
+    };
+    (user, host, port)
+}
+
+/// Resolve one `[user@]host[:port]` ProxyJump hop (the host is then looked up in
+/// the ssh config too, so a jump can itself be a configured alias).
+fn resolve_jump(spec: &str) -> ResolvedHost {
+    let (user, host, port) = parse_jump_spec(spec);
+    resolve_host(&host, user.as_deref(), port)
+}
+
+/// Expand a leading `~` / `~/…` in a path to the home directory.
+fn expand_tilde(p: &Path) -> PathBuf {
+    if let Ok(rest) = p.strip_prefix("~") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// Establish the SSH tunnel through `target.proxy_jump` and return a stream to the
+/// target (the last hop's direct-tcpip channel), plus the jump handles — which the
+/// caller must keep alive, since the tunnel rides on them.
+async fn open_proxy_chain(
+    target: &ResolvedHost,
+    rconfig: &Arc<client::Config>,
+) -> Result<(
+    russh::ChannelStream<client::Msg>,
+    Vec<client::Handle<BuiltinHandler>>,
+)> {
+    let mut handles: Vec<client::Handle<BuiltinHandler>> = Vec::new();
+    for (i, spec) in target.proxy_jump.iter().enumerate() {
+        let hop = resolve_jump(spec);
+        let handler = BuiltinHandler {
+            host: hop.hostname.clone(),
+            port: hop.port,
+        };
+        let mut h = if i == 0 {
+            // First hop: a real TCP connection.
+            client::connect(rconfig.clone(), (hop.hostname.as_str(), hop.port), handler)
+                .await
+                .with_context(|| format!("connecting to jump host {}:{}", hop.hostname, hop.port))?
+        } else {
+            // Subsequent hops ride a direct-tcpip channel on the previous hop.
+            let chan = handles[i - 1]
+                .channel_open_direct_tcpip(hop.hostname.clone(), hop.port as u32, "127.0.0.1", 0)
+                .await
+                .with_context(|| format!("tunnelling to jump host {}:{}", hop.hostname, hop.port))?;
+            client::connect_stream(rconfig.clone(), chan.into_stream(), handler)
+                .await
+                .with_context(|| format!("connecting to jump host {} via tunnel", hop.hostname))?
+        };
+        authenticate(&mut h, &hop.user, &hop.identities)
+            .await
+            .with_context(|| format!("authenticating to jump host {}@{}", hop.user, hop.hostname))?;
+        handles.push(h);
+    }
+    // Final tunnel from the last jump to the real target.
+    let last = handles.last().expect("proxy_jump is non-empty here");
+    let chan = last
+        .channel_open_direct_tcpip(target.hostname.clone(), target.port as u32, "127.0.0.1", 0)
+        .await
+        .with_context(|| format!("tunnelling to {}:{}", target.hostname, target.port))?;
+    Ok((chan.into_stream(), handles))
+}
+
+// ---- authentication -----------------------------------------------------------
+
+/// Authenticate `handle` as `user`, trying methods roughly in OpenSSH order:
+/// discover what the server allows, then ssh-agent (Unix) → identity files
+/// (prompting for a passphrase on an encrypted key) → keyboard-interactive →
+/// password. The two interactive fallbacks only prompt when stdin is a terminal.
+async fn authenticate(
+    handle: &mut client::Handle<BuiltinHandler>,
+    user: &str,
+    identities: &[PathBuf],
+) -> Result<()> {
+    // Probe with the "none" method to learn the server's allowed methods (and to
+    // catch the rare server that accepts no-auth outright).
+    let mut allowed = match handle.authenticate_none(user).await {
+        Ok(r) if r.success() => return Ok(()),
+        Ok(r) => allowed_methods(&r),
+        // Couldn't probe: assume the common set and let the attempts sort it out.
+        Err(_) => vec!["publickey".into(), "keyboard-interactive".into(), "password".into()],
+    };
+    let pubkey_ok = |a: &[String]| a.iter().any(|m| m == "publickey");
+
+    // 1. ssh-agent (Unix only for now — the Windows named-pipe agent is future work).
     #[cfg(unix)]
-    {
+    if pubkey_ok(&allowed) {
         use russh::keys::agent::client::AgentClient;
         if let Ok(mut agent) = AgentClient::connect_env().await {
             if let Ok(ids) = agent.request_identities().await {
@@ -473,44 +689,177 @@ async fn authenticate(handle: &mut client::Handle<BuiltinHandler>, user: &str) -
                         if res.success() {
                             return Ok(());
                         }
+                        allowed = allowed_methods(&res);
                     }
                 }
             }
         }
     }
 
-    // 2. Default identity files on disk (unencrypted only — a passphrase-locked
-    //    key is skipped, since we have no TTY prompt yet).
-    if let Some(ssh_dir) = home_dir().map(|h| h.join(".ssh")) {
+    // 2. Identity files: the config's `IdentityFile`s first, then the defaults.
+    if pubkey_ok(&allowed) {
         // Negotiate the RSA signature hash once (None for ed25519/ecdsa keys).
         let rsa_hash = handle.best_supported_rsa_hash().await.ok().flatten().flatten();
-        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
-            let path = ssh_dir.join(name);
-            if !path.is_file() {
+        let interactive = std::io::stdin().is_terminal();
+        let mut tried = std::collections::HashSet::new();
+        for path in identities.iter().cloned().chain(default_identity_files()) {
+            if !path.is_file() || !tried.insert(path.clone()) {
                 continue;
             }
-            let key = match load_secret_key(&path, None) {
-                Ok(k) => k,
-                Err(_) => continue, // encrypted or unreadable; try the next
+            let Some(key) = load_identity(&path, interactive) else {
+                continue;
             };
             let with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
             if let Ok(res) = handle.authenticate_publickey(user, with_hash).await {
                 if res.success() {
                     return Ok(());
                 }
+                allowed = allowed_methods(&res);
             }
+        }
+    }
+
+    // 3 & 4. Interactive fallbacks — only with a real terminal to prompt on.
+    if std::io::stdin().is_terminal() {
+        if allowed.iter().any(|m| m == "keyboard-interactive")
+            && try_keyboard_interactive(handle, user).await?
+        {
+            return Ok(());
+        }
+        if allowed.iter().any(|m| m == "password") && try_password(handle, user).await? {
+            return Ok(());
         }
     }
 
     let _ = handle
         .disconnect(Disconnect::ByApplication, "auth failed", "")
         .await;
-    bail!(
-        "authentication failed for {user} (tried ssh-agent and ~/.ssh/id_ed25519, \
-         id_ecdsa, id_rsa). The builtin bootstrap supports ssh-agent and \
-         unencrypted key files only; for passwords or other methods use \
-         --bootstrap=ssh."
-    )
+    let extra = if std::io::stdin().is_terminal() {
+        ", keyboard-interactive, password"
+    } else {
+        " (no terminal available for passphrase/password prompts)"
+    };
+    bail!("authentication failed for {user} (tried ssh-agent, identity files{extra})")
+}
+
+/// The OpenSSH default identity files in `~/.ssh`, in preference order.
+fn default_identity_files() -> Vec<PathBuf> {
+    match home_dir().map(|h| h.join(".ssh")) {
+        Some(ssh) => ["id_ed25519", "id_ecdsa", "id_rsa"]
+            .iter()
+            .map(|n| ssh.join(n))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Load a private key, prompting up to 3× for a passphrase if it is encrypted and
+/// we have a terminal. Returns `None` if it can't be loaded/decrypted.
+fn load_identity(path: &Path, interactive: bool) -> Option<russh::keys::PrivateKey> {
+    match load_secret_key(path, None) {
+        Ok(k) => Some(k),
+        Err(russh::keys::Error::KeyIsEncrypted) if interactive => {
+            for _ in 0..3 {
+                let pw = rpassword::prompt_password(format!(
+                    "Enter passphrase for key '{}': ",
+                    path.display()
+                ))
+                .ok()?;
+                match load_secret_key(path, Some(&pw)) {
+                    Ok(k) => return Some(k),
+                    Err(_) => eprintln!("[mish-client] bad passphrase, try again"),
+                }
+            }
+            None
+        }
+        // Encrypted but non-interactive, or unreadable: skip this key.
+        Err(_) => None,
+    }
+}
+
+/// Server-advertised remaining auth methods (lowercase names) from a failed
+/// result; empty on success. Avoids naming russh's unexported `MethodKind` by
+/// going through its `&str` conversion.
+fn allowed_methods(r: &client::AuthResult) -> Vec<String> {
+    match r {
+        client::AuthResult::Success => Vec::new(),
+        client::AuthResult::Failure {
+            remaining_methods, ..
+        } => remaining_methods
+            .iter()
+            .map(|m| {
+                let s: &str = m.into();
+                s.to_string()
+            })
+            .collect(),
+    }
+}
+
+/// Run the keyboard-interactive exchange, prompting per server request (no-echo
+/// for password-style prompts). `Ok(true)` on success.
+async fn try_keyboard_interactive(
+    handle: &mut client::Handle<BuiltinHandler>,
+    user: &str,
+) -> Result<bool> {
+    let mut resp = handle
+        .authenticate_keyboard_interactive_start(user, None::<String>)
+        .await
+        .context("starting keyboard-interactive auth")?;
+    loop {
+        match resp {
+            KeyboardInteractiveAuthResponse::Success => return Ok(true),
+            KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
+            KeyboardInteractiveAuthResponse::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                if !name.is_empty() {
+                    eprintln!("[mish-client] {name}");
+                }
+                if !instructions.is_empty() {
+                    eprintln!("[mish-client] {instructions}");
+                }
+                let mut answers = Vec::with_capacity(prompts.len());
+                for p in &prompts {
+                    let a = if p.echo {
+                        use std::io::Write;
+                        eprint!("{}", p.prompt);
+                        let _ = std::io::stderr().flush();
+                        let mut line = String::new();
+                        std::io::stdin()
+                            .read_line(&mut line)
+                            .context("reading prompt response")?;
+                        line.trim_end_matches(['\r', '\n']).to_string()
+                    } else {
+                        rpassword::prompt_password(&p.prompt).context("reading prompt response")?
+                    };
+                    answers.push(a);
+                }
+                resp = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .context("responding to keyboard-interactive auth")?;
+            }
+        }
+    }
+}
+
+/// Prompt for a password (up to 3×) and try password auth. `Ok(true)` on success.
+async fn try_password(handle: &mut client::Handle<BuiltinHandler>, user: &str) -> Result<bool> {
+    for _ in 0..3 {
+        let pw = rpassword::prompt_password(format!("{user}'s password: "))
+            .context("reading password")?;
+        let res = handle
+            .authenticate_password(user, pw)
+            .await
+            .context("password auth")?;
+        if res.success() {
+            return Ok(true);
+        }
+        eprintln!("[mish-client] permission denied, please try again.");
+    }
+    Ok(false)
 }
 
 /// The parsed contents of a `MISH CONNECT` line.
@@ -1109,5 +1458,125 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    // ---- ssh_config resolution + ProxyJump parsing ----
+
+    fn parse_cfg(text: &str, host: &str) -> russh_config::Config {
+        russh_config::parse(text, host).expect("parse ssh config")
+    }
+
+    #[test]
+    fn resolve_from_config_maps_all_fields() {
+        let text = "Host myhost\n  \
+            HostName 10.0.0.5\n  Port 2200\n  User bob\n  \
+            IdentityFile ~/.ssh/special_ed25519\n  \
+            ProxyJump jumpuser@bastion:2222\n";
+        let r = resolve_from(parse_cfg(text, "myhost"), None, None);
+        assert_eq!(r.hostname, "10.0.0.5");
+        assert_eq!(r.port, 2200);
+        assert_eq!(r.user, "bob");
+        assert_eq!(r.proxy_jump, vec!["jumpuser@bastion:2222".to_string()]);
+        assert_eq!(r.identities.len(), 1);
+        // The IdentityFile's leading ~ is expanded away.
+        assert!(!r.identities[0].starts_with("~"));
+        assert!(r.identities[0].ends_with("special_ed25519"));
+    }
+
+    #[test]
+    fn resolve_cli_user_and_port_override_config() {
+        let text = "Host h\n  HostName 10.0.0.5\n  Port 2200\n  User bob\n";
+        let r = resolve_from(parse_cfg(text, "h"), Some("alice"), Some(22));
+        assert_eq!(r.user, "alice"); // CLI wins
+        assert_eq!(r.port, 22); // CLI wins
+        assert_eq!(r.hostname, "10.0.0.5"); // still from config
+    }
+
+    #[test]
+    fn resolve_unknown_host_falls_back_to_defaults() {
+        let r = resolve_from(parse_cfg("Host other\n  HostName 1.2.3.4\n", "myhost"), None, None);
+        assert_eq!(r.hostname, "myhost"); // no matching block → literal alias
+        assert_eq!(r.port, 22);
+        assert!(r.proxy_jump.is_empty());
+    }
+
+    #[test]
+    fn proxy_jump_value_splits_into_hops() {
+        assert_eq!(split_proxy_jump("a"), vec!["a"]);
+        assert_eq!(
+            split_proxy_jump("a, b@h:22 ,c"),
+            vec!["a", "b@h:22", "c"]
+        );
+        assert!(split_proxy_jump("").is_empty());
+        assert!(split_proxy_jump(" , ").is_empty());
+    }
+
+    #[test]
+    fn jump_spec_parses_user_host_port() {
+        assert_eq!(
+            parse_jump_spec("u@h:2222"),
+            (Some("u".into()), "h".into(), Some(2222))
+        );
+        assert_eq!(parse_jump_spec("h2"), (None, "h2".into(), None));
+        // A non-numeric trailing :foo is not a port.
+        assert_eq!(parse_jump_spec("host:foo"), (None, "host:foo".into(), None));
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        if let Some(home) = home_dir() {
+            assert_eq!(expand_tilde(Path::new("~/.ssh/id")), home.join(".ssh/id"));
+        }
+        // A non-tilde path is unchanged.
+        assert_eq!(expand_tilde(Path::new("/etc/x")), PathBuf::from("/etc/x"));
+    }
+
+    // ---- Passphrase-protected key handling ----
+
+    // Throwaway ed25519 keys generated for these tests only (the encrypted one's
+    // passphrase is below). Flush-left so the PEM bytes are exact.
+    const ENC_PASSPHRASE: &str = "hunter2";
+    const ENC_KEY: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABD/XgssQL
+BCBpOU4NfzMuhTAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIJWfUrBAozPQvWDF
+TDLMrX2cC6jgPXVuiNT9BgSj4t3tAAAAkDL+zlpUGQBDLnrd658BBzdiooWuNw4QnKp2Br
+wCA4MKKNMCh4TcO1J3/9yCCGWAuNGaiRozTfRdqIDTA9uTu1D3R+trUqIXemZFAqC6UwMJ
+Lzekn9otg+r8OMiEoBDYsmIebMsIy8jNV1cghtzzzb3ohtcgLrg0onjYq9F0IoPPq/QA77
+0sfEl6DXxIVsYUaA==
+-----END OPENSSH PRIVATE KEY-----
+";
+    const PLAIN_KEY: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACCXvd/0K+4SS2TXZlRSPLRzdvoptx+9jLFEm2F5Ui08RAAAAJAxwatLMcGr
+SwAAAAtzc2gtZWQyNTUxOQAAACCXvd/0K+4SS2TXZlRSPLRzdvoptx+9jLFEm2F5Ui08RA
+AAAEBpt/XlGq5seEbDVyFVFYlzPCxKPHEWzNNWmfKgjO8bE5e93/Qr7hJLZNdmVFI8tHN2
++im3H72MsUSbYXlSLTxEAAAADXBsYWluLWZpeHR1cmU=
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    #[test]
+    fn encrypted_key_load_round_trip() {
+        let f = write_tmp("enc", ENC_KEY);
+        // Without a passphrase, russh signals the key is encrypted (so we know to
+        // prompt) rather than failing opaquely.
+        assert!(matches!(
+            load_secret_key(&f.0, None),
+            Err(russh::keys::Error::KeyIsEncrypted)
+        ));
+        // The right passphrase decrypts; a wrong one fails.
+        assert!(load_secret_key(&f.0, Some(ENC_PASSPHRASE)).is_ok());
+        assert!(load_secret_key(&f.0, Some("wrong-passphrase")).is_err());
+    }
+
+    #[test]
+    fn load_identity_skips_encrypted_when_noninteractive() {
+        // An encrypted key must be skipped (not block on a prompt) when there's no
+        // terminal; an unencrypted one loads without prompting.
+        let enc = write_tmp("enc2", ENC_KEY);
+        assert!(load_identity(&enc.0, false).is_none());
+        let plain = write_tmp("plain", PLAIN_KEY);
+        assert!(load_identity(&plain.0, false).is_some());
     }
 }

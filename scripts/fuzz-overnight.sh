@@ -37,6 +37,7 @@ TARGETS=(
   tty_emission_safety     # OSC title/URI can't break framing on the client TTY
   frag_memory_bounds      # reassembler memory stays bounded under a hostile peer
   client_render_safety    # arbitrary server diff renders to the real TTY without injection
+  resized_view            # shared-session viewer crop: client-controlled size can't OOM the server
 )
 [ "$#" -gt 0 ] && TARGETS=("$@")
 

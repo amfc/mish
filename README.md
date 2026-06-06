@@ -16,9 +16,9 @@ mutually-authenticated QUIC transport, the `alacritty-terminal` layer with
 mosh's minimal-diff, the `mish-client` / `mish-server` binaries, predictive
 echo, and the deterministic network simulators. Several features now go *beyond*
 upstream mosh — server-side **scrollback**, **persistent sessions + reattach**,
-and a reliable QUIC **side-channel** (see [`NEXT_FEATURES.md`](NEXT_FEATURES.md)).
-What's left (tracked in [`FUTURE_WORK.md`](FUTURE_WORK.md)) is small polish, not
-core functionality.
+**multi-client attach** (`--shared`), and a reliable QUIC **side-channel** (see
+[`NEXT_FEATURES.md`](NEXT_FEATURES.md)). What's left (tracked in
+[`FUTURE_WORK.md`](FUTURE_WORK.md)) is small polish, not core functionality.
 
 ## Why this can be small
 
@@ -93,9 +93,13 @@ way:
 - `--bootstrap=ssh` — shell out to the system `ssh` binary, exactly like upstream
   mosh (full ssh-config / agent / proxy support; pass extra flags via `--ssh`).
 - `--bootstrap=builtin` — a builtin, pure-Rust SSH client ([`russh`]) that needs
-  no external `ssh`. It authenticates via the ssh-agent or your default
-  `~/.ssh/id_{ed25519,ecdsa,rsa}` keys, checks the host key against
-  `~/.ssh/known_hosts`, and takes the SSH port from `--ssh-port` (default 22).
+  no external `ssh` (and no C libraries — important for the Windows goal). It
+  reads **`~/.ssh/config`** (`HostName`/`Port`/`User`/`IdentityFile`/`ProxyJump`;
+  `$MISH_SSH_CONFIG` overrides the path), authenticates via the **ssh-agent →
+  identity files (prompting for a key passphrase) → keyboard-interactive →
+  password**, tunnels through any **ProxyJump** hosts, checks the host key against
+  `~/.ssh/known_hosts`, and takes the SSH port from `--ssh-port` (or the config,
+  default 22).
 - `--bootstrap=auto` (the default) — use the system `ssh` if it's on `PATH`, else
   fall back to the builtin client.
 
@@ -161,6 +165,22 @@ credentials via a `0600` user-only registry file — see
 mish-client host --session work   # start (or reattach to) a persistent session "work"
 ```
 
+**Multi-client attach / shared sessions (also better than mosh).** With
+`--shared`, several clients can attach to one session *at the same time* — the
+client that starts it is the read-write **owner**, and anyone who attaches to the
+same named session afterward joins as a read-only **viewer** (pair programming,
+teaching, "watch my terminal"). The screen fans out to everyone; only the owner's
+keystrokes reach the shell, and a viewer on a smaller terminal sees the owner's
+screen cropped to its own size (the owner drives the geometry). All attached
+clients can read everything on the screen — sharing is opt-in, and the whole
+feature can be compiled out (`--no-default-features`, dropping the `multi-client`
+cargo feature) for a single-client-only build. See [`SECURITY.md`](SECURITY.md).
+
+```sh
+mish-client host --session demo --shared   # start a shared session "demo" (you're the owner)
+mish-client host --session demo            # someone else attaches read-only (a viewer)
+```
+
 **Port forwarding (mosh can't do this at all).** `mish-client -L
 [bind:]port:host:hostport` and `-R …` tunnel TCP connections over the session,
 exactly like `ssh -L`/`-R` — each forwarded connection rides its own
@@ -215,6 +235,7 @@ the independent UDP/QUIC path.
 | Scrollback | client fetches a deep history window over QUIC and gets the scrolled-off rows; client scroll-mode renders the history viewport headlessly | `mosh/tests/scrollback_e2e.rs`, `mosh/tests/scroll_client.rs` |
 | Port forwarding | `-L`/`-R` relay real bytes over real QUIC; `--no-forward` refuses both; client refuses a forwarded connection for an unconfigured `-R` bind (hostile-server gate); spec-parse + codec round-trip / panic-free decode | `mosh/tests/port_forward.rs`, `mish::forward` |
 | Reattach | the persistent session survives a client detach and re-syncs the full screen (incl. gap output) to a fresh connection; a second `--session NAME` server reattaches via the registry | `mosh/tests/reattach.rs`, `mosh/tests/session_reattach.rs`, `mosh` `registry` |
+| Multi-client (`--shared`) | a concurrent owner + viewer on one session both converge on the same output; the owner's keystrokes reach the PTY while the viewer's are dropped (read-only); a smaller viewer's screen is cropped to its own geometry | `mosh/tests/multi_client.rs`, `mish-terminal` `screen::resized_view` |
 | Diff-engine benchmark | throughput of `new_frame` + `apply_diff` round-trip across scrolling/typing/full-repaint workloads (mosh's `benchmark.cc`) | `mish-terminal/examples/diff_bench.rs` |
 | A/B latency harness | drives mish *and* upstream `mosh` through one fault-injecting relay (iid / Gilbert-Elliott burst / reorder) and compares display + keyboard latency identically — see [`PERFORMANCE.md`](PERFORMANCE.md) | `crates/bench-harness` |
 | Clock fuzz | non-monotonic / jumping / boundary clock values into the core's timer math: no panic, bounded memory, and forward jumps still converge | `mish-ssp/tests/fuzz_clock.rs` |
@@ -346,12 +367,12 @@ mish equivalents.
 ### Beyond parity
 
 Several beyond-mosh features are **already done** — server-side **scrollback**,
-**persistent sessions + reattach**, the reliable QUIC **side-channel** they ride
-on, and now **`ssh -L`/`-R`-style port forwarding** (TCP tunnels over QUIC
-streams, which mosh's UDP/OCB transport cannot do — see
-[`docs/port-forwarding.md`](docs/port-forwarding.md)). The remaining forward
-roadmap — **multi-client attach** and large-payload **clipboard** — is laid out
-in **[`NEXT_FEATURES.md`](NEXT_FEATURES.md)**.
+**persistent sessions + reattach**, **multi-client attach** (`--shared`), the
+reliable QUIC **side-channel** they ride on, and now **`ssh -L`/`-R`-style port
+forwarding** (TCP tunnels over QUIC streams, which mosh's UDP/OCB transport cannot
+do — see [`docs/port-forwarding.md`](docs/port-forwarding.md)). The remaining
+forward roadmap — large-payload **clipboard** — is laid out in
+**[`NEXT_FEATURES.md`](NEXT_FEATURES.md)**.
 
 > One idea that used to be on this list, app-layer *congestion-aware pacing*, was
 > built, measured to **hurt** interactive latency under loss (we'd be stacking a
@@ -375,8 +396,9 @@ There are coverage-guided libFuzzer targets for the protocol core
 (`instruction_decode`, `screen_apply`, `diff_roundtrip`, `frag_reassemble`,
 `userstream_decode`, `differential_emulator`) and for the security seams
 (`answerback_safety`, `tty_emission_safety`, `frag_memory_bounds`,
-`client_render_safety`, and `bootstrap_parse` — the session-bootstrap parsers +
-bounded `MISH CONNECT` scanner). CI smoke-runs each for 40 s as a regression gate; for a
+`client_render_safety`, `bootstrap_parse` — the session-bootstrap parsers +
+bounded `MISH CONNECT` scanner — and `resized_view`, asserting a shared-session
+viewer's client-controlled terminal size can't OOM the server). CI smoke-runs each for 40 s as a regression gate; for a
 real campaign, **[`scripts/fuzz-overnight.sh`](scripts/fuzz-overnight.sh)** runs
 all of them at once in libFuzzer fork mode, saturating every core and surviving
 crashes (each saved, fuzzing continues), with a per-target time budget:

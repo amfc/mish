@@ -97,9 +97,11 @@ struct Options {
     /// The ssh command, shell-split (e.g. `["ssh", "-p", "2222"]`). Used by the
     /// `ssh` bootstrap transport.
     ssh_argv: Vec<String>,
-    /// SSH port for the builtin bootstrap transport (`--ssh-port`, default 22).
-    /// The system `ssh` transport takes its port from `--ssh "ssh -p N"` instead.
-    ssh_port: u16,
+    /// SSH port for the builtin bootstrap transport (`--ssh-port`). `None` means
+    /// "unset" — let `~/.ssh/config` (`Port`) decide, falling back to 22. An
+    /// explicit value wins over the config. The system `ssh` transport takes its
+    /// port from `--ssh "ssh -p N"` instead.
+    ssh_port: Option<u16>,
     /// Allocate a remote PTY (`ssh -tt`); cleared by `--no-ssh-pty`. Applies to
     /// the `ssh` transport only.
     ssh_pty: bool,
@@ -113,6 +115,11 @@ struct Options {
     /// across disconnects and reattaches to it on a later run (the "never lose
     /// your shell" mode). Opt-in; without it, a fresh session each time.
     session: Option<String>,
+    /// Start the remote session as a **shared** multi-client session (`--shared`,
+    /// NEXT_FEATURES.md #3): this client is the read-write owner and additional
+    /// clients (e.g. `mish host --session NAME`) may attach read-only. Only
+    /// meaningful on the invocation that *starts* the daemon. Off → single-client.
+    shared: bool,
     /// Raw attach (`--attach IP PORT`): connect directly to an already-running
     /// server (no SSH/local bootstrap), with credentials in `$MISH_CONNECT`
     /// (the hex `<server-cert> <client-cert> <client-key>` from its MISH CONNECT
@@ -157,7 +164,7 @@ fn parse_args() -> Result<Options> {
         local: false,
         bootstrap: BootstrapMode::default(),
         ssh_argv: vec!["ssh".into()],
-        ssh_port: 22,
+        ssh_port: None,
         ssh_pty: true,
         server_cmd: None,
         // Default adaptive, overridable by env then by an explicit flag (mosh's
@@ -168,6 +175,7 @@ fn parse_args() -> Result<Options> {
         },
         no_init: std::env::var_os("MOSH_NO_TERM_INIT").is_some(),
         session: None,
+        shared: false,
         attach: None,
         local_forwards: Vec::new(),
         remote_forwards: Vec::new(),
@@ -196,11 +204,12 @@ fn parse_args() -> Result<Options> {
                 }
             }
             "--ssh-port" => {
-                opts.ssh_port = args
-                    .next()
-                    .context("--ssh-port needs a number")?
-                    .parse()
-                    .context("--ssh-port must be a number")?;
+                opts.ssh_port = Some(
+                    args.next()
+                        .context("--ssh-port needs a number")?
+                        .parse()
+                        .context("--ssh-port must be a number")?,
+                );
             }
             "--no-ssh-pty" => opts.ssh_pty = false,
             "--server" => opts.server_cmd = Some(args.next().context("--server needs a value")?),
@@ -225,6 +234,14 @@ fn parse_args() -> Result<Options> {
             s if s.starts_with("-L") => opts.local_forwards.push(parse_forward(&s[2..])?),
             s if s.starts_with("-R") => opts.remote_forwards.push(parse_forward(&s[2..])?),
             "--session" => opts.session = Some(args.next().context("--session needs a NAME")?),
+            "--shared" => {
+                #[cfg(feature = "multi-client")]
+                {
+                    opts.shared = true;
+                }
+                #[cfg(not(feature = "multi-client"))]
+                bail!("--shared requires building mish with the `multi-client` feature");
+            }
             "--attach" => {
                 let ip = args.next().context("--attach needs IP PORT")?;
                 let port: u16 = args
@@ -282,6 +299,7 @@ fn print_usage() {
          \x20 -L [bind:]port:host:hostport  forward a local port to host:hostport (repeatable)\n\
          \x20 -R [bind:]port:host:hostport  forward a remote port to host:hostport (repeatable)\n\
          \x20 --session <name>     reattachable persistent session (never lose your shell)\n\
+         \x20 --shared             shared session: you own it, others can attach read-only\n\
          \x20 --attach IP PORT     attach to a running server ($MISH_CONNECT creds; for testing)\n\
          \x20 --log-file <path>    write a JSON event log (for debugging)\n\
          \x20 --log-level <lvl>    log verbosity: error|warn|info|debug|trace (default debug)\n\
@@ -335,7 +353,7 @@ async fn main() -> Result<()> {
     let boot: Bootstrap = if opts.local {
         let server = opts.server_cmd.unwrap_or_else(default_local_server);
         eprintln!("[mish-client] starting local server `{server}`…");
-        bootstrap::local(&server, opts.session.as_deref(), opts.command.as_deref())
+        bootstrap::local(&server, opts.shared, opts.session.as_deref(), opts.command.as_deref())
             .await
             .context("local bootstrap")?
     } else {
@@ -344,11 +362,12 @@ async fn main() -> Result<()> {
         // Pick the SSH transport: the system `ssh` binary, or the builtin russh
         // client. In `auto` mode we use `ssh` when it is on PATH, else builtin.
         if opts.bootstrap.use_builtin(&opts.ssh_argv[0]) {
-            eprintln!("[mish-client] builtin ssh → {host}:{} {server}…", opts.ssh_port);
+            eprintln!("[mish-client] builtin ssh → {host} {server}…");
             bootstrap::builtin(
                 &host,
                 opts.ssh_port,
                 &server,
+                opts.shared,
                 opts.session.as_deref(),
                 opts.command.as_deref(),
             )
@@ -361,6 +380,7 @@ async fn main() -> Result<()> {
                 opts.ssh_pty,
                 &host,
                 &server,
+                opts.shared,
                 opts.session.as_deref(),
                 opts.command.as_deref(),
             )

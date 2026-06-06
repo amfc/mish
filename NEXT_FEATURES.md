@@ -13,14 +13,15 @@ port) — this is capability mosh can't offer.
 
 > **Already shipped (and removed from this list):** the enabling primitive — a
 > reliable, ordered QUIC **control stream** alongside the loss-tolerant datagram
-> screen — plus **server-side scrollback** with the client scroll UX, and
+> screen — plus **server-side scrollback** with the client scroll UX,
 > **persistent sessions + reattach** (`--persist` / `--session NAME`, with roaming
-> = the full "never lose your shell" story). Because the stream primitive is done
-> and in use, the features below **reuse** it rather than introduce it. One idea
-> that used to be here, app-layer *congestion-aware pacing*, was built, measured
-> to **hurt** interactive latency under loss, and removed — see
-> [`PERFORMANCE.md`](PERFORMANCE.md) and the "one congestion controller, and it's
-> QUIC's" strategy.
+> = the full "never lose your shell" story), and **multi-client attach**
+> (`--shared`: one read-write owner + N read-only viewers sharing a session).
+> Because the stream primitive is done and in use, the features below **reuse** it
+> rather than introduce it. One idea that used to be here, app-layer
+> *congestion-aware pacing*, was built, measured to **hurt** interactive latency
+> under loss, and removed — see [`PERFORMANCE.md`](PERFORMANCE.md) and the "one
+> congestion controller, and it's QUIC's" strategy.
 
 The architectural split that makes all of this a natural fit, not a fight:
 **datagrams for the live, loss-tolerant screen; reliable streams for bulk /
@@ -31,36 +32,7 @@ reusing the `fuzz_hostile` discipline).
 
 ---
 
-## 1. Multi-client attach (shared / pair session)
-
-**Why.** Pair programming, teaching, "watch my terminal" — over the same
-state-sync substrate, read-only or read-write. mosh can't do this.
-
-**Design.** Builds directly on the **shipped session registry** (persistent
-sessions + reattach): allow **N clients attached to one session**. The server
-fans the `Screen` state out to every attached client (each is just another SSP
-receiver of the same `Complete` state — the substrate is already one-to-many
-friendly). Input is the asymmetric part: merge multiple clients' `UserStream`s
-into the PTY, with a per-client **role** — read-only (input dropped) or read-write
-(input forwarded). A simple policy (owner grants write; optional input locking to
-avoid interleaved-keystroke chaos) keeps it sane. Predictive echo stays per-client
-and local.
-
-**Reuse.** Everything from persistence + reattach; `Screen` broadcast is natural
-(the driver already `publish_remote`s to subscribers). Per-session it's mostly a
-fan-out + an input-merge policy.
-
-**Risks / unknowns.** Input-arbitration UX (who can type, how writers are
-granted/revoked); per-client geometry (different terminal sizes → smallest-window
-or per-client viewport); auth for additional clients (each needs its own minted
-cert, or an owner-issued grant); resize storms. Keep v1 to **one read-write owner
-+ read-only viewers** and expand later.
-
-**Effort.** Medium — the registry it builds on already exists.
-
----
-
-## 2. Real clipboard over a reliable stream (large payloads)
+## 1. Real clipboard over a reliable stream (large payloads)
 
 **Why.** We already sync **OSC 52** clipboard contents (`Screen::clipboard`,
 latest-wins, datagram-carried) — that's the *small* version, and it works for
@@ -86,7 +58,7 @@ large-payload upgrade riding the existing stream plumbing).
 
 ---
 
-## 3. Port forwarding over QUIC streams — **done**
+## 2. Port forwarding over QUIC streams — **done**
 
 **Why.** `ssh -L`/`-R`-style forwarding — something **mosh cannot do at all**
 (its UDP/OCB transport has no reliable multiplexed channel). QUIC streams make it
@@ -124,13 +96,11 @@ parser is IPv4/hostname-only). None are core.
 
 ## Suggested sequencing
 
-All three reuse the reliable side-channel (already shipped) and add no new crypto.
+Both reuse the reliable side-channel (already shipped) and add no new crypto.
 
 1. **Clipboard (large)** — smallest: the small OSC 52 version already ships, so
    this is just moving big blobs onto the existing stream.
-2. **Multi-client attach** — builds on the shipped session registry; mostly a
-   `Screen` fan-out + an input-merge policy.
-3. **Port forwarding** — *done* (§3). Highest new value; the security model is
+2. **Port forwarding** — *done* (§2). Highest new value; the security model is
    gated as planned (off until requested, owner model, `--no-forward`, client
    dials only configured `-R` targets) with adversarial e2e tests.
 

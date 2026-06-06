@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mish::persist::{AttachEnd, PersistentSession};
+use mish::persist::{AttachEnd, PersistentSession, Role};
 use mish::server::PtyControl;
 use mish_ssp::clock::{Clock, SystemClock};
 use mish_ssp::core::SspConfig;
@@ -88,7 +88,12 @@ async fn session_persists_across_reattach() {
 
     // --- Client A attaches: must see the pre-attach output (full resync). ---
     let (sa, ca) = memory::pair();
-    let a_end = tokio::spawn(session.clone().attach(Arc::new(sa), net, std::future::pending::<()>()));
+    let a_end = tokio::spawn(session.clone().attach(
+        Arc::new(sa),
+        net,
+        std::future::pending::<()>(),
+        Role::Owner,
+    ));
     let mut a = Client::spawn(ca, clock.clone());
     a.expect_contains("LINE_ONE").await;
 
@@ -109,7 +114,12 @@ async fn session_persists_across_reattach() {
 
     // --- Client B reattaches on a fresh connection: must see ALL three lines. ---
     let (sb, cb) = memory::pair();
-    let b_end = tokio::spawn(session.clone().attach(Arc::new(sb), net, std::future::pending::<()>()));
+    let b_end = tokio::spawn(session.clone().attach(
+        Arc::new(sb),
+        net,
+        std::future::pending::<()>(),
+        Role::Owner,
+    ));
     let mut b = Client::spawn(cb, clock.clone());
     b.expect_contains("LINE_ONE").await; // survived the whole time
     b.expect_contains("LINE_THREE").await; // produced during the disconnect gap
@@ -147,9 +157,14 @@ async fn new_connection_preempts_live_attachment() {
     let net = Some(Duration::from_secs(30));
     let (sa, ca) = memory::pair();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    let a_end = tokio::spawn(session.clone().attach(Arc::new(sa), net, async move {
-        let _ = cancel_rx.await;
-    }));
+    let a_end = tokio::spawn(session.clone().attach(
+        Arc::new(sa),
+        net,
+        async move {
+            let _ = cancel_rx.await;
+        },
+        Role::Owner,
+    ));
     // Client A is live and active — it is NOT disconnecting.
     let mut a = Client::spawn(ca, clock.clone());
     pty_out_tx.send(b"ATTACHED\r\n".to_vec()).await.unwrap();

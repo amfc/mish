@@ -17,8 +17,12 @@ boundary is explicit.
     accepted trust-on-first-use (logged, not persisted). So the bootstrap channel
     is confidential and integrity-protected against a passive attacker, but a
     first-contact active MITM on an unknown host is not caught; `--bootstrap=ssh`
-    is the stricter choice when that matters. Auth uses the ssh-agent or
-    unencrypted on-disk keys only (see [`FUTURE_WORK.md`](FUTURE_WORK.md)).
+    is the stricter choice when that matters. Auth supports the ssh-agent,
+    identity files (incl. **passphrase-protected** keys, prompted on the TTY),
+    keyboard-interactive, and password — the latter two prompt for and send a
+    secret, but only over this confidential, host-verified channel. `ProxyJump`
+    tunnels the SSH bootstrap through jump hosts (each host-key-verified the same
+    way). See [`FUTURE_WORK.md`](FUTURE_WORK.md) for remaining gaps.
 
 [`russh`]: https://crates.io/crates/russh
 - The **UDP/QUIC path** is hostile: an attacker can observe, drop, duplicate,
@@ -37,6 +41,7 @@ boundary is explicit.
 | Pre-handshake junk doesn't exhaust the server | quinn endpoint drops invalid packets | `wire_attacks.rs::server_survives_pre_handshake_junk_flood` |
 | Client key not leaked to logs | only on the SSH-tunneled stdout line, never stderr | `mosh/tests/key_hygiene.rs` |
 | Malformed/hostile SSP input is safe | no-panic, bounded memory, compression-bomb cap | `fuzz_hostile.rs`, `fuzz_driver_live.rs`, `instruction.rs` |
+| A shared-session viewer can't OOM the server with an absurd terminal size | the viewer-screen crop clamps client-reported dimensions to the `MAX_SCREEN_CELLS` budget before allocating | `screen.rs` `resized_view_*` (proptest), `fuzz/.../resized_view.rs` |
 | Builtin bootstrap rejects a *changed* host key | `classify_host_key` over russh `check_known_hosts` (match→accept, mismatch→refuse, unknown→TOFU) | `bootstrap.rs` `host_key_{matching,mismatch,unknown}_*` |
 | Builtin bootstrap can't be shell-injected | `shell_quote` single-quote escaping of the remote command/session name | `bootstrap.rs` `shell_quote_resists_injection_in_real_sh` (real `/bin/sh`), `shell_quote_round_trips_through_split` |
 | Hostile/buggy server can't exhaust client memory at bootstrap | bounded `MISH CONNECT` scan (`MAX_CONNECT_SCAN`, both transports) | `bootstrap.rs` `scan_connect_*`, `bootstrap_parse` fuzz target |
@@ -79,6 +84,46 @@ zero-key-at-rest variant would require a daemon control socket (deferred). Stale
 entries (after an abrupt daemon death) are reaped on the next lookup by a
 liveness (`kill(pid, 0)`) check. Persistence is **opt-in** (`--session`); the
 default remains a fresh per-connection session.
+
+## Shared multi-client sessions (`--shared`)
+
+A shared session (`mish-server --shared`) lets **several clients attach to one
+session at the same time** — one read-write **owner** plus any number of
+read-only **viewers** (NEXT_FEATURES.md, "multi-client attach"). The security
+properties:
+
+- **Same trust boundary as reattach — not a new one.** Every attaching client
+  authenticates with the *same* per-session mutual-TLS credential, delivered over
+  SSH and recorded in the `0600` registry file above. So "who may attach" is
+  exactly "who has shell access as that user on the host" (or to whom that user
+  hands the SSH bootstrap) — `--shared` adds no new way in. It does **not** grant
+  cross-user access: a second user gets in only if they could already obtain the
+  session credential, which already implies shell access as the owner.
+- **Viewers are read-only at the source.** A viewer's keystrokes and resizes are
+  dropped **server-side** in `persist::attach` before they reach the PTY — the
+  shell never sees them. Read-only is enforced where input is applied, not by
+  asking the client to behave. There is exactly one writer slot (the owner);
+  while it's held, every other attachment is a viewer.
+- **A viewer's reported size can't exhaust server memory.** Because the owner
+  drives the shell geometry, a viewer's screen is cropped to *its own* reported
+  terminal size (`Screen::resized_view`) — and that size is client-controlled
+  (it rides the viewer's `UserStream` resize). The crop **clamps** the
+  dimensions (`MAX_VIEW_DIM`, the same cell budget as the `apply_diff`
+  `MAX_SCREEN_CELLS` guard) before allocating, so a read-only viewer reporting an
+  absurd terminal (e.g. `65535×65535`) can't OOM the shared server. Bounded +
+  panic-free for any dimensions, covered by a proptest and the `resized_view`
+  libFuzzer target.
+- **All attached clients see all output.** A shared session is a broadcast of the
+  one screen to every client, so anyone attached can read everything on it
+  (including anything the owner types that echoes). Treat attaching someone as
+  handing them a live view of your terminal. Sharing is **opt-in** (`--shared`,
+  itself behind a default-on `multi-client` build feature that can be compiled
+  out entirely); the default is a single-client session.
+
+**Deferred:** an owner-issued, per-viewer *grant* (so a non-owner could be let in
+without the full session credential) and runtime write-token handoff between
+attached clients — both would need per-client minted certs and an in-session
+control protocol, out of scope for v1.
 
 ## Port forwarding (`-L` / `-R`)
 
