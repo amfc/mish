@@ -140,7 +140,9 @@ a reattach). At the shell prompt the **mouse wheel is left to your terminal**, s
 two-finger / wheel scrolling, native click-drag selection, and your terminal's
 own scrollback all work exactly as they do for any other program (no forced mouse
 reporting). Inside a full-screen app (vim, less, htop…) the wheel and Shift-Arrow
-reach the app as usual, so those keep their own scrolling/bindings.
+reach the app as usual, so those keep their own scrolling/bindings. See
+[`docs/scrollback.md`](docs/scrollback.md) for the full guide, caveats, and how
+it works.
 
 **Persistent sessions / reattach (also better than mosh).** With `--session
 NAME`, the server keeps the shell + terminal state alive across disconnects, and
