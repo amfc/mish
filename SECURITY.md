@@ -9,6 +9,18 @@ boundary is explicit.
 - The **SSH channel** used for bootstrap is authenticated and confidential
   (that's the user's existing trust anchor). The `MISH CONNECT` line — UDP port,
   server cert, and the minted **client cert + key** — travels only over it.
+  - With `--bootstrap=ssh` (the default when `ssh` is present) this is the system
+    OpenSSH client, with its full host-key / agent / config handling.
+  - With `--bootstrap=built-in` the SSH layer is our own [`russh`] client. It
+    still verifies the server against `~/.ssh/known_hosts` and **rejects a key
+    mismatch**, but — unlike OpenSSH's interactive prompt — an *unknown* host is
+    accepted trust-on-first-use (logged, not persisted). So the bootstrap channel
+    is confidential and integrity-protected against a passive attacker, but a
+    first-contact active MITM on an unknown host is not caught; `--bootstrap=ssh`
+    is the stricter choice when that matters. Auth uses the ssh-agent or
+    unencrypted on-disk keys only (see [`FUTURE_WORK.md`](FUTURE_WORK.md)).
+
+[`russh`]: https://crates.io/crates/russh
 - The **UDP/QUIC path** is hostile: an attacker can observe, drop, duplicate,
   corrupt, replay, and inject packets, and can spoof source addresses.
 

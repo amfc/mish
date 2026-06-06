@@ -21,6 +21,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 portable-pty = "0.9"
 crossterm = "0.29"
 anyhow = "1"
+# Built-in, pure-Rust SSH client for the `--bootstrap=built-in` transport (no
+# external `ssh` needed; the path toward a Windows mish). `ring` backend to
+# match the rest of the workspace and stay off aws-lc-rs's C toolchain.
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2", "rsa"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -134,3 +134,39 @@ overlay) are all done. These are the remaining parity polish:
   differential grammar. *Optional future extension:* a tmux/xterm-driven oracle
   (a true terminal) where those are installed; `vt100` is the portable
   always-available independent renderer used here.
+
+## Built-in SSH bootstrap (`--bootstrap=built-in`)
+
+The session bootstrap can now run over a built-in, pure-Rust SSH client
+([`russh`]) instead of the system `ssh` binary, selected with `--bootstrap`
+(`auto` — the default — uses the system `ssh` if it's on `PATH`, else the
+built-in client; `ssh` and `built-in` force one). This is the groundwork for an
+`mish` that runs where upstream mosh never could — primarily **Windows**, which
+has no external `ssh` to rely on. (`bootstrap::built_in`, `bootstrap_e2e.rs`
+covers the local path; the built-in path is exercised manually against a real
+sshd.)
+
+Intentionally scoped out of this first pass, in rough effort order:
+
+- **Windows port itself** — *the actual goal this unblocks.* The built-in
+  bootstrap removes the hard `ssh` dependency, but the client/server still use
+  Unix PTYs, signals (`SIGWINCH`/`SIGCONT`/`SIGTSTP`), and `libc`. A Windows
+  build needs a ConPTY server side and a crossterm-based client side. *Larger.*
+- **Auth methods.** The built-in client tries the ssh-agent (Unix socket only)
+  then unencrypted `~/.ssh/id_{ed25519,ecdsa,rsa}`. No password /
+  keyboard-interactive (needs a TTY prompt), no passphrase-locked keys (needs a
+  prompt + caching), no `IdentityFile`/`IdentitiesOnly` from `~/.ssh/config`, and
+  on Windows no named-pipe agent. Fall back to `--bootstrap=ssh` meanwhile.
+- **Host-key trust.** Matches `~/.ssh/known_hosts` and rejects a *mismatch*, but
+  an *unknown* host is accepted trust-on-first-use and **not written back** (so
+  it re-warns each run). Persisting accepted keys (and an interactive
+  accept/reject prompt) is future work.
+- **SSH port / config.** The built-in path takes its port from `--ssh-port`
+  (default 22) and does no `~/.ssh/config` parsing (`Host`/`HostName`/`Port`/
+  `User`/`ProxyJump`), unlike shelling out to `ssh`.
+- **IPv6 UDP target.** Shared with the `ssh` path: the QUIC client endpoint binds
+  `0.0.0.0:0` (IPv4), so if the host resolves to an IPv6 address first the
+  follow-on QUIC connect fails. The endpoint should bind to match the resolved
+  address family.
+
+[`russh`]: https://crates.io/crates/russh

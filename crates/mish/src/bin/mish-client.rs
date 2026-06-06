@@ -19,8 +19,11 @@
 //!
 //! Options:
 //!   --local            start mish-server as a local child (no SSH)
+//!   --bootstrap <how>  how to SSH in: auto|ssh|built-in (default: auto — use the
+//!                      system ssh if present, else the built-in russh client)
 //!   --ssh <cmd>        ssh command, shell-split (default: ssh); we append -n and
 //!                      -tt and run `host -- <server …>`, like upstream mosh
+//!   --ssh-port <n>     SSH port for the built-in client (default: 22)
 //!   --no-ssh-pty       don't allocate a remote PTY (omit ssh -tt)
 //!   --server <cmd>     mish-server command to run (default: mish-server,
 //!                      or the sibling binary in --local mode)
@@ -33,7 +36,7 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use mish::bootstrap::{self, shell_split, Bootstrap};
+use mish::bootstrap::{self, shell_split, Bootstrap, BootstrapMode};
 use mish::client::{run_client, ClientInput};
 use mish_quic::transport;
 use mish_ssp::clock::SystemClock;
@@ -84,9 +87,17 @@ fn suspend(no_init: bool) {
 
 struct Options {
     local: bool,
-    /// The ssh command, shell-split (e.g. `["ssh", "-p", "2222"]`).
+    /// How to run the SSH bootstrap step (`--bootstrap`): the system `ssh`
+    /// binary, the built-in russh client, or auto-detect.
+    bootstrap: BootstrapMode,
+    /// The ssh command, shell-split (e.g. `["ssh", "-p", "2222"]`). Used by the
+    /// `ssh` bootstrap transport.
     ssh_argv: Vec<String>,
-    /// Allocate a remote PTY (`ssh -tt`); cleared by `--no-ssh-pty`.
+    /// SSH port for the built-in bootstrap transport (`--ssh-port`, default 22).
+    /// The system `ssh` transport takes its port from `--ssh "ssh -p N"` instead.
+    ssh_port: u16,
+    /// Allocate a remote PTY (`ssh -tt`); cleared by `--no-ssh-pty`. Applies to
+    /// the `ssh` transport only.
     ssh_pty: bool,
     server_cmd: Option<String>,
     /// Speculative-echo mode (`--predict` / `-a` / `-n` / `MOSH_PREDICTION_DISPLAY`).
@@ -129,7 +140,9 @@ fn parse_predict(name: &str) -> Result<PredictMode> {
 fn parse_args() -> Result<Options> {
     let mut opts = Options {
         local: false,
+        bootstrap: BootstrapMode::default(),
         ssh_argv: vec!["ssh".into()],
+        ssh_port: 22,
         ssh_pty: true,
         server_cmd: None,
         // Default adaptive, overridable by env then by an explicit flag (mosh's
@@ -150,12 +163,27 @@ fn parse_args() -> Result<Options> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--local" => opts.local = true,
+            "--bootstrap" => {
+                let val = args.next().context("--bootstrap needs auto|ssh|built-in")?;
+                opts.bootstrap = BootstrapMode::parse(&val)?;
+            }
+            // Also accept the `--bootstrap=<how>` spelling.
+            s if s.starts_with("--bootstrap=") => {
+                opts.bootstrap = BootstrapMode::parse(&s["--bootstrap=".len()..])?;
+            }
             "--ssh" => {
                 let val = args.next().context("--ssh needs a value")?;
                 opts.ssh_argv = shell_split(&val)?;
                 if opts.ssh_argv.is_empty() {
                     bail!("--ssh value is empty");
                 }
+            }
+            "--ssh-port" => {
+                opts.ssh_port = args
+                    .next()
+                    .context("--ssh-port needs a number")?
+                    .parse()
+                    .context("--ssh-port must be a number")?;
             }
             "--no-ssh-pty" => opts.ssh_pty = false,
             "--server" => opts.server_cmd = Some(args.next().context("--server needs a value")?),
@@ -213,7 +241,9 @@ fn print_usage() {
          \x20      mish-client --local [-- command]\n\n\
          options:\n\
          \x20 --local              run mish-server as a local child (no SSH)\n\
+         \x20 --bootstrap <how>    SSH transport: auto|ssh|built-in (default: auto)\n\
          \x20 --ssh <cmd>          ssh command, shell-split (default: ssh)\n\
+         \x20 --ssh-port <n>       SSH port for the built-in transport (default: 22)\n\
          \x20 --no-ssh-pty         don't allocate a remote PTY (no ssh -tt)\n\
          \x20 --server <cmd>       mish-server command to run (default: mish-server)\n\
          \x20 --predict <mode>     adaptive|always|never|experimental (default: adaptive)\n\
@@ -271,17 +301,32 @@ async fn main() -> Result<()> {
     } else {
         let host = opts.host.clone().unwrap();
         let server = opts.server_cmd.unwrap_or_else(|| SERVER_BIN.into());
-        eprintln!("[mish-client] {} {host} {server}…", opts.ssh_argv.join(" "));
-        bootstrap::ssh(
-            &opts.ssh_argv,
-            opts.ssh_pty,
-            &host,
-            &server,
-            opts.session.as_deref(),
-            opts.command.as_deref(),
-        )
-        .await
-        .context("ssh bootstrap")?
+        // Pick the SSH transport: the system `ssh` binary, or the built-in russh
+        // client. In `auto` mode we use `ssh` when it is on PATH, else built-in.
+        if opts.bootstrap.use_built_in(&opts.ssh_argv[0]) {
+            eprintln!("[mish-client] built-in ssh → {host}:{} {server}…", opts.ssh_port);
+            bootstrap::built_in(
+                &host,
+                opts.ssh_port,
+                &server,
+                opts.session.as_deref(),
+                opts.command.as_deref(),
+            )
+            .await
+            .context("built-in ssh bootstrap")?
+        } else {
+            eprintln!("[mish-client] {} {host} {server}…", opts.ssh_argv.join(" "));
+            bootstrap::ssh(
+                &opts.ssh_argv,
+                opts.ssh_pty,
+                &host,
+                &server,
+                opts.session.as_deref(),
+                opts.command.as_deref(),
+            )
+            .await
+            .context("ssh bootstrap")?
+        }
     };
     eprintln!("[mish-client] connecting to {} …", boot.addr);
 

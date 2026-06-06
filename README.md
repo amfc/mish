@@ -84,16 +84,38 @@ as in mosh's shared-key model — the server accepts input only from the party t
 read those credentials over SSH. Anyone else who reaches the UDP port is rejected
 at the TLS handshake.
 
+**Two ways to do the SSH step (`--bootstrap`).** That initial SSH can run either
+way:
+
+- `--bootstrap=ssh` — shell out to the system `ssh` binary, exactly like upstream
+  mosh (full ssh-config / agent / proxy support; pass extra flags via `--ssh`).
+- `--bootstrap=built-in` — a built-in, pure-Rust SSH client ([`russh`]) that needs
+  no external `ssh`. It authenticates via the ssh-agent or your default
+  `~/.ssh/id_{ed25519,ecdsa,rsa}` keys, checks the host key against
+  `~/.ssh/known_hosts`, and takes the SSH port from `--ssh-port` (default 22).
+- `--bootstrap=auto` (the default) — use the system `ssh` if it's on `PATH`, else
+  fall back to the built-in client.
+
+The built-in client is what will let `mish` run where mosh never could —
+notably **Windows**, which has no upstream mosh. (The Windows port itself is
+still future work; this just removes the hard dependency on an external `ssh`.)
+
+[`russh`]: https://crates.io/crates/russh
+
 ```sh
 # Remote (like `mosh host`): SSH in, start the server, attach over UDP.
 mish-client user@host
 mish-client user@host -- tmux attach     # run a specific command
 
+# Force the built-in (no external ssh) SSH client, on a non-standard port.
+mish-client --bootstrap=built-in --ssh-port 2222 user@host
+
 # Local mode for testing: start mish-server as a child, no SSH.
 mish-client --local
 mish-client --local -- /bin/bash
 
-# Options: --ssh <cmd>  --server <cmd>  --predict <mode>  --no-init
+# Options: --bootstrap <how>  --ssh <cmd>  --ssh-port <n>  --server <cmd>
+#          --predict <mode>  --no-init
 # Keys: Ctrl-] quick-detach; escape prefix Ctrl-^ (MOSH_ESCAPE_KEY) then
 #       `.` quit / Ctrl-Z suspend (resumes cleanly on `fg`).
 #       Mouse wheel (or Shift-PageUp/PageDown) scrolls into server-held scrollback.
