@@ -84,6 +84,37 @@ entries (after an abrupt daemon death) are reaped on the next lookup by a
 liveness (`kill(pid, 0)`) check. Persistence is **opt-in** (`--session`); the
 default remains a fresh per-connection session.
 
+## Shared multi-client sessions (`--shared`)
+
+A shared session (`mish-server --shared`) lets **several clients attach to one
+session at the same time** — one read-write **owner** plus any number of
+read-only **viewers** (NEXT_FEATURES.md, "multi-client attach"). The security
+properties:
+
+- **Same trust boundary as reattach — not a new one.** Every attaching client
+  authenticates with the *same* per-session mutual-TLS credential, delivered over
+  SSH and recorded in the `0600` registry file above. So "who may attach" is
+  exactly "who has shell access as that user on the host" (or to whom that user
+  hands the SSH bootstrap) — `--shared` adds no new way in. It does **not** grant
+  cross-user access: a second user gets in only if they could already obtain the
+  session credential, which already implies shell access as the owner.
+- **Viewers are read-only at the source.** A viewer's keystrokes and resizes are
+  dropped **server-side** in `persist::attach` before they reach the PTY — the
+  shell never sees them. Read-only is enforced where input is applied, not by
+  asking the client to behave. There is exactly one writer slot (the owner);
+  while it's held, every other attachment is a viewer.
+- **All attached clients see all output.** A shared session is a broadcast of the
+  one screen to every client, so anyone attached can read everything on it
+  (including anything the owner types that echoes). Treat attaching someone as
+  handing them a live view of your terminal. Sharing is **opt-in** (`--shared`,
+  itself behind a default-on `multi-client` build feature that can be compiled
+  out entirely); the default is a single-client session.
+
+**Deferred:** an owner-issued, per-viewer *grant* (so a non-owner could be let in
+without the full session credential) and runtime write-token handoff between
+attached clients — both would need per-client minted certs and an in-session
+control protocol, out of scope for v1.
+
 ## Follow-ups (tracked)
 
 - **Zeroize the in-memory client key.** It currently lives as a `Vec<u8>` in

@@ -16,9 +16,9 @@ mutually-authenticated QUIC transport, the `alacritty-terminal` layer with
 mosh's minimal-diff, the `mish-client` / `mish-server` binaries, predictive
 echo, and the deterministic network simulators. Several features now go *beyond*
 upstream mosh — server-side **scrollback**, **persistent sessions + reattach**,
-and a reliable QUIC **side-channel** (see [`NEXT_FEATURES.md`](NEXT_FEATURES.md)).
-What's left (tracked in [`FUTURE_WORK.md`](FUTURE_WORK.md)) is small polish, not
-core functionality.
+**multi-client attach** (`--shared`), and a reliable QUIC **side-channel** (see
+[`NEXT_FEATURES.md`](NEXT_FEATURES.md)). What's left (tracked in
+[`FUTURE_WORK.md`](FUTURE_WORK.md)) is small polish, not core functionality.
 
 ## Why this can be small
 
@@ -160,6 +160,22 @@ credentials via a `0600` user-only registry file — see
 mish-client host --session work   # start (or reattach to) a persistent session "work"
 ```
 
+**Multi-client attach / shared sessions (also better than mosh).** With
+`--shared`, several clients can attach to one session *at the same time* — the
+client that starts it is the read-write **owner**, and anyone who attaches to the
+same named session afterward joins as a read-only **viewer** (pair programming,
+teaching, "watch my terminal"). The screen fans out to everyone; only the owner's
+keystrokes reach the shell, and a viewer on a smaller terminal sees the owner's
+screen cropped to its own size (the owner drives the geometry). All attached
+clients can read everything on the screen — sharing is opt-in, and the whole
+feature can be compiled out (`--no-default-features`, dropping the `multi-client`
+cargo feature) for a single-client-only build. See [`SECURITY.md`](SECURITY.md).
+
+```sh
+mish-client host --session demo --shared   # start a shared session "demo" (you're the owner)
+mish-client host --session demo            # someone else attaches read-only (a viewer)
+```
+
 A blue status banner ("mish: Last contact N seconds ago…") appears when the link
 stalls, and the window title is prefixed `[mish]`.
 
@@ -201,6 +217,7 @@ the independent UDP/QUIC path.
 | Side-channel | reliable bidi-stream request/response over real QUIC: framed round-trip + a 256 KiB payload past the datagram limit | `mish-quic/tests/side_channel.rs`, `mish-ssp` `framing` |
 | Scrollback | client fetches a deep history window over QUIC and gets the scrolled-off rows; client scroll-mode renders the history viewport headlessly | `mosh/tests/scrollback_e2e.rs`, `mosh/tests/scroll_client.rs` |
 | Reattach | the persistent session survives a client detach and re-syncs the full screen (incl. gap output) to a fresh connection; a second `--session NAME` server reattaches via the registry | `mosh/tests/reattach.rs`, `mosh/tests/session_reattach.rs`, `mosh` `registry` |
+| Multi-client (`--shared`) | a concurrent owner + viewer on one session both converge on the same output; the owner's keystrokes reach the PTY while the viewer's are dropped (read-only); a smaller viewer's screen is cropped to its own geometry | `mosh/tests/multi_client.rs`, `mish-terminal` `screen::resized_view` |
 | Diff-engine benchmark | throughput of `new_frame` + `apply_diff` round-trip across scrolling/typing/full-repaint workloads (mosh's `benchmark.cc`) | `mish-terminal/examples/diff_bench.rs` |
 | A/B latency harness | drives mish *and* upstream `mosh` through one fault-injecting relay (iid / Gilbert-Elliott burst / reorder) and compares display + keyboard latency identically — see [`PERFORMANCE.md`](PERFORMANCE.md) | `crates/bench-harness` |
 | Clock fuzz | non-monotonic / jumping / boundary clock values into the core's timer math: no panic, bounded memory, and forward jumps still converge | `mish-ssp/tests/fuzz_clock.rs` |
