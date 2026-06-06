@@ -147,6 +147,16 @@ pub async fn run_client<T: Transport>(
     // live updates still arrive but don't disturb the view.
     let mut scroll_offset: u32 = 0;
     let mut scroll_view: Option<Screen> = None;
+    // The scroll position is anchored to a *fixed point in the buffer* — the
+    // viewport's top row measured as lines above the oldest retained line
+    // (`scroll_anchor`) — not to the live top row. Output arriving while the user
+    // is scrolled grows the buffer at the *bottom*, so a live-edge-relative offset
+    // would slide the view out from under them (and strand the rows just above the
+    // live screen). `scroll_hist` is the history depth at the last fetch, used to
+    // convert the anchor back into the `top_above` the protocol speaks against the
+    // current (possibly grown) buffer. Both are only meaningful while scrolled.
+    let mut scroll_anchor: u32 = 0;
+    let mut scroll_hist: u32 = 0;
 
     // Emit a minimal frame from `painted` to the screen to show: either the
     // scrollback window (when scrolled) or the predicted live screen with a
@@ -207,34 +217,79 @@ pub async fn run_client<T: Transport>(
                     () => {{
                         if scroll_offset != 0 || scroll_view.is_some() {
                             scroll_offset = 0;
+                            scroll_anchor = 0;
                             scroll_view = None;
                             painted_once = false;
                         }
                     }};
                 }
-                // Scroll one page up into server-held history (fetched over the
-                // reliable side-channel; clamped to the available history).
-                macro_rules! scroll_up {
-                    () => {{
+                // Render the scrollback window whose top row sits `$from_oldest`
+                // lines above the oldest retained line — a *buffer-relative*
+                // position that stays put as new output grows the buffer. We learn
+                // the current history depth from the fetch and convert the anchor
+                // into a `top_above` request, refetching once if the buffer grew or
+                // shrank since we last looked (so a live-edge-relative `top_above`
+                // never strands content). At the live edge (`top == 0`) we leave
+                // scrollback.
+                macro_rules! scroll_to_anchor {
+                    ($from_oldest:expr) => {{
                         if let Some(h) = &history {
-                            let page = rows.max(1) as u32;
-                            let target = scroll_offset.saturating_add(page);
-                            if let Some(resp) = h.fetch(target, rows).await {
-                                let off = target.min(resp.history_size);
-                                if off > 0 {
-                                    // If the clamp landed on a different offset,
-                                    // refetch so the window matches it exactly.
-                                    let resp = if off != target {
-                                        h.fetch(off, rows).await.unwrap_or(resp)
-                                    } else {
-                                        resp
-                                    };
-                                    scroll_offset = off;
-                                    scroll_view = Some(history_screen(&resp, cols, rows, off));
+                            let want = $from_oldest;
+                            // Provisional request from the last known depth; the
+                            // response carries the true depth so we can correct.
+                            let prov = scroll_hist.saturating_sub(want);
+                            if let Some(resp) = h.fetch(prov, rows).await {
+                                let hist = resp.history_size;
+                                let anchor = want.min(hist);
+                                let top = hist.saturating_sub(anchor);
+                                let resp = if top != prov {
+                                    h.fetch(top, rows).await.unwrap_or(resp)
+                                } else {
+                                    resp
+                                };
+                                scroll_hist = hist;
+                                if top == 0 {
+                                    exit_scroll!();
+                                    repaint!();
+                                } else {
+                                    scroll_anchor = anchor;
+                                    scroll_offset = top;
+                                    scroll_view = Some(history_screen(&resp, cols, rows, top));
                                     painted_once = false;
                                     repaint!();
                                 }
                             }
+                        }
+                    }};
+                }
+                // Scroll one page toward older output. Entering scrollback shows
+                // the page just above the live top and pins it to the buffer;
+                // subsequent moves walk the buffer-relative anchor.
+                macro_rules! scroll_up {
+                    () => {{
+                        let page = rows.max(1) as u32;
+                        if scroll_view.is_none() {
+                            if let Some(h) = &history {
+                                if let Some(resp) = h.fetch(page, rows).await {
+                                    let hist = resp.history_size;
+                                    let top = page.min(hist);
+                                    if top > 0 {
+                                        let resp = if top != page {
+                                            h.fetch(top, rows).await.unwrap_or(resp)
+                                        } else {
+                                            resp
+                                        };
+                                        scroll_hist = hist;
+                                        scroll_anchor = hist.saturating_sub(top);
+                                        scroll_offset = top;
+                                        scroll_view = Some(history_screen(&resp, cols, rows, top));
+                                        painted_once = false;
+                                        repaint!();
+                                    }
+                                }
+                            }
+                        } else {
+                            scroll_to_anchor!(scroll_anchor.saturating_sub(page));
                         }
                     }};
                 }
@@ -242,20 +297,9 @@ pub async fn run_client<T: Transport>(
                 // leave scrollback entirely.
                 macro_rules! scroll_down {
                     () => {{
-                        if scroll_offset > 0 {
+                        if scroll_view.is_some() {
                             let page = rows.max(1) as u32;
-                            let target = scroll_offset.saturating_sub(page);
-                            if target == 0 {
-                                exit_scroll!();
-                                repaint!();
-                            } else if let Some(h) = &history {
-                                if let Some(resp) = h.fetch(target, rows).await {
-                                    scroll_offset = target;
-                                    scroll_view = Some(history_screen(&resp, cols, rows, target));
-                                    painted_once = false;
-                                    repaint!();
-                                }
-                            }
+                            scroll_to_anchor!(scroll_anchor.saturating_add(page));
                         }
                     }};
                 }
