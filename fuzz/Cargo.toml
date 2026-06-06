@@ -99,3 +99,22 @@ path = "fuzz_targets/resized_view.rs"
 test = false
 doc = false
 bench = false
+
+# Fuzz builds MUST be run with `--release` (see scripts / the 8h launcher). In the
+# default (non-release) cargo-fuzz build, `-Cdebug-assertions -Coverflow-checks`
+# are forced via RUSTFLAGS and can't be overridden per-package. Under `--release`
+# cargo-fuzz adds no such RUSTFLAGS, so these profile settings govern: we turn
+# debug-assertions + overflow-checks back ON for everything (matching the normal
+# fuzz build's bug-finding strength) …
+[profile.release]
+debug-assertions = true
+overflow-checks = true
+
+# … and OFF for vte only, to stop the known upstream legacy-color overflow panic
+# (vte 0.15 ansi.rs:219) from spamming crash artifacts during campaigns. It is a
+# documented non-bug (see ../vte-legacy-color-overflow.md), not a real finding;
+# ASan stays on for vte, so genuine memory bugs there are still caught. Drop this
+# once a fixed vte ships.
+[profile.release.package.vte]
+debug-assertions = false
+overflow-checks = false
