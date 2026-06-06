@@ -616,11 +616,16 @@ async fn main() -> Result<()> {
     );
 
     for (name, faults) in conditions {
-        // Minimum a real echo round-trip can take: the relay delays each
-        // direction by `delay_ms`, so type→server→echo→client is ≥ 2×delay.
-        let floor = 2.0 * faults.delay_ms as f64;
-        println!("=== {name} ===   [echo round-trip floor ~{floor:.0} ms]");
-        println!("  DISPLAY 1-way (predict off)    KEYBOARD to-glyph (predict off / on)");
+        // Two different floors. Display is one-way (server→client), so it can't
+        // beat a single relay delay. Keyboard is a round trip (type→server→echo→
+        // client), so it can't beat 2× the delay. The `rt`/`loc` tag is against
+        // the keyboard (round-trip) floor only.
+        let one_way = faults.delay_ms as f64;
+        let floor = 2.0 * one_way;
+        println!(
+            "=== {name} ===   [display 1-way floor ~{one_way:.0} ms · keyboard round-trip floor ~{floor:.0} ms]"
+        );
+        println!("  DISPLAY 1-way (predict off)    KEYBOARD round-trip to-glyph (predict off / on)");
         for &t in targets {
             let (d_med, d_p90, dn) =
                 matrix_cell(t, &bins, faults, Predict::Never, Metric::Display, seeds).await;

@@ -58,24 +58,32 @@ debug mish vs the release system `mosh` is an unfair comparison and inflates
 mish by ~5 ms). Absolute numbers are machine-dependent; read the
 mish-vs-mosh *gap*, not the raw values:
 
+Two floors per condition: **display is one-way** (server→client), so it can't
+beat a single relay delay; **keyboard is a round trip**, so it can't beat 2× that
+delay. The `rt`/`loc` tag is against the keyboard (round-trip) floor.
+
 ```
-                                   KEYBOARD to-glyph (predict off / on)
-=== LAN    (floor ~2 ms) ===   DISPLAY 1-way
-   mish:   16.2/  17.9 ms          27.9 ms rt  /   2.1 ms rt
-     mosh:   12.5/  13.6 ms          12.9 ms rt  /   2.3 ms rt
+                              DISPLAY 1-way     KEYBOARD round-trip
+                              med / p90         predict off / on
+=== LAN   (disp floor ~1 ms · kbd floor ~2 ms) ===
+   mish:                    16.2/  17.9 ms    27.9 ms rt  /   2.1 ms rt
+     mosh:                    12.5/  13.6 ms    12.9 ms rt  /   2.3 ms rt
 
-=== DSL    (floor ~40 ms) ===
-   mish:   35.9/  38.6 ms          70.1 ms rt  /   2.1 ms loc
-     mosh:   33.2/  35.0 ms          56.0 ms rt  /   2.4 ms loc
+=== DSL   (disp floor ~20 ms · kbd floor ~40 ms) ===
+   mish:                    35.9/  38.6 ms    70.1 ms rt  /   2.1 ms loc
+     mosh:                    33.2/  35.0 ms    56.0 ms rt  /   2.4 ms loc
 
-=== WAN    (floor ~80 ms) ===
-   mish:   62.9/  75.5 ms         111.8 ms rt  /   2.2 ms loc
-     mosh:   60.5/  70.7 ms         102.6 ms rt  /   2.1 ms loc
+=== WAN   (disp floor ~40 ms · kbd floor ~80 ms) ===
+   mish:                    62.9/  75.5 ms   111.8 ms rt  /   2.2 ms loc
+     mosh:                    60.5/  70.7 ms   102.6 ms rt  /   2.1 ms loc
 
-=== LOSSY  (floor ~120 ms) ===
-   mish:   89.1/ 103.3 ms         164.0 ms rt  /   2.1 ms loc
-     mosh:   83.7/  98.7 ms         152.1 ms rt  /   2.2 ms loc
+=== LOSSY (disp floor ~60 ms · kbd floor ~120 ms) ===
+   mish:                    89.1/ 103.3 ms   164.0 ms rt  /   2.1 ms loc
+     mosh:                    83.7/  98.7 ms   152.1 ms rt  /   2.2 ms loc
 ```
+
+(So e.g. WAN display at 60–75 ms is *not* below its floor: display's floor is the
+~40 ms one-way delay, not the ~80 ms round-trip floor that governs keyboard.)
 
 Takeaways from this run:
 - Display: mish trails mosh by ~3 ms on a LAN, and the gap closes as the link
