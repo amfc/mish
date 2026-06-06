@@ -35,7 +35,10 @@ fn is_osc_unsafe(c: char) -> bool {
 /// carry a frame terminator and inject commands into the user's terminal. The
 /// common case (no control chars) borrows without allocating. Hardened after the
 /// `tty_emission_safety` fuzz target showed a title/URI could break OSC framing.
-fn osc_sanitize(s: &str) -> Cow<'_, str> {
+/// Also applied at snapshot time (`Emulator::snapshot`) so the stored screen
+/// never holds a title/URI that can't survive this emission — keeping the
+/// diff round-trip identity intact (the `diff_roundtrip` target found the gap).
+pub(crate) fn osc_sanitize(s: &str) -> Cow<'_, str> {
     if s.chars().any(is_osc_unsafe) {
         Cow::Owned(s.chars().filter(|&c| !is_osc_unsafe(c)).collect())
     } else {

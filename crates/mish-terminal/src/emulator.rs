@@ -282,7 +282,14 @@ impl Emulator {
             cursor_row: cursor.line.0.max(0) as u16,
             cursor_col: cursor.column.0 as u16,
             cursor_visible: mode.contains(TermMode::SHOW_CURSOR),
-            title: self.listener.title.lock().unwrap().clone(),
+            // Normalize the title to exactly what survives a clean OSC round-trip:
+            // strip control chars (new_frame strips them on emit) and trailing
+            // whitespace (alacritty drops it when re-parsing the emitted title).
+            // Otherwise the stored title keeps content the wire diff can't
+            // reproduce, breaking round-trip identity (diff_roundtrip fuzzer).
+            title: crate::display::osc_sanitize(&self.listener.title.lock().unwrap())
+                .trim_end()
+                .to_string(),
             echo_ack: 0, // set by the server session, not the emulator
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             mouse_mode,
@@ -314,9 +321,18 @@ fn convert_cell(cell: &ATermCell) -> Cell {
         bg: convert_color(cell.bg),
         flags: convert_flags(cell.flags),
         combining: cell.zerowidth().map(|z| z.to_vec()).unwrap_or_default(),
-        hyperlink: cell.hyperlink().map(|h| screen::Hyperlink {
-            id: Some(h.id().to_string()),
-            uri: h.uri().to_string(),
+        // Sanitize id/URI the same way new_frame does on emit, so the OSC 8
+        // hyperlink round-trips (control bytes here would be stripped on render).
+        // A hyperlink whose URI is empty (or sanitizes to empty) is an OSC 8
+        // *close*, not a link: re-emitting it produces no hyperlink, so store None
+        // to match (alacritty can leave a degenerate empty-URI link with an
+        // auto-generated id — found by the diff_roundtrip fuzzer).
+        hyperlink: cell.hyperlink().and_then(|h| {
+            let uri = crate::display::osc_sanitize(h.uri()).into_owned();
+            (!uri.is_empty()).then(|| screen::Hyperlink {
+                id: Some(crate::display::osc_sanitize(h.id()).into_owned()),
+                uri,
+            })
         }),
     }
 }

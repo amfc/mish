@@ -450,6 +450,36 @@ fn malicious_osc_fields_cannot_break_out() {
     );
 }
 
+/// Regression (found by the `diff_roundtrip` fuzzer after the OSC-injection fix):
+/// `new_frame` strips control bytes from the title/URI on emit, so the *snapshot*
+/// must strip them too — otherwise the stored title keeps a control char the wire
+/// diff can't reproduce, breaking the round-trip identity. A title set with a C1
+/// control char (U+008F) must be sanitized at snapshot and round-trip.
+#[test]
+fn control_char_title_round_trips() {
+    let mut emu = Emulator::new(40, 12);
+    emu.feed(b"\x1b]0;\xc2\x8fhi\x07"); // OSC 0: title "<U+008F>hi"
+    let cur = emu.snapshot();
+
+    // The snapshot dropped the control char (so it matches what new_frame emits).
+    assert!(
+        !cur.title.chars().any(|c| {
+            let u = c as u32;
+            u < 0x20 || u == 0x7f || (0x80..=0x9f).contains(&u)
+        }),
+        "snapshot title still holds a control char: {:?}",
+        cur.title
+    );
+    // …and a full repaint reproduces the screen exactly (title included).
+    let got = paint(&cur);
+    assert!(
+        screen_eq(&cur, &got),
+        "control-char title failed to round-trip: cur={:?} got={:?}",
+        cur.title,
+        got.title
+    );
+}
+
 /// Regression (found by the `diff_roundtrip` fuzzer): a wide (CJK) glyph whose
 /// spacer column gets overwritten by a real glyph — via insert-character (ICH)
 /// shifting into it — leaves the emulator in a "broken wide char" state (wide
