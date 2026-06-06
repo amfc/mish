@@ -80,6 +80,8 @@ Options:
   --shared            Allow several concurrent clients (one read-write owner +
                       read-only viewers); implies --persist. Requires the
                       `multi-client` build feature.
+  --no-forward        Hard-disable ssh -L/-R-style port forwarding (otherwise the
+                      authenticated client may request forwards).
   --session NAME      Start (or reattach to) a named, reattachable session.
                       Implies --persist.
   -4 | -6             Bind IPv4 (0.0.0.0, default) or IPv6 (::).
