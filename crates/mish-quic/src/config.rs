@@ -347,4 +347,60 @@ mod tests {
             "0-RTT early data must remain disabled (replay-injection risk)"
         );
     }
+
+    /// Security seam #0 — the auth decision. The pinned client-cert verifier is
+    /// the whole "only the SSH-authenticated party may connect" property: it must
+    /// accept a certificate **iff** it is byte-identical to the pinned one. A
+    /// false-accept is a total auth bypass, so sweep the equality boundary
+    /// adversarially (a different valid cert with the same subject, every
+    /// single-bit flip of the pinned DER, truncation/extension/prefix/empty) and
+    /// confirm only the exact cert is accepted — and that attacker-supplied
+    /// intermediates never change the verdict.
+    #[test]
+    fn pinned_client_verifier_accepts_only_the_exact_cert() {
+        init_crypto();
+        let mint = || {
+            rcgen::generate_simple_self_signed(vec!["mish-client".to_string()])
+                .unwrap()
+                .cert
+                .der()
+                .clone()
+        };
+        let pinned = mint();
+        let other = mint(); // a *different* valid self-signed cert, same subject
+        let v = PinnedClientCertVerifier::new(pinned.clone());
+        let now = UnixTime::now();
+
+        // Exact pinned cert → accepted.
+        assert!(v.verify_client_cert(&pinned, &[], now).is_ok());
+
+        // Everything that isn't byte-identical → rejected.
+        let pin = pinned.as_ref();
+        let mut adversarial: Vec<Vec<u8>> = vec![
+            other.as_ref().to_vec(),
+            Vec::new(),
+            pin[..pin.len() - 1].to_vec(),     // truncated
+            [pin, &[0u8]].concat(),            // extended
+            pin[..pin.len() / 2].to_vec(),     // prefix
+        ];
+        for i in 0..pin.len() {
+            let mut flipped = pin.to_vec();
+            flipped[i] ^= 0x01; // flip one bit at each position
+            adversarial.push(flipped);
+        }
+        for bytes in adversarial {
+            assert_ne!(bytes.as_slice(), pin, "test bug: perturbation equals pinned");
+            let cert = CertificateDer::from(bytes);
+            assert!(
+                v.verify_client_cert(&cert, &[], now).is_err(),
+                "verifier accepted a non-pinned client certificate"
+            );
+        }
+
+        // Only the end-entity is consulted: attacker-supplied intermediates can't
+        // turn a wrong cert into an accept, nor a right cert into a reject.
+        let bogus = CertificateDer::from(vec![0u8; 48]);
+        assert!(v.verify_client_cert(&pinned, &[bogus.clone()], now).is_ok());
+        assert!(v.verify_client_cert(&other, &[pinned.clone()], now).is_err());
+    }
 }
