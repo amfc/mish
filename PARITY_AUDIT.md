@@ -113,10 +113,13 @@ TLS verification" line is stale, but the *client-auth* direction is the real gap
 
 - **CSI 1 J** with cursor on row 1 leaves the row above intact, diverging from vt100/xterm
   (DOC'd, inherited from alacritty).
-- **SGR blink (5)** dropped from cell renditions.
+- **SGR blink (5)** dropped from cell renditions — *blocked at the emulator
+  layer* (alacritty has no blink cell flag; see FUTURE_WORK.md).
 - Legacy **mouse encodings/modes** not modeled: X10 (9), VT220-hilite (1001), UTF-8 (1005),
   urxvt (1015).
-- Client exit does not reset mouse/paste/reverse modes on the main screen.
+- Client exit mode-reset — *done.* On exit the client resets mouse reporting,
+  SGR-mouse, bracketed paste, reverse video, and application-cursor-keys
+  (DECCKM), restores alternate-scroll, and shows the cursor (`RESET_MODES`).
 - Icon name (OSC 1) collapsed into window title; no title stack; **no `[mosh]` title prefix**
   (the prefix is undocumented as a gap).
 - Scroll optimization is whole-screen-up only; no DECSTBM sub-region/downward scroll (DOC'd).
@@ -131,7 +134,8 @@ TLS verification" line is stale, but the *client-auth* direction is the real gap
 - Initial window size hardcoded **80x24** instead of `TIOCGWINSZ` from stdin — *resolved*
   (client reports the real `crossterm::size()`); child PTY `IUTF8` input flag — *resolved*
   (`pty::enable_iutf8`, kernel erase of multibyte chars in cooked mode).
-- `mish-server` lacks `--version`/`--help`/banner; no `-v`.
+- `mish-server` `--version`/`--help` (with a usage banner) — *done* (`-V`/`-h`
+  aliases, `server_cli.rs`); still no `-v` verbose.
 - No `--family`/`-4`/`-6`; no `--no-init` (`MOSH_NO_TERM_INIT`, suppress smcup/rmcup); no
   `--experimental-remote-ip`; no `-c` color advertisement (TERM hardcoded).
 - `MOSH_PREDICTION_DISPLAY`/`MOSH_PREDICTION_OVERWRITE` env vars not honored.

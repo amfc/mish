@@ -60,6 +60,36 @@ struct Options {
     log_level: tracing::Level,
 }
 
+const USAGE: &str = "\
+mish-server: spawn a shell on a PTY and serve it over QUIC datagrams.
+
+Usage: mish-server [OPTIONS] [bind-port] [-- command]
+
+Options:
+  --detach            Daemonize (fork + setsid) so the SSH session can close.
+  --persist           Keep the session alive across client disconnects and
+                      accept reattaches.
+  --shared            Allow several concurrent clients (one read-write owner +
+                      read-only viewers); implies --persist. Requires the
+                      `multi-client` build feature.
+  --session NAME      Start (or reattach to) a named, reattachable session.
+                      Implies --persist.
+  -4 | -6             Bind IPv4 (0.0.0.0, default) or IPv6 (::).
+  --family inet|inet6 Same as -4 / -6.
+  -p PORT | -p LO:HI  Bind a specific port, or the first free port in a range.
+  -l KEY=VAL          Export KEY=VAL to the child shell (repeatable).
+  --log-file PATH     Write a JSON event log to PATH.
+  --log-level LEVEL   Max verbosity for the event log (default: debug).
+  -h, --help          Print this help and exit.
+  -V, --version       Print version and exit.
+
+With no `-- command`, the user's $SHELL is started as a login shell.
+
+Env: MOSH_SERVER_NETWORK_TMOUT (mid-session idle, default 300s),
+     MOSH_SERVER_SIGNAL_TMOUT (wait for first connection, default 60s),
+     MISH_SERVER_REATTACH_TMOUT (--persist: wait for a reattach, default 24h).
+";
+
 fn parse_args() -> Result<Options> {
     let mut opts = Options {
         detach: false,
@@ -76,6 +106,14 @@ fn parse_args() -> Result<Options> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--version" | "-V" => {
+                println!("mish-server {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--help" | "-h" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
             "--detach" => opts.detach = true,
             "--persist" => opts.persist = true,
             "--shared" => {
