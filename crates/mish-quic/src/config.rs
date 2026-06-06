@@ -403,4 +403,68 @@ mod tests {
         assert!(v.verify_client_cert(&pinned, &[bogus.clone()], now).is_ok());
         assert!(v.verify_client_cert(&other, &[pinned.clone()], now).is_err());
     }
+
+    /// Client side of seam #0 — server pinning. The client trusts exactly the one
+    /// server cert it read over SSH (a RootCertStore with that single cert), so a
+    /// MITM on the hostile UDP path can't impersonate the user's host. This is the
+    /// honest-user protection: sweep the server verifier and confirm it accepts
+    /// the genuine pinned cert but rejects any other (a different valid cert with
+    /// the same name, every single-bit flip of the pinned DER, truncation/empty).
+    #[test]
+    fn server_pin_rejects_any_cert_but_the_one_read_over_ssh() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::client::WebPkiServerVerifier;
+        use rustls::pki_types::ServerName;
+
+        init_crypto();
+        let mint = || {
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .unwrap()
+                .cert
+                .der()
+                .clone()
+        };
+        let pinned = mint();
+        let other = mint(); // a different valid self-signed cert, same name
+
+        // Build the exact verifier the client uses: WebPKI against a root store
+        // holding only the pinned cert.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(pinned.clone()).unwrap();
+        let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let now = UnixTime::now();
+
+        // The genuine host cert (what the user read over SSH) is accepted.
+        assert!(
+            verifier
+                .verify_server_cert(&pinned, &[], &name, &[], now)
+                .is_ok(),
+            "client rejected the genuine pinned server cert"
+        );
+
+        // Any other server cert → rejected (no impersonation).
+        let pin = pinned.as_ref();
+        let mut adversarial: Vec<Vec<u8>> = vec![
+            other.as_ref().to_vec(),
+            Vec::new(),
+            pin[..pin.len() - 1].to_vec(),
+        ];
+        for i in 0..pin.len() {
+            let mut f = pin.to_vec();
+            f[i] ^= 0x01;
+            adversarial.push(f);
+        }
+        for bytes in adversarial {
+            let cert = CertificateDer::from(bytes);
+            assert!(
+                verifier
+                    .verify_server_cert(&cert, &[], &name, &[], now)
+                    .is_err(),
+                "client accepted a non-pinned server cert — MITM impersonation"
+            );
+        }
+    }
 }

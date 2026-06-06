@@ -36,6 +36,7 @@ TARGETS=(
   answerback_safety       # answerback loopback can't inject into the shell (no CR/LF)
   tty_emission_safety     # OSC title/URI can't break framing on the client TTY
   frag_memory_bounds      # reassembler memory stays bounded under a hostile peer
+  client_render_safety    # arbitrary server diff renders to the real TTY without injection
 )
 [ "$#" -gt 0 ] && TARGETS=("$@")
 

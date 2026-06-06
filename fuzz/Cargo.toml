@@ -77,3 +77,10 @@ path = "fuzz_targets/frag_memory_bounds.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "client_render_safety"
+path = "fuzz_targets/client_render_safety.rs"
+test = false
+doc = false
+bench = false
