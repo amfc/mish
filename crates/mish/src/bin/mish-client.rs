@@ -393,7 +393,7 @@ async fn main() -> Result<()> {
     // 2. Open the mutually-authenticated QUIC session: trust the server cert and
     //    present the minted client cert/key from the SSH-authenticated channel.
     let endpoint = transport::authenticated_client_endpoint(
-        "0.0.0.0:0".parse().unwrap(),
+        client_bind_addr(boot.addr),
         &boot.server_cert_der,
         &boot.client_cert_der,
         &boot.client_key_der,
@@ -436,6 +436,19 @@ fn exit_now() -> ! {
     std::process::exit(0);
 }
 
+/// Local address to bind the QUIC client endpoint to, matching the resolved
+/// server's address family. A QUIC connection can't cross families, so an
+/// IPv6 server needs an IPv6-bound endpoint; binding `0.0.0.0:0` (IPv4) and
+/// then dialing an IPv6 address fails. `:0` lets the OS pick the port.
+fn client_bind_addr(server: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    if server.is_ipv6() {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    }
+}
+
 /// Attach directly to a running server at `ip:port`, with the credential triple
 /// (hex `server-cert client-cert client-key`) in `$MISH_CONNECT`. No bootstrap.
 async fn attach_session(
@@ -462,7 +475,7 @@ async fn attach_session(
         .parse()
         .with_context(|| format!("bad --attach address {ip}:{port}"))?;
     let endpoint = transport::authenticated_client_endpoint(
-        "0.0.0.0:0".parse().unwrap(),
+        client_bind_addr(addr),
         &server_cert,
         &client_cert,
         &client_key,
@@ -797,9 +810,17 @@ impl mish::client::HistoryFetcher for QuicHistory {
     }
 }
 
+/// Terminal modes a remote program may have left enabled, reset on exit so the
+/// local terminal isn't wedged: mouse reporting (DECRST 1000/1002/1003) and SGR
+/// mouse encoding (1006), bracketed paste (2004), screen-reverse (5),
+/// application-cursor-keys (DECCKM, 1); then restore alternate-scroll (1007,
+/// which we force off during the session) and show the cursor (25).
+const RESET_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
+                           \x1b[?2004l\x1b[?5l\x1b[?1l\x1b[?1007h\x1b[?25h";
+
 /// Restores cooked mode and the main screen on drop, and resets the input modes
-/// a remote program may have left enabled so the local terminal isn't wedged
-/// (mouse reporting, bracketed paste, reverse video) after the session ends.
+/// a remote program may have left enabled (see [`RESET_MODES`]) so the local
+/// terminal isn't wedged after the session ends.
 struct TerminalGuard {
     /// Whether we entered the alternate screen (so we know to leave it).
     no_init: bool,
@@ -807,18 +828,41 @@ struct TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
-        // Disable mouse modes (incl. our wheel-capture baseline) and bracketed
-        // paste, drop screen-reverse, restore alternate-scroll (which we force
-        // off during the session), and show the cursor.
-        print!(
-            "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
-             \x1b[?2004l\x1b[?5l\x1b[?1007h\x1b[?25h"
-        );
+        print!("{RESET_MODES}");
         // Leave the alternate screen only if we entered it.
         if !self.no_init {
             print!("\x1b[?1049l");
         }
         use std::io::Write;
         let _ = std::io::stdout().flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn reset_modes_returns_cursor_keys_to_normal() {
+        // DECCKM off (?1l) must be in the on-exit reset, alongside the mouse,
+        // bracketed-paste, and reverse-video resets — so an app that left
+        // application-cursor-keys on doesn't wedge the local terminal's arrows.
+        assert!(RESET_MODES.contains("\x1b[?1l"), "app-cursor-keys reset");
+        assert!(RESET_MODES.contains("\x1b[?1000l"), "mouse reset");
+        assert!(RESET_MODES.contains("\x1b[?2004l"), "bracketed-paste reset");
+        assert!(RESET_MODES.contains("\x1b[?5l"), "reverse-video reset");
+        assert!(RESET_MODES.contains("\x1b[?25h"), "cursor shown");
+    }
+
+    #[test]
+    fn client_bind_addr_matches_server_family() {
+        let v4: SocketAddr = "203.0.113.5:60001".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:60001".parse().unwrap();
+        assert!(client_bind_addr(v4).is_ipv4(), "IPv4 server ⇒ IPv4 bind");
+        assert!(client_bind_addr(v6).is_ipv6(), "IPv6 server ⇒ IPv6 bind");
+        // Ephemeral port in both cases.
+        assert_eq!(client_bind_addr(v4).port(), 0);
+        assert_eq!(client_bind_addr(v6).port(), 0);
     }
 }

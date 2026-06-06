@@ -80,14 +80,24 @@ None of these are correctness or security gaps — the §1 review items
 (authentication, answerback, compression, escape/suspend/SIGCONT, status
 overlay) are all done. These are the remaining parity polish:
 
-- **Reverse video (DECSCNM `ESC[?5h`) + terminal bell (BEL).** mosh syncs both;
-  alacritty surfaces `Event::Bell` (dropped today) and may not model DECSCNM as a
-  `Screen` field — needs a transient bell counter and possibly emulator-side work.
-- **DECCKM cursor-key translation + legacy mouse encodings; client mode reset on
-  exit.** App-cursor-keys mode (SS3 vs CSI for arrows) needs client-side input
-  translation keyed on the synced mode; legacy mouse modes X10(9)/hilite(1001)/
-  UTF-8(1005)/urxvt(1015) unmodeled; SGR blink (5) dropped from renditions.
-  *(Client mode-reset-on-exit and the `[mish]` title prefix are already done.)*
+- **Terminal bell (BEL)** — *done.* `Screen::bell_count` is captured from
+  alacritty's `Event::Bell` (`emulator.rs`), synced, and the diff emits one BEL
+  (`^G`) per beep since the previous frame (`display.rs`); a full repaint
+  re-rings any accumulated bells.
+- **Reverse video (DECSCNM `ESC[?5h`) + SGR blink (5)** — *blocked at the
+  emulator layer.* alacritty does not model screen-reverse (no DECSCNM state) and
+  drops SGR 5 entirely (no `BLINK` cell flag — its SGR handler has no blink arm),
+  so neither is observable from the emulator's `Screen`/cell state. Capturing
+  them would need emulator-side work (or a pre-emulator SGR shadow parser), not a
+  diff-layer change — deferred for the same reason as the `CSI 1 J` divergence.
+- **DECCKM cursor-key input translation + legacy mouse encodings.**
+  App-cursor-keys *state* is synced (`Screen::app_cursor_keys`, emitted in
+  `display.rs`) and the wheel→arrow path honors it, but the client forwards raw
+  stdin bytes, so a real arrow press is **not** rewritten from CSI to SS3 when
+  the server app set DECCKM — that needs a small escape-sequence rewriter on the
+  input path (arrows + Home/End). Legacy mouse modes X10(9)/hilite(1001)/
+  UTF-8(1005)/urxvt(1015) remain unmodeled. *(Client mode-reset-on-exit — now
+  including DECCKM (`?1l`) — and the `[mish]` title prefix are done.)*
 - **Prediction-ack timing + paste guard + cursor validation** — *done* (except
   `PredictMode::Experimental`). The paste guard (no prediction for an input
   batch over 100 bytes), predicted-cursor validation against the server cursor,
@@ -112,8 +122,9 @@ overlay) are all done. These are the remaining parity polish:
   + `MOSH_PREDICTION_DISPLAY`, `--ssh` shell-splitting with `ssh -n`/`-tt` +
   `--no-ssh-pty`, `--no-init` (`MOSH_NO_TERM_INIT`, suppresses the alternate
   screen), and `--version` (`bootstrap::shell_split`, `client_cli.rs` tests).
-  *Remaining (lower value):* server `--version`/`--help`/banner, `-c` color
-  advertisement, and `--predict-overwrite` (needs the unimplemented
+  Server `--version`/`--help` (with a usage banner) are now done
+  (`mish-server --version|--help`, `server_cli.rs`). *Remaining (lower value):*
+  `-c` color advertisement and `--predict-overwrite` (needs the unimplemented
   `predict_overwrite` engine path).
 - **Initial window size from `TIOCGWINSZ` + PTY `IUTF8` input flag** — *done.*
   The client already reports the real size via `crossterm::size()`, and the
@@ -176,9 +187,9 @@ Remaining, in rough effort order:
 - **ProxyJump UDP.** Only the **SSH bootstrap** is tunnelled; the mosh UDP session
   still connects directly to the resolved target (mosh roaming isn't tunnelled),
   so the target must be UDP-reachable. Tunnelling UDP would be a larger change.
-- **IPv6 UDP target.** Shared with the `ssh` path: the QUIC client endpoint binds
-  `0.0.0.0:0` (IPv4), so if the host resolves to an IPv6 address first the
-  follow-on QUIC connect fails. The endpoint should bind to match the resolved
-  address family.
+- **IPv6 UDP target** — *done.* The QUIC client endpoint now binds to match the
+  resolved server's address family (`client_bind_addr`: `[::]:0` for an IPv6
+  server, `0.0.0.0:0` for IPv4), so an IPv6-first host no longer fails the
+  follow-on QUIC connect. Covered by `client_bind_addr_matches_server_family`.
 
 [`russh`]: https://crates.io/crates/russh
