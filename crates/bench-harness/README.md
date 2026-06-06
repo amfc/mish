@@ -42,23 +42,33 @@ straight to the server) — useful to separate transport faults from behavior.
 
 ## Example results
 
-Representative run (loopback, debug build; absolute numbers are machine- and
-build-dependent — read the mish-vs-mosh *gap*, not the raw values):
+Representative run (loopback, **release build** — always benchmark release: a
+debug mish vs the release system `mosh` is an unfair comparison and inflates
+mish by ~5 ms). Absolute numbers are machine-dependent; read the
+mish-vs-mosh *gap*, not the raw values:
 
 ```
 === LAN    (rtt~2ms,  0% loss) ===
   DISPLAY (server→client, predict off)   KEYBOARD echo (predict off / on)
-   mish:   21.1/  23.3 ms               35.3 ms /    2.9 ms
-     mosh:   13.4/  14.7 ms               25.4 ms /    3.3 ms
+   mish:   15.9/  17.6 ms               27.9 ms /    2.2 ms
+     mosh:   12.5/  13.5 ms               12.7 ms /    2.4 ms
 
 === WAN    (rtt~80ms, 5% loss) ===
-   mish:   67.7/  83.3 ms              117.1 ms /    2.9 ms
-     mosh:   60.7/  71.9 ms               59.7 ms /   59.8 ms
+   mish:   64.1/  74.3 ms              112.2 ms /    2.2 ms
+     mosh:   59.6/  72.1 ms               55.2 ms /   53.3 ms
+
+=== LOSSY  (rtt~120ms, 15% loss) ===
+   mish:   87.4/ 103.3 ms              165.4 ms /    2.2 ms
+     mosh:   88.5/ 102.0 ms              154.9 ms /  154.9 ms
 ```
 
 Takeaways from this run:
-- mish carries a consistent ~5–8 ms display-latency overhead vs mosh.
-- mish's predictive echo is strong and stable (~3 ms keyboard across all
-  conditions); mosh's adaptive prediction engages inconsistently at higher RTT.
+- Display: mish trails mosh by ~3 ms on a LAN, and the gap closes as the link
+  degrades (they're even on LOSSY) — consistent with QUIC vs UDP/OCB framing.
+- Keyboard with prediction *off*, mish's echo round-trip is meaningfully
+  slower than mosh's on good links (27.9 vs 12.7 ms LAN) — a real difference in
+  the server→client echo path, worth a closer look.
+- Predictive echo: mish is strong and stable (~2.2 ms across all conditions);
+  mosh's adaptive prediction engages inconsistently at higher RTT.
 
 These are a starting point for tuning, not a fixed verdict.
