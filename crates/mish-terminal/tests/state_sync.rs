@@ -50,7 +50,10 @@ fn arb_cell() -> impl Strategy<Value = Cell> {
 }
 
 fn arb_screen() -> impl Strategy<Value = Screen> {
-    (1u16..12, 1u16..6).prop_flat_map(|(cols, rows)| {
+    // cols >= 2: a single-column screen is a degenerate geometry `apply_diff`
+    // rejects (a wide glyph can't fit / makes alacritty's 1-wide grid panic), so
+    // it isn't a reconstructible state — see Screen::apply_diff's geometry guard.
+    (2u16..12, 1u16..6).prop_flat_map(|(cols, rows)| {
         let n = cols as usize * rows as usize;
         (
             Just(cols),
@@ -111,7 +114,7 @@ proptest! {
             let fd = (0..a.cells.len()).find(|&i| x.cells.get(i) != a.cells.get(i));
             prop_assert!(false, "roundtrip mismatch: dims x({},{}) a({},{}) cur x({},{},{}) a({},{},{}) title x={:?} a={:?}; firstcell {:?} x={:?} a={:?}; bdims({},{})",
                 x.cols,x.rows,a.cols,a.rows, x.cursor_row,x.cursor_col,x.cursor_visible, a.cursor_row,a.cursor_col,a.cursor_visible,
-                x.title,a.title, fd, fd.map(|i|&x.cells[i]), fd.map(|i|&a.cells[i]), b.cols,b.rows);
+                x.title,a.title, fd, fd.and_then(|i|x.cells.get(i)), fd.and_then(|i|a.cells.get(i)), b.cols,b.rows);
         }
     }
 
@@ -123,7 +126,7 @@ proptest! {
             let fd = (0..a.cells.len()).find(|&i| x.cells.get(i) != a.cells.get(i));
             prop_assert!(false, "from_initial mismatch: dims x({},{}) a({},{}) cur x({},{},{}) a({},{},{}) title x={:?} a={:?} echo x={} a={}; firstcell {:?} x={:?} a={:?}",
                 x.cols,x.rows,a.cols,a.rows, x.cursor_row,x.cursor_col,x.cursor_visible, a.cursor_row,a.cursor_col,a.cursor_visible,
-                x.title,a.title,x.echo_ack,a.echo_ack, fd, fd.map(|i|&x.cells[i]), fd.map(|i|&a.cells[i]));
+                x.title,a.title,x.echo_ack,a.echo_ack, fd, fd.and_then(|i|x.cells.get(i)), fd.and_then(|i|a.cells.get(i)));
         }
     }
 

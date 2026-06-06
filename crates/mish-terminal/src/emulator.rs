@@ -231,7 +231,25 @@ impl Emulator {
         for r in 0..rows {
             let row = &grid[Line(r as i32)];
             for c in 0..cols {
-                cells.push(convert_cell(&row[Column(c)]));
+                let aterm_cell = &row[Column(c)];
+                let mut cell = convert_cell(aterm_cell);
+                // Normalize a "broken" wide char: a WIDE_CHAR whose following
+                // column is not its spacer (the spacer was overwritten by a real
+                // glyph after an insert/delete — ICH/DCH — shifted into it). The
+                // glyph stream can't reproduce that state: re-emitting the wide
+                // glyph re-claims the spacer, and writing the partner glyph onto a
+                // spacer makes the terminal clear the wide char — so the receiver
+                // renders blank there. Store blank to match, keeping every snapshot
+                // reconstructible (same spirit as the control-char normalization in
+                // `convert_cell`). Found by the `diff_roundtrip` fuzzer.
+                if aterm_cell.flags.contains(Flags::WIDE_CHAR)
+                    && !(c + 1 < cols
+                        && row[Column(c + 1)].flags.contains(Flags::WIDE_CHAR_SPACER))
+                {
+                    cell.c = ' ';
+                    cell.combining.clear();
+                }
+                cells.push(cell);
             }
         }
 

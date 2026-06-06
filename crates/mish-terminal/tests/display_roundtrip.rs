@@ -414,3 +414,32 @@ proptest! {
         prop_assert!(diff.is_empty(), "identical screens produced a non-empty diff: {:?}", String::from_utf8_lossy(&diff));
     }
 }
+
+/// Regression (found by the `diff_roundtrip` fuzzer): a wide (CJK) glyph whose
+/// spacer column gets overwritten by a real glyph — via insert-character (ICH)
+/// shifting into it — leaves the emulator in a "broken wide char" state (wide
+/// glyph at col 0, a real glyph at col 1). The differ used to skip col 1 as the
+/// glyph's implied spacer and emit an *empty* diff, so the change was lost. The
+/// snapshot now normalizes the unreconstructible wide glyph to blank, so the
+/// incremental diff round-trips.
+#[test]
+fn broken_wide_char_spacer_roundtrips() {
+    let mut emu = Emulator::new(40, 12);
+    emu.feed(&[0xe5, 0xb6, 0x9e]); // U+5D9E: a wide glyph at col 0, spacer at col 1
+    let prev = emu.snapshot();
+    // CSI, BS (cursor left onto the spacer), '@' = ICH (insert blank), then '['
+    // written into the now-broken spacer column.
+    emu.feed(&[0x1b, 0x5b, 0x08, 0x40, 0x5b]);
+    let cur = emu.snapshot();
+
+    // The two screens genuinely differ (the bug produced an empty diff here).
+    assert_ne!(prev.cells, cur.cells, "the ICH should have changed the row");
+    // …and the incremental diff reconstructs `cur` from `prev`.
+    let rebuilt = apply(&prev, &cur);
+    assert!(
+        screen_eq(&cur, &rebuilt),
+        "broken-wide-char diff failed to round-trip:\n cur={:?}\n got={:?}",
+        cur.cells,
+        rebuilt.cells
+    );
+}

@@ -279,9 +279,12 @@ impl SyncState for Screen {
         // Reject degenerate or implausibly large geometries from a malformed/
         // hostile diff. A zero dimension slips past the product check (0 × huge ==
         // 0) yet makes the emulator's grid panic building a zero-width/height row;
-        // an enormous product would allocate an absurd grid. A real screen is
-        // always at least 1×1 (the initial 0×0 state never reaches apply_diff).
-        if cols == 0 || rows == 0 || cols as u32 * rows as u32 > MAX_SCREEN_CELLS {
+        // an enormous product would allocate an absurd grid. A *single-column*
+        // grid panics too: a wide (CJK) glyph writes its spacer to column 1, which
+        // is out of bounds in alacritty's 1-wide row (`cursor_cell` index OOB,
+        // found by the `screen_apply` fuzzer). A 1-column terminal can't render
+        // wide chars anyway and never occurs in practice, so require cols >= 2.
+        if cols < 2 || rows == 0 || cols as u32 * rows as u32 > MAX_SCREEN_CELLS {
             return;
         }
 
@@ -327,12 +330,33 @@ mod tests {
             d.push(b'\n'); // some escape-stream payload
             d
         };
-        for (cols, rows) in [(0, 0xe6e6), (0xe6e6, 0), (0, 0), (u16::MAX, u16::MAX)] {
+        // Includes cols == 1 (the `screen_apply` fuzzer's 1-column case): a real
+        // wide glyph in a 1-wide row makes alacritty's grid panic, so it's rejected
+        // like the zero/oversized geometries.
+        for (cols, rows) in [
+            (0, 0xe6e6),
+            (0xe6e6, 0),
+            (0, 0),
+            (1, 24),
+            (1, 256),
+            (u16::MAX, u16::MAX),
+        ] {
             let mut s = Screen::blank(80, 24);
             s.apply_diff(&make(cols, rows)); // must not panic
                                              // Degenerate/oversized geometry is rejected → screen left unchanged.
             assert_eq!((s.cols, s.rows), (80, 24));
         }
+
+        // The exact shrunk fuzzer counterexample: cols=1, rows=256, then a wide
+        // CJK glyph (U+2E80, UTF-8 e2 ba 80) whose spacer would land out of bounds.
+        let mut d = 0u64.to_le_bytes().to_vec();
+        d.extend_from_slice(&1u16.to_le_bytes()); // cols = 1
+        d.extend_from_slice(&256u16.to_le_bytes()); // rows
+        d.push(0); // flags
+        d.extend_from_slice(&[0xe2, 0xba, 0x80]); // wide glyph payload
+        let mut s = Screen::blank(80, 24);
+        s.apply_diff(&d); // must not panic
+        assert_eq!((s.cols, s.rows), (80, 24));
     }
 
     #[test]
