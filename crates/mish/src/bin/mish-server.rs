@@ -325,7 +325,7 @@ async fn serve_persistent(
     network_timeout: Option<Duration>,
     pty: PtyProcess,
 ) -> Result<()> {
-    use mish::persist::{AttachEnd, PersistentSession};
+    use mish::persist::{AttachEnd, PersistentSession, Role};
 
     let session = Arc::new(PersistentSession::spawn(
         emu.clone(),
@@ -354,9 +354,14 @@ async fn serve_persistent(
         let (preempt_tx, preempt_rx) = tokio::sync::oneshot::channel::<()>();
         let attaching = session
             .clone()
-            .attach(transport, network_timeout, async move {
-                let _ = preempt_rx.await;
-            });
+            .attach(
+                transport,
+                network_timeout,
+                async move {
+                    let _ = preempt_rx.await;
+                },
+                Role::Owner,
+            );
         tokio::pin!(attaching);
 
         let end = tokio::select! {

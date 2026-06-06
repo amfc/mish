@@ -24,6 +24,23 @@ use tokio::sync::{mpsc, watch};
 
 use crate::server::PtyControl;
 
+/// The role a client attachment plays in a (possibly **shared**, multi-client)
+/// session. The single read-write **owner** drives the PTY and its geometry; any
+/// number of read-only **viewers** watch the same screen but can't type into it
+/// (`NEXT_FEATURES.md` #3). A non-shared session always attaches as [`Owner`].
+///
+/// [`Owner`]: Role::Owner
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Read-write: this client's keystrokes and resizes reach the shared PTY and
+    /// emulator. There is at most one owner at a time.
+    Owner,
+    /// Read-only viewer: keystrokes and resizes are dropped (never reach the
+    /// shared shell). The viewer's reported geometry is used only to crop the
+    /// published screen to its terminal ("owner drives, viewers clip").
+    Viewer,
+}
+
 /// Why an [`PersistentSession::attach`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachEnd {
@@ -104,6 +121,18 @@ impl PersistentSession {
         s
     }
 
+    /// The screen to publish to one attachment: the live snapshot for an owner;
+    /// for a viewer, cropped/padded to its own reported geometry ("owner drives,
+    /// viewers clip"). Until a viewer has reported its size (`view_geom == None`)
+    /// it gets the owner geometry, corrected on its first resize.
+    fn screen_for(&self, processed: u64, role: Role, view_geom: Option<(u16, u16)>) -> Screen {
+        let s = self.screen(processed);
+        match (role, view_geom) {
+            (Role::Viewer, Some((cols, rows))) => s.resized_view(cols, rows),
+            _ => s,
+        }
+    }
+
     /// Run one client connection over `transport` until it disconnects or the
     /// child exits. The (re)attaching client gets a full repaint of the current
     /// screen automatically (a fresh SSP session re-syncs from scratch). Takes
@@ -114,11 +143,17 @@ impl PersistentSession {
     /// a reattach (e.g. after a hard drop that never closed the old connection)
     /// takes over immediately instead of blocking for up to 5 minutes. Pass
     /// `std::future::pending()` to opt out.
+    ///
+    /// `role` is the client's access level. [`Role::Owner`] (the only role a
+    /// non-shared session uses) forwards keystrokes/resizes to the shared PTY;
+    /// [`Role::Viewer`] drops them and only watches, with the published screen
+    /// cropped to the viewer's own terminal size.
     pub async fn attach<T: Transport>(
         self: Arc<Self>,
         transport: Arc<T>,
         network_timeout: Option<Duration>,
         cancel: impl std::future::Future<Output = ()> + Send,
+        role: Role,
     ) -> AttachEnd {
         let (driver, handle) =
             Driver::<T, Screen, UserStream>::with(transport, self.clock.clone(), SspConfig::default());
@@ -126,8 +161,11 @@ impl PersistentSession {
 
         // How many of *this* client's input events we've applied (its echo ack).
         let mut processed: u64 = 0;
+        // A viewer's last reported terminal size, used to crop the published
+        // screen to its geometry. `None` until its first resize arrives.
+        let mut view_geom: Option<(u16, u16)> = None;
         // Initial publish → full repaint of the current screen to the new client.
-        handle.set_local(self.screen(processed));
+        handle.set_local(self.screen_for(processed, role, view_geom));
 
         let mut remote = handle.subscribe_remote();
         let mut screen_rx = self.screen_rx.clone();
@@ -175,7 +213,7 @@ impl PersistentSession {
                         // Pump gone (child exited and the channel dropped).
                         return AttachEnd::ChildExited;
                     }
-                    let screen = self.screen(processed);
+                    let screen = self.screen_for(processed, role, view_geom);
                     handle.set_local(screen);
                 }
                 changed = remote.changed() => {
@@ -194,20 +232,32 @@ impl PersistentSession {
                         let mut e = self.emu.lock().unwrap();
                         for ev in stream.events_since(processed) {
                             match ev {
+                                // An owner's keystrokes reach the shared shell; a
+                                // viewer's are dropped (read-only). Either way the
+                                // event is consumed below (`processed`), so a
+                                // viewer's local prediction culls promptly rather
+                                // than resending forever.
                                 UserEvent::Keystroke(b) => {
-                                    let _ = self.pty_input.send(PtyControl::Input(b.clone()));
+                                    if role == Role::Owner {
+                                        let _ = self.pty_input.send(PtyControl::Input(b.clone()));
+                                    }
                                 }
-                                UserEvent::Resize { cols, rows } => {
-                                    let _ = self
-                                        .pty_input
-                                        .send(PtyControl::Resize { cols: *cols, rows: *rows });
-                                    e.resize(*cols, *rows);
-                                }
+                                // The owner drives the PTY geometry; a viewer only
+                                // records its own size to crop the screen it sees.
+                                UserEvent::Resize { cols, rows } => match role {
+                                    Role::Owner => {
+                                        let _ = self
+                                            .pty_input
+                                            .send(PtyControl::Resize { cols: *cols, rows: *rows });
+                                        e.resize(*cols, *rows);
+                                    }
+                                    Role::Viewer => view_geom = Some((*cols, *rows)),
+                                },
                             }
                         }
                         processed = stream.total();
                     }
-                    handle.set_local(self.screen(processed));
+                    handle.set_local(self.screen_for(processed, role, view_geom));
                 }
             }
         }
