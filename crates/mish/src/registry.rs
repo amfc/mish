@@ -155,6 +155,47 @@ pub fn remove(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Security seam #4 — the session name (`--session NAME`) is
+        /// attacker-influenceable (shared scripts, env). For *any* name, the
+        /// registry path must stay a single component directly inside the dir:
+        /// no `..`, no separators, no escape.
+        #[test]
+        fn entry_path_never_escapes_the_dir(name in ".*") {
+            let dir = Path::new("/run/user/1000/mish");
+            let p = entry_path(dir, &name);
+            prop_assert_eq!(p.parent(), Some(dir));
+            prop_assert!(
+                !p.components().any(|c| c == std::path::Component::ParentDir),
+                "path contains a parent-dir component: {:?}",
+                p
+            );
+            let fname = p.file_name().and_then(|f| f.to_str()).unwrap();
+            prop_assert!(!fname.contains('/') && fname.ends_with(".session"));
+        }
+    }
+
+    /// Explicit hostile session names (the `.`/`..` edges the `.session` suffix
+    /// has to neutralize) all stay inside the registry dir.
+    #[test]
+    fn hostile_session_names_stay_in_dir() {
+        let dir = Path::new("/run/user/1000/mish");
+        for name in [
+            "..",
+            ".",
+            "../../etc/passwd",
+            "/etc/passwd",
+            "a/../../b",
+            "....//....//",
+            "\0evil",
+            "",
+        ] {
+            let p = entry_path(dir, name);
+            assert_eq!(p.parent(), Some(dir), "{name:?} escaped the dir: {p:?}");
+        }
+    }
 
     /// A unique temp dir for a test (no external tempdir crate).
     fn tmp(tag: &str) -> PathBuf {

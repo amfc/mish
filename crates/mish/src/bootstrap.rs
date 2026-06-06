@@ -315,6 +315,29 @@ pub fn shell_split(s: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Security seam #1 — credential bootstrap parsing. The `MISH CONNECT`
+        /// line and the ssh/server command strings are parsed before the QUIC
+        /// session exists; they take input from the (SSH-authenticated, but
+        /// possibly buggy or compromised) server's stdout and from user/script
+        /// config. The parsers must never panic, and the hex codec carrying the
+        /// certs/keys must be an exact inverse.
+        #[test]
+        fn from_hex_is_an_exact_inverse(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            let decoded = from_hex(&to_hex(&bytes));
+            prop_assert_eq!(decoded.as_deref(), Some(bytes.as_slice()));
+        }
+
+        #[test]
+        fn bootstrap_parsers_never_panic(s in ".*") {
+            // Arbitrary input must not panic (results intentionally discarded).
+            let _ = from_hex(&s);
+            let _ = shell_split(&s);
+            let _ = parse_connect(&s);
+        }
+    }
 
     #[test]
     fn hex_roundtrip() {
