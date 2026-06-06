@@ -9,10 +9,11 @@
 //! so the fork happens in a single-threaded process. The child then builds the
 //! runtime and constructs the Quinn endpoint from the inherited socket.
 //!
-//! Usage: `mish-server [--detach] [--persist] [--shared] [--no-forward] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [bind-port] [-- command]`
+//! Usage: `mish-server [--detach] [--persist] [--shared] [--allow-forward] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [bind-port] [-- command]`
 //!
-//! `--no-forward` hard-disables `ssh -L`/`-R`-style port forwarding (otherwise
-//! the SSH-authenticated client may request forwards; see `docs/port-forwarding.md`).
+//! `--allow-forward` enables `ssh -L`/`-R`-style port forwarding, which is
+//! **off by default**; the bootstrapping client passes it automatically when the
+//! user requests a forward (see `docs/port-forwarding.md`).
 //!
 //! With no `-- command`, the user's `$SHELL` is started as a **login shell**
 //! (`-l`). `-4`/`-6` select the bind address family (default IPv4 `0.0.0.0`).
@@ -57,10 +58,11 @@ struct Options {
     /// else register a new one. Implies `--persist`.
     session: Option<String>,
     command: Option<String>,
-    /// Whether to honor client port-forwarding requests (`-L`/`-R`). On by
-    /// default — the connecting peer is the SSH-authenticated owner — and
-    /// hard-disabled with `--no-forward`. Forwards are still only created when
-    /// the client explicitly requests them.
+    /// Whether to honor client port-forwarding requests (`-L`/`-R`). **Off by
+    /// default** (deny); enabled per session with `--allow-forward`. The
+    /// SSH-bootstrapping client passes this automatically when the user asks for
+    /// a forward, so `mish-client host -L …` still works out of the box while a
+    /// manually-launched or reattached server stays locked down unless told.
     forward: bool,
     /// Write a JSON event log here (`--log-file`); `None` disables logging.
     log_file: Option<std::path::PathBuf>,
@@ -80,8 +82,9 @@ Options:
   --shared            Allow several concurrent clients (one read-write owner +
                       read-only viewers); implies --persist. Requires the
                       `multi-client` build feature.
-  --no-forward        Hard-disable ssh -L/-R-style port forwarding (otherwise the
-                      authenticated client may request forwards).
+  --allow-forward     Enable ssh -L/-R-style port forwarding (off by default).
+                      The bootstrapping client passes this automatically when a
+                      -L/-R forward is requested.
   --session NAME      Start (or reattach to) a named, reattachable session.
                       Implies --persist.
   -4 | -6             Bind IPv4 (0.0.0.0, default) or IPv6 (::).
@@ -110,7 +113,7 @@ fn parse_args() -> Result<Options> {
         shared: false,
         session: None,
         command: None,
-        forward: true,
+        forward: false,
         log_file: None,
         log_level: tracing::Level::DEBUG,
     };
@@ -127,7 +130,7 @@ fn parse_args() -> Result<Options> {
             }
             "--detach" => opts.detach = true,
             "--persist" => opts.persist = true,
-            "--no-forward" => opts.forward = false,
+            "--allow-forward" => opts.forward = true,
             "--shared" => {
                 #[cfg(feature = "multi-client")]
                 {

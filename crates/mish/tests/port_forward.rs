@@ -3,8 +3,9 @@
 //! Each test stands up real loopback QUIC endpoints (the same plumbing the
 //! binaries use), real TCP listeners/echo servers, and the actual
 //! `mish::forward` tasks — exercising the whole `-L`/`-R` data path, the
-//! `--no-forward` refusal, and the client-side security gate that refuses
-//! forwarded connections for binds it never requested.
+//! default-deny refusal (a server without `--allow-forward`), and the
+//! client-side security gate that refuses forwarded connections for binds it
+//! never requested.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,14 +120,14 @@ async fn remote_forward_relays_bytes() {
     drop(rf); // tearing down the forward closes the listener
 }
 
-/// `--no-forward`: the server refuses `-L` (the tunnel stream is closed with no
-/// data relayed) and `-R` (the request is NAK'd).
+/// Default deny (a server without `--allow-forward`): it refuses `-L` (the
+/// tunnel stream is closed with no data relayed) and `-R` (the request is NAK'd).
 #[tokio::test]
 async fn disabled_forwarding_is_refused() {
     let (target_port, _echo) = echo_server().await;
     let (client_t, server_t) = quic_pair().await;
 
-    // Forwarding disabled on the server.
+    // Forwarding not enabled on the server (the default).
     let emu = Emulator::shared(80, 24);
     tokio::spawn(serve_side_channels(server_t, emu, false));
 

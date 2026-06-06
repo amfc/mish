@@ -349,13 +349,23 @@ async fn main() -> Result<()> {
         exit_now();
     }
 
+    // Port forwarding is off on the server by default; if the user asked for any
+    // -L/-R forward, tell the server we launch to allow it (--allow-forward).
+    let want_forward = !opts.local_forwards.is_empty() || !opts.remote_forwards.is_empty();
+
     // 1. Bootstrap: get (udp addr, cert) by starting mish-server locally or via SSH.
     let boot: Bootstrap = if opts.local {
         let server = opts.server_cmd.unwrap_or_else(default_local_server);
         eprintln!("[mish-client] starting local server `{server}`…");
-        bootstrap::local(&server, opts.shared, opts.session.as_deref(), opts.command.as_deref())
-            .await
-            .context("local bootstrap")?
+        bootstrap::local(
+            &server,
+            opts.shared,
+            want_forward,
+            opts.session.as_deref(),
+            opts.command.as_deref(),
+        )
+        .await
+        .context("local bootstrap")?
     } else {
         let host = opts.host.clone().unwrap();
         let server = opts.server_cmd.unwrap_or_else(|| SERVER_BIN.into());
@@ -368,6 +378,7 @@ async fn main() -> Result<()> {
                 opts.ssh_port,
                 &server,
                 opts.shared,
+                want_forward,
                 opts.session.as_deref(),
                 opts.command.as_deref(),
             )
@@ -381,6 +392,7 @@ async fn main() -> Result<()> {
                 &host,
                 &server,
                 opts.shared,
+                want_forward,
                 opts.session.as_deref(),
                 opts.command.as_deref(),
             )

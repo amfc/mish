@@ -23,7 +23,7 @@ async fn local_bootstrap_starts_server_and_connects() {
     let server = env!("CARGO_BIN_EXE_mish-server");
 
     // Start the server child, read MISH CONNECT, learn (addr, cert).
-    let boot = bootstrap::local(server, false, None, Some("/bin/sh"))
+    let boot = bootstrap::local(server, false, false, None, Some("/bin/sh"))
         .await
         .expect("bootstrap should start the server and parse MISH CONNECT");
     assert_ne!(boot.addr.port(), 0, "got a real UDP port");

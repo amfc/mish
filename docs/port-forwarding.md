@@ -57,14 +57,19 @@ Port forwarding is the one feature that opens a network surface, so it is
 deliberately conservative. See [`SECURITY.md`](../SECURITY.md#port-forwarding--l---r)
 for the full threat model. In short:
 
-- **Off until requested.** No listener or tunnel exists unless you pass `-L`/`-R`.
+- **Default deny on the server.** The server refuses forwarding unless launched
+  with `--allow-forward`. When `mish-client` bootstraps the server over SSH it
+  passes that flag automatically as soon as you use `-L`/`-R`, so the common case
+  just works — but a server you started by hand (or are reattaching to) only
+  forwards if it was started with `--allow-forward`.
+- **Off until requested.** Even with the server allowing it, no listener or tunnel
+  exists unless you pass `-L`/`-R`.
 - **Same auth, no new crypto.** Tunnels ride the existing mutually-authenticated
-  connection; only the SSH-authenticated party can open them.
+  connection; only the SSH-authenticated party can open them. In a `--shared`
+  session, only the owner may forward (read-only viewers cannot).
 - **The client only dials what you configured.** A malicious/compromised server
   cannot use `-R` to reach arbitrary addresses on your machine — the client
   refuses any forwarded connection whose bind it didn't request.
-- **Server kill switch.** `mish-server --no-forward` hard-disables all
-  forwarding regardless of what the client asks.
 - **Bounded.** Each live tunnel is one QUIC stream; the concurrent-stream cap
   (256) bounds simultaneous tunneled connections, and per-stream flow control
   bounds memory.
@@ -108,7 +113,8 @@ A `-R` forward's server-side listener is tied to its control stream: closing it
 ### Where it's tested
 
 - [`crates/mish/tests/port_forward.rs`](../crates/mish/tests/port_forward.rs) —
-  `-L` and `-R` relay real bytes over real QUIC; `--no-forward` refuses both; the
-  client refuses a forwarded connection for an unconfigured bind.
+  `-L` and `-R` relay real bytes over real QUIC; a server without
+  `--allow-forward` refuses both; the client refuses a forwarded connection for
+  an unconfigured bind.
 - [`crates/mish/src/forward.rs`](../crates/mish/src/forward.rs) `#[cfg(test)]` —
   spec parsing, codec round-trip + panic-free decode on hostile bytes.

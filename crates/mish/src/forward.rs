@@ -29,13 +29,16 @@
 //!
 //! ## Security
 //!
-//! Forwarding is **off until explicitly requested** per-forward (`-L`/`-R`
-//! flags); see [`SECURITY.md`](../../../SECURITY.md). The connection is already
-//! mutually authenticated, so the peer is the SSH-authenticated owner. The one
-//! genuinely new surface is a *malicious server* reaching back into the client's
-//! localhost via `-R`: the client therefore **only dials targets it explicitly
+//! Forwarding is **default-deny on the server** — it is refused unless the
+//! server was launched with `--allow-forward` (the bootstrapping client passes
+//! that automatically when a `-L`/`-R` is requested) — and **off until
+//! explicitly requested** per-forward (`-L`/`-R` flags); see
+//! [`SECURITY.md`](../../../SECURITY.md). The connection is already mutually
+//! authenticated, so the peer is the SSH-authenticated owner. The one genuinely
+//! new surface is a *malicious server* reaching back into the client's localhost
+//! via `-R`: the client therefore **only dials targets it explicitly
 //! configured**, refusing any [`StreamHello::ForwardedConnection`] for a bind it
-//! never requested. The server can hard-disable all forwarding (`--no-forward`).
+//! never requested.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -186,7 +189,7 @@ fn dial_target(host: &str, port: u16) -> Option<String> {
 
 /// Accept side-channel streams on `transport` and demultiplex each by its
 /// [`StreamHello`]: scrollback history is always served; `-L`/`-R` forwarding is
-/// served only when `forward` is enabled (`mish-server` without `--no-forward`).
+/// served only when `forward` is enabled (`mish-server --allow-forward`).
 /// Runs until the connection goes away. Replaces the history-only accept loop.
 pub async fn serve_side_channels(
     transport: Arc<QuicTransport>,
@@ -243,7 +246,8 @@ async fn dispatch_server_stream(
                 let ack = ForwardAck {
                     ok: false,
                     bound_port: 0,
-                    message: "port forwarding is disabled on the server (--no-forward)".into(),
+                    message: "port forwarding is disabled on the server (needs --allow-forward)"
+                        .into(),
                 };
                 let _ = write_message(&mut send, &ack.encode()).await;
                 let _ = send.finish();

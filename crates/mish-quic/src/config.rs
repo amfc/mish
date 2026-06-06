@@ -47,7 +47,8 @@ pub fn init_crypto() {
 /// bidi stream, so the cap doubles as the ceiling on concurrent tunneled
 /// connections. 256 comfortably covers a browser's connection fan-out while still
 /// bounding memory; per-stream flow control bounds each stream's buffering, and
-/// forwarding is opt-in (`-L`/`-R`) and server-disablable (`--no-forward`).
+/// forwarding is opt-in (`-L`/`-R`) and default-deny on the server
+/// (`--allow-forward`).
 const MAX_SIDE_CHANNELS: u32 = 256;
 
 /// Transport config shared by client and server: datagrams on, plus a bounded

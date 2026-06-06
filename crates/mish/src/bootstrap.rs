@@ -171,11 +171,13 @@ pub fn program_on_path(prog: &str) -> bool {
 }
 
 /// Build the `mish-server` argument list: optional `--detach`, optional
-/// `--shared` (multi-client), an optional named reattachable `--session NAME`,
-/// an ephemeral port, then an optional `-- command`.
+/// `--shared` (multi-client), optional `--allow-forward` (port forwarding is
+/// off on the server by default), an optional named reattachable
+/// `--session NAME`, an ephemeral port, then an optional `-- command`.
 fn server_args(
     detach: bool,
     shared: bool,
+    forward: bool,
     session: Option<&str>,
     port: &str,
     command: Option<&str>,
@@ -186,6 +188,11 @@ fn server_args(
     }
     if shared {
         args.push("--shared".to_string());
+    }
+    // The user requested a -L/-R forward, so enable forwarding on the server we
+    // are launching for them (the server defaults to refusing it).
+    if forward {
+        args.push("--allow-forward".to_string());
     }
     if let Some(name) = session {
         args.push("--session".to_string());
@@ -203,13 +210,14 @@ fn server_args(
 pub async fn local(
     server_cmd: &str,
     shared: bool,
+    forward: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
     // Local mode: keep the server in the foreground as a managed child (no
     // detach — we kill it when the session ends).
     let mut child = Command::new(server_cmd)
-        .args(server_args(false, shared, session, "0", command))
+        .args(server_args(false, shared, forward, session, "0", command))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -234,12 +242,14 @@ pub async fn local(
 /// stdin, so the local TTY stays with us) and, unless `ssh_pty` is false, `-tt`
 /// (force remote PTY allocation, needed for the login shell to behave) — then
 /// `host -- <server …>`, matching upstream `mosh`'s wrapper.
+#[allow(clippy::too_many_arguments)] // bootstrap entry point: discrete server flags
 pub async fn ssh(
     ssh_argv: &[String],
     ssh_pty: bool,
     host: &str,
     server_cmd: &str,
     shared: bool,
+    forward: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
@@ -257,7 +267,7 @@ pub async fn ssh(
     cmd.arg(host)
         .arg("--")
         .arg(server_cmd)
-        .args(server_args(true, shared, session, "0", command));
+        .args(server_args(true, shared, forward, session, "0", command));
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -309,6 +319,7 @@ pub async fn builtin(
     port: Option<u16>,
     server_cmd: &str,
     shared: bool,
+    forward: bool,
     session: Option<&str>,
     command: Option<&str>,
 ) -> Result<Bootstrap> {
@@ -353,7 +364,7 @@ pub async fn builtin(
     // (`--detach` so the server survives this connection closing); each is
     // shell-quoted because sshd runs the whole string through the login shell.
     let argv = std::iter::once(server_cmd.to_string())
-        .chain(server_args(true, shared, session, "0", command))
+        .chain(server_args(true, shared, forward, session, "0", command))
         .map(|a| shell_quote(&a))
         .collect::<Vec<_>>()
         .join(" ");

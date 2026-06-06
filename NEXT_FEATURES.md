@@ -79,13 +79,15 @@ handles reliability, ordering, flow control, and congestion per stream. See
 crypto), and the bootstrap CLI patterns — exactly as planned.
 
 **Security** (full model in [`SECURITY.md`](SECURITY.md#port-forwarding--l---r)):
-**off until explicitly requested** per-forward; the authenticated peer is the
-owner (honoring its forward request is not a privilege escalation, as with ssh's
-`AllowTcpForwarding`); a server kill switch `--no-forward`; and — the one
-genuinely new surface — the client dials **only the targets it configured** for
-`-R`, so a hostile server can't reach arbitrary client-local addresses. Bounded
-by the concurrent-stream cap + per-stream flow control. Covered by e2e tests over
-real QUIC ([`port_forward.rs`](crates/mish/tests/port_forward.rs)).
+**default-deny on the server** (opt in with `--allow-forward`, which the
+bootstrapping client passes automatically when a forward is requested); **off
+until explicitly requested** per-forward; the authenticated peer is the owner
+(honoring its forward request is not a privilege escalation, as with ssh's
+`AllowTcpForwarding`), and in `--shared` sessions only the owner may forward; and
+— the one genuinely new surface — the client dials **only the targets it
+configured** for `-R`, so a hostile server can't reach arbitrary client-local
+addresses. Bounded by the concurrent-stream cap + per-stream flow control.
+Covered by e2e tests over real QUIC ([`port_forward.rs`](crates/mish/tests/port_forward.rs)).
 
 **Deferred (future work).** A per-target allow/deny policy (`PermitOpen`/
 `PermitListen`-style); `-D` SOCKS dynamic forwarding; UDP; and IPv6 *literals in
@@ -101,8 +103,8 @@ Both reuse the reliable side-channel (already shipped) and add no new crypto.
 1. **Clipboard (large)** — smallest: the small OSC 52 version already ships, so
    this is just moving big blobs onto the existing stream.
 2. **Port forwarding** — *done* (§2). Highest new value; the security model is
-   gated as planned (off until requested, owner model, `--no-forward`, client
-   dials only configured `-R` targets) with adversarial e2e tests.
+   gated as planned (default-deny `--allow-forward`, owner model, client dials
+   only configured `-R` targets) with adversarial e2e tests.
 
 Every one of these should land with the same testing discipline the project
 already holds itself to (see [`TESTING.md`](TESTING.md)): deterministic-sim

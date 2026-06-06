@@ -187,8 +187,9 @@ exactly like `ssh -L`/`-R` — each forwarded connection rides its own
 **bidirectional QUIC stream** inside the same mutually-authenticated connection,
 while the live screen keeps riding loss-tolerant datagrams. mosh's hand-rolled
 UDP/OCB transport has no reliable multiplexed channel, so it has no equivalent.
-Forwarding is **off until you request it** per-forward; the server can hard-disable
-it (`mish-server --no-forward`); and a `-R` client dials only the targets it
+Forwarding is **default-deny on the server** (`mish-server --allow-forward`,
+which the client passes automatically when you use `-L`/`-R`); it's **off until
+you request it** per-forward; and a `-R` client dials only the targets it
 configured, so a hostile server can't reach arbitrary client-local addresses. See
 [`docs/port-forwarding.md`](docs/port-forwarding.md) and the threat model in
 [`SECURITY.md`](SECURITY.md#port-forwarding--l---r).
@@ -233,7 +234,7 @@ the independent UDP/QUIC path.
 | Real-PTY reference | output of a real program on a real kernel PTY rendered by our emulator and the independent `vt100` must agree (real bytes, independent oracle) | `mosh/tests/real_terminal_reference.rs` |
 | Side-channel | reliable bidi-stream request/response over real QUIC: framed round-trip + a 256 KiB payload past the datagram limit | `mish-quic/tests/side_channel.rs`, `mish-ssp` `framing` |
 | Scrollback | client fetches a deep history window over QUIC and gets the scrolled-off rows; client scroll-mode renders the history viewport headlessly | `mosh/tests/scrollback_e2e.rs`, `mosh/tests/scroll_client.rs` |
-| Port forwarding | `-L`/`-R` relay real bytes over real QUIC; `--no-forward` refuses both; client refuses a forwarded connection for an unconfigured `-R` bind (hostile-server gate); spec-parse + codec round-trip / panic-free decode | `mosh/tests/port_forward.rs`, `mish::forward` |
+| Port forwarding | `-L`/`-R` relay real bytes over real QUIC; a server without `--allow-forward` refuses both (default-deny); client refuses a forwarded connection for an unconfigured `-R` bind (hostile-server gate); spec-parse + codec round-trip / panic-free decode | `mosh/tests/port_forward.rs`, `mish::forward` |
 | Reattach | the persistent session survives a client detach and re-syncs the full screen (incl. gap output) to a fresh connection; a second `--session NAME` server reattaches via the registry | `mosh/tests/reattach.rs`, `mosh/tests/session_reattach.rs`, `mosh` `registry` |
 | Multi-client (`--shared`) | a concurrent owner + viewer on one session both converge on the same output; the owner's keystrokes reach the PTY while the viewer's are dropped (read-only); a smaller viewer's screen is cropped to its own geometry | `mosh/tests/multi_client.rs`, `mish-terminal` `screen::resized_view` |
 | Diff-engine benchmark | throughput of `new_frame` + `apply_diff` round-trip across scrolling/typing/full-repaint workloads (mosh's `benchmark.cc`) | `mish-terminal/examples/diff_bench.rs` |
