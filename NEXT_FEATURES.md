@@ -199,32 +199,22 @@ large-payload upgrade riding #1's stream plumbing).
 
 ---
 
-## 5. Congestion-aware frame pacing (ECN → SSP send-interval)
+## 5. ~~Congestion-aware frame pacing (ECN → SSP send-interval)~~ — tried & removed
 
-**Why.** Closes the ECN gap noted in `FUTURE_WORK.md`/`NOT_IMPLEMENTING.md` — but
-as a **feature, not a chore**: wiring QUIC's congestion/ECN signal into the SSP
-send-interval makes us *better than* mosh's hand-rolled heuristic on bad links.
-mosh guesses at congestion; we can read QUIC's actual congestion controller.
-
-**Design.** The SSP core already derives its send interval from SRTT (`core.rs`
-`send_interval()`, ~2 frames/RTT). Feed it a second input: QUIC's congestion
-window / ECN-CE feedback / pacing rate from quinn, surfaced through the
-`Transport` trait as a lightweight "link pressure" signal. Under congestion,
-**lengthen the frame interval** (fewer, larger diffs) instead of hammering a
-saturated link; relax when it clears. Stays sans-IO: the signal is just another
-argument into the existing timer math, so it's simulator-testable (the
-`mish-ssp` sim can inject synthetic congestion the way it injects loss/skew).
-
-**Reuse.** `core.rs` send-interval logic, the deterministic sim
-(`sim.rs`/`sim_convergence.rs`) for asymmetric-loss/congestion scenarios already
-flagged as a test gap in `PARITY_AUDIT.md` §4.
-
-**Risks / unknowns.** What quinn exposes (cwnd/pacing/ECN may need a small quinn
-API surface or estimation from datagram-ack timing); avoiding oscillation
-(hysteresis, like the prediction triggers); proving convergence + fairness in
-sim. Independent of the stream primitive — **can proceed in parallel** with #1.
-
-**Effort.** Medium. Self-contained in the SSP/transport layer; good parallel track.
+> **Resolved: don't do this.** It was built (feed QUIC's ECN-CE/loss congestion
+> signal into the SSP send-interval, lengthening the frame interval under
+> congestion) and then **removed**, because the A/B bad-network harness showed it
+> made us **2.5× slower than mosh on heavy-loss keyboard echo (423 vs. 163 ms)**.
+>
+> The premise was wrong for an interactive shell. mosh deliberately does **no**
+> congestion control on its datagrams — it keeps blasting the latest state at the
+> frame rate, because latest-wins makes a dropped frame harmless — and QUIC
+> already congestion-controls the wire underneath us. Stacking a second, app-layer
+> backoff on top just added latency exactly when it hurt most. The settled
+> strategy is **"one congestion controller, and it's QUIC's"**: SSP stays purely
+> latency-paced like mosh. See **[`PERFORMANCE.md`](PERFORMANCE.md)** for the
+> measurement, the per-knob transport tuning, and the proof we stay at parity
+> under loss.
 
 ---
 

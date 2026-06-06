@@ -196,6 +196,7 @@ the independent UDP/QUIC path.
 | Scrollback | client fetches a deep history window over QUIC and gets the scrolled-off rows; client scroll-mode renders the history viewport headlessly | `mosh/tests/scrollback_e2e.rs`, `mosh/tests/scroll_client.rs` |
 | Reattach | the persistent session survives a client detach and re-syncs the full screen (incl. gap output) to a fresh connection; a second `--session NAME` server reattaches via the registry | `mosh/tests/reattach.rs`, `mosh/tests/session_reattach.rs`, `mosh` `registry` |
 | Diff-engine benchmark | throughput of `new_frame` + `apply_diff` round-trip across scrolling/typing/full-repaint workloads (mosh's `benchmark.cc`) | `mish-terminal/examples/diff_bench.rs` |
+| A/B latency harness | drives mish *and* upstream `mosh` through one fault-injecting relay (iid / Gilbert-Elliott burst / reorder) and compares display + keyboard latency identically — see [`PERFORMANCE.md`](PERFORMANCE.md) | `crates/bench-harness` |
 | Clock fuzz | non-monotonic / jumping / boundary clock values into the core's timer math: no panic, bounded memory, and forward jumps still converge | `mish-ssp/tests/fuzz_clock.rs` |
 | Roaming | a client that migrates its source address mid-session keeps converging (server re-pins the peer) | `mish-madsim/tests/madsim_fullstack.rs` |
 | Diff round-trip fuzz | structured-VT sequences + real-shell PTY replay, asserting the wire diff reproduces every screen transition | `mish-terminal/tests/fuzz_diff.rs`, `mosh/tests/replay.rs` |
@@ -324,11 +325,17 @@ mish equivalents.
 
 ### Beyond parity
 
-With mosh parity reached, the forward roadmap — features that make mish
-*better than* mosh by exploiting QUIC's reliable streams and crypto/resumption
-(server-side **scrollback**, **session persistence + reattach**, **multi-client
-attach**, large-payload **clipboard**, **congestion-aware pacing**, and **port
-forwarding**) — is laid out in **[`NEXT_FEATURES.md`](NEXT_FEATURES.md)**.
+Several beyond-mosh features are **already done** — server-side **scrollback**,
+**persistent sessions + reattach**, and the reliable QUIC **side-channel** they
+ride on. The remaining forward roadmap — **multi-client attach**, large-payload
+**clipboard**, and **port forwarding** — is laid out in
+**[`NEXT_FEATURES.md`](NEXT_FEATURES.md)**.
+
+> One idea that used to be on this list, app-layer *congestion-aware pacing*, was
+> built, measured to **hurt** interactive latency under loss (we'd be stacking a
+> second backoff on top of QUIC's, where mosh backs off not at all), and removed.
+> See [`PERFORMANCE.md`](PERFORMANCE.md) for the measurement and the resulting
+> "one congestion controller, and it's QUIC's" strategy.
 
 ## Toolchain, fuzzing & CI
 
