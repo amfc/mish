@@ -23,3 +23,16 @@ bincode = "1.3"
 # dev
 proptest = "1"
 tokio-test = "0.4"
+
+# Work around an upstream debug-only panic in `vte` 0.15's `parse_legacy_color`
+# (ansi.rs:219): for a `#`-prefixed OSC color whose body is >= 51 hex bytes, the
+# shift amount `4 * (slice.len() - 1)` reaches the word width, so `col >> n`
+# trips an overflow check and panics. The `answerback_safety` fuzzer surfaced it;
+# it is NOT a security/answerback bug (no CR/LF or amplification). Release builds
+# already wrap (overflow-checks off) and behave fine, so we only need to silence
+# the check in debug builds — disabling overflow-checks for the vte package alone
+# keeps a hostile OSC color from aborting a debug session. Reported upstream;
+# remove once a fixed vte release is published. The `fuzz` crate is excluded from
+# this workspace, so its instrumented build still catches regressions here.
+[profile.dev.package.vte]
+overflow-checks = false
