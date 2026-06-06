@@ -73,6 +73,14 @@ fn transport_config() -> Arc<TransportConfig> {
     let mut ack = quinn::AckFrequencyConfig::default();
     ack.max_ack_delay(Some(Duration::from_millis(5)));
     tc.ack_frequency_config(Some(ack));
+    // Congestion controller. Cubic (quinn default) multiplicatively collapses the
+    // window on loss, throttling our interactive datagrams under heavy/bursty loss
+    // — exactly where we trail mosh (which has no congestion control at all). BBR
+    // estimates bandwidth instead of reacting to loss, keeping datagrams flowing.
+    // Opt-in via MISH_CC=bbr while we A/B it.
+    if std::env::var("MISH_CC").as_deref() == Ok("bbr") {
+        tc.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
     Arc::new(tc)
 }
 
