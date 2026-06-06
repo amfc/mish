@@ -117,8 +117,13 @@ mish-client --bootstrap=builtin --ssh-port 2222 user@host
 mish-client --local
 mish-client --local -- /bin/bash
 
+# Port forwarding, like ssh (repeatable). -L: reach a remote service locally;
+# -R: expose a local service on the remote. See docs/port-forwarding.md.
+mish-client host -L 8080:localhost:3000     # local 8080 → remote's localhost:3000
+mish-client host -R 9000:localhost:3000     # remote 9000 → your localhost:3000
+
 # Options: --bootstrap <how>  --ssh <cmd>  --ssh-port <n>  --server <cmd>
-#          --predict <mode>  --no-init
+#          --predict <mode>  --no-init  -L/-R [bind:]port:host:hostport
 # Keys: Ctrl-] quick-detach; escape prefix Ctrl-^ (MOSH_ESCAPE_KEY) then
 #       `.` quit / Ctrl-Z suspend (resumes cleanly on `fg`).
 #       Shift-Up/Down (or Shift-PageUp/PageDown) scrolls server-held scrollback.
@@ -155,6 +160,18 @@ credentials via a `0600` user-only registry file — see
 ```sh
 mish-client host --session work   # start (or reattach to) a persistent session "work"
 ```
+
+**Port forwarding (mosh can't do this at all).** `mish-client -L
+[bind:]port:host:hostport` and `-R …` tunnel TCP connections over the session,
+exactly like `ssh -L`/`-R` — each forwarded connection rides its own
+**bidirectional QUIC stream** inside the same mutually-authenticated connection,
+while the live screen keeps riding loss-tolerant datagrams. mosh's hand-rolled
+UDP/OCB transport has no reliable multiplexed channel, so it has no equivalent.
+Forwarding is **off until you request it** per-forward; the server can hard-disable
+it (`mish-server --no-forward`); and a `-R` client dials only the targets it
+configured, so a hostile server can't reach arbitrary client-local addresses. See
+[`docs/port-forwarding.md`](docs/port-forwarding.md) and the threat model in
+[`SECURITY.md`](SECURITY.md#port-forwarding--l---r).
 
 A blue status banner ("mish: Last contact N seconds ago…") appears when the link
 stalls, and the window title is prefixed `[mish]`.
@@ -196,6 +213,7 @@ the independent UDP/QUIC path.
 | Real-PTY reference | output of a real program on a real kernel PTY rendered by our emulator and the independent `vt100` must agree (real bytes, independent oracle) | `mosh/tests/real_terminal_reference.rs` |
 | Side-channel | reliable bidi-stream request/response over real QUIC: framed round-trip + a 256 KiB payload past the datagram limit | `mish-quic/tests/side_channel.rs`, `mish-ssp` `framing` |
 | Scrollback | client fetches a deep history window over QUIC and gets the scrolled-off rows; client scroll-mode renders the history viewport headlessly | `mosh/tests/scrollback_e2e.rs`, `mosh/tests/scroll_client.rs` |
+| Port forwarding | `-L`/`-R` relay real bytes over real QUIC; `--no-forward` refuses both; client refuses a forwarded connection for an unconfigured `-R` bind (hostile-server gate); spec-parse + codec round-trip / panic-free decode | `mosh/tests/port_forward.rs`, `mish::forward` |
 | Reattach | the persistent session survives a client detach and re-syncs the full screen (incl. gap output) to a fresh connection; a second `--session NAME` server reattaches via the registry | `mosh/tests/reattach.rs`, `mosh/tests/session_reattach.rs`, `mosh` `registry` |
 | Diff-engine benchmark | throughput of `new_frame` + `apply_diff` round-trip across scrolling/typing/full-repaint workloads (mosh's `benchmark.cc`) | `mish-terminal/examples/diff_bench.rs` |
 | A/B latency harness | drives mish *and* upstream `mosh` through one fault-injecting relay (iid / Gilbert-Elliott burst / reorder) and compares display + keyboard latency identically — see [`PERFORMANCE.md`](PERFORMANCE.md) | `crates/bench-harness` |
@@ -328,10 +346,12 @@ mish equivalents.
 ### Beyond parity
 
 Several beyond-mosh features are **already done** — server-side **scrollback**,
-**persistent sessions + reattach**, and the reliable QUIC **side-channel** they
-ride on. The remaining forward roadmap — **multi-client attach**, large-payload
-**clipboard**, and **port forwarding** — is laid out in
-**[`NEXT_FEATURES.md`](NEXT_FEATURES.md)**.
+**persistent sessions + reattach**, the reliable QUIC **side-channel** they ride
+on, and now **`ssh -L`/`-R`-style port forwarding** (TCP tunnels over QUIC
+streams, which mosh's UDP/OCB transport cannot do — see
+[`docs/port-forwarding.md`](docs/port-forwarding.md)). The remaining forward
+roadmap — **multi-client attach** and large-payload **clipboard** — is laid out
+in **[`NEXT_FEATURES.md`](NEXT_FEATURES.md)**.
 
 > One idea that used to be on this list, app-layer *congestion-aware pacing*, was
 > built, measured to **hurt** interactive latency under loss (we'd be stacking a

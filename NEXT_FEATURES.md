@@ -86,31 +86,39 @@ large-payload upgrade riding the existing stream plumbing).
 
 ---
 
-## 3. Port forwarding over QUIC streams
+## 3. Port forwarding over QUIC streams — **done**
 
 **Why.** `ssh -L`/`-R`-style forwarding — something **mosh cannot do at all**
 (its UDP/OCB transport has no reliable multiplexed channel). QUIC streams make it
 almost free, turning mish from "a shell" into "a shell + tunnel."
 
-**Design.** Each forwarded TCP connection maps to one **bidirectional QUIC
-stream**, multiplexed over the existing authenticated connection. A control
-message (on the existing reliable side-channel) opens a forward: "`-L`
-local:port → remote:host:port" or the reverse. The client listens locally, opens
-a stream per accepted connection, and the server dials the target (and vice versa
-for `-R`). Pure byte-shoveling once the stream exists — QUIC handles reliability,
-ordering, flow control, and congestion per stream.
+**What shipped.** `mish-client -L [bind:]port:host:hostport` and `-R …`
+(repeatable, ssh syntax). Each forwarded TCP connection maps to one
+**bidirectional QUIC stream**, multiplexed over the existing authenticated
+connection ([`mish::forward`](crates/mish/src/forward.rs)). A framed
+`StreamHello` tags every side-channel stream so one accept loop demultiplexes
+scrollback history and forwarding; after the hello a data stream is a pure byte
+relay (`copy_bidirectional`). `-L` and `-R` are symmetric — the side that
+*accepts* a stream is the side that dials the target. Once the stream exists QUIC
+handles reliability, ordering, flow control, and congestion per stream. See
+[`docs/port-forwarding.md`](docs/port-forwarding.md).
 
-**Reuse.** The reliable side-channel, the mutual-auth connection (no new crypto),
-CLI parsing patterns from the bootstrap / `--ssh` work.
+**Reuse.** Built on the reliable side-channel, the mutual-auth connection (no new
+crypto), and the bootstrap CLI patterns — exactly as planned.
 
-**Risks / unknowns.** This is a **real security surface** — forwarding lets the
-remote reach into the local network and vice versa. Must be **off by default**,
-explicitly requested per-forward, and ideally policy-gated (allowed hosts/ports).
-Resource limits (max streams/forwards), half-close semantics, IPv6, and CLI
-ergonomics (`-L`/`-R`/`-D` SOCKS?). Treat the threat model as seriously as the
-auth work in `SECURITY.md`.
+**Security** (full model in [`SECURITY.md`](SECURITY.md#port-forwarding--l---r)):
+**off until explicitly requested** per-forward; the authenticated peer is the
+owner (honoring its forward request is not a privilege escalation, as with ssh's
+`AllowTcpForwarding`); a server kill switch `--no-forward`; and — the one
+genuinely new surface — the client dials **only the targets it configured** for
+`-R`, so a hostile server can't reach arbitrary client-local addresses. Bounded
+by the concurrent-stream cap + per-stream flow control. Covered by e2e tests over
+real QUIC ([`port_forward.rs`](crates/mish/tests/port_forward.rs)).
 
-**Effort.** Medium–large, mostly the security/policy + CLI, not the data path.
+**Deferred (future work).** A per-target allow/deny policy (`PermitOpen`/
+`PermitListen`-style); `-D` SOCKS dynamic forwarding; UDP; and IPv6 *literals in
+the spec string* (bind/dial resolve IPv6 fine — only the colon-splitting spec
+parser is IPv4/hostname-only). None are core.
 
 ---
 
@@ -122,9 +130,9 @@ All three reuse the reliable side-channel (already shipped) and add no new crypt
    this is just moving big blobs onto the existing stream.
 2. **Multi-client attach** — builds on the shipped session registry; mostly a
    `Screen` fan-out + an input-merge policy.
-3. **Port forwarding** — highest new value, but gate the security model carefully
-   (it's the only one that opens a network surface); do the threat-model work and
-   adversarial tests first.
+3. **Port forwarding** — *done* (§3). Highest new value; the security model is
+   gated as planned (off until requested, owner model, `--no-forward`, client
+   dials only configured `-R` targets) with adversarial e2e tests.
 
 Every one of these should land with the same testing discipline the project
 already holds itself to (see [`TESTING.md`](TESTING.md)): deterministic-sim

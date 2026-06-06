@@ -80,8 +80,58 @@ entries (after an abrupt daemon death) are reaped on the next lookup by a
 liveness (`kill(pid, 0)`) check. Persistence is **opt-in** (`--session`); the
 default remains a fresh per-connection session.
 
+## Port forwarding (`-L` / `-R`)
+
+`ssh -L`/`-R`-style TCP forwarding (NEXT_FEATURES.md #3) tunnels connections over
+**bidirectional QUIC streams** inside the existing mutually-authenticated
+connection — **no new crypto and no new auth surface**: only the
+SSH-authenticated party (the one who read the minted client cert/key over SSH)
+can open a stream at all. Forwarding is the one feature that opens a *network*
+surface, so the posture is deliberately conservative.
+
+- **Off until explicitly requested, per forward.** No listener or tunnel exists
+  unless the user passes `-L`/`-R`. There is no ambient forwarding.
+- **The authenticated peer is the owner.** A `-L` lets the client make the server
+  dial a target, and `-R` lets the server listen on the client's behalf. Because
+  the connecting party is the SSH-authenticated user — who could already run
+  arbitrary commands on the host — honoring their explicit forward request is not
+  a privilege escalation (this is exactly ssh's `AllowTcpForwarding` posture).
+- **Server kill switch.** `mish-server --no-forward` hard-disables all
+  forwarding regardless of the client's request: `-L`/`-R` streams are refused
+  and `-R` requests are NAK'd. Use it when the server should never tunnel.
+- **The genuinely new surface — a hostile server reaching into the client's
+  localhost via `-R` — is closed.** When the server opens a `ForwardedConnection`
+  stream, the client dials **only a target it explicitly configured** for that
+  `-R` bind, keyed by the requested bind identity; a connection for any other
+  bind is refused without dialing. So a compromised/malicious server cannot use
+  `-R` to reach arbitrary addresses on the client. (Tested:
+  `port_forward.rs::client_refuses_unconfigured_forwarded_connection`.)
+- **Bounded.** Each live tunnel is one QUIC stream; the concurrent-stream cap
+  (`MAX_SIDE_CHANNELS`, 256) bounds simultaneous tunneled connections, per-stream
+  flow control bounds memory, and the framed `StreamHello`/`ForwardAck` control
+  messages are size-capped and decode panic-free on arbitrary bytes (the
+  `fuzz_hostile` discipline — `forward.rs` codec tests).
+- **Listener lifetime.** A `-R` listener is tied to its control stream: tearing
+  the forward down (detach/exit) or a dead connection frees the bound port.
+
+What is **relied on, not separately enforced:** beyond the
+authenticated-owner model there is no per-target allow/deny policy (ssh's
+`PermitOpen`/`PermitListen`). A `-L` can dial any host the server can reach, and a
+`-R` can bind any address the server may bind. A target allowlist is tracked as
+future work; today the control is binary (`--no-forward`) plus the owner model.
+
+| Property | Mechanism | Test |
+|---|---|---|
+| Forwarding only when requested | no listener/stream without `-L`/`-R` | (by construction) |
+| Server can refuse all forwarding | `--no-forward` → refuse `-L`, NAK `-R` | `port_forward.rs::disabled_forwarding_is_refused` |
+| Hostile server can't reach unconfigured client-local addrs via `-R` | client dials only configured `-R` targets | `port_forward.rs::client_refuses_unconfigured_forwarded_connection` |
+| Forwarding control messages are panic-free / bounded | size-capped framing + `Option`-returning decode | `forward.rs::decode_is_panic_free_on_garbage` |
+
 ## Follow-ups (tracked)
 
+- **Per-target forwarding allowlist** (`PermitOpen`/`PermitListen`-style). Today
+  forwarding is gated by the authenticated-owner model plus a server-wide
+  `--no-forward`; a host/port allow/deny policy is future work (NEXT_FEATURES.md).
 - **Zeroize the in-memory client key.** It currently lives as a `Vec<u8>` in
   `SessionAuth`/`Bootstrap`; wrapping it so it's wiped on drop (and suppressing
   core dumps via `RLIMIT_CORE`) is tracked with the broader secrecy adoption.
