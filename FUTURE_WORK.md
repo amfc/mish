@@ -84,20 +84,14 @@ overlay) are all done. These are the remaining parity polish:
   alacritty's `Event::Bell` (`emulator.rs`), synced, and the diff emits one BEL
   (`^G`) per beep since the previous frame (`display.rs`); a full repaint
   re-rings any accumulated bells.
-- **Reverse video (DECSCNM `ESC[?5h`) + SGR blink (5)** — *blocked at the
-  emulator layer.* alacritty does not model screen-reverse (no DECSCNM state) and
-  drops SGR 5 entirely (no `BLINK` cell flag — its SGR handler has no blink arm),
-  so neither is observable from the emulator's `Screen`/cell state. Capturing
-  them would need emulator-side work (or a pre-emulator SGR shadow parser), not a
-  diff-layer change — deferred for the same reason as the `CSI 1 J` divergence.
-- **DECCKM cursor-key input translation + legacy mouse encodings.**
-  App-cursor-keys *state* is synced (`Screen::app_cursor_keys`, emitted in
-  `display.rs`) and the wheel→arrow path honors it, but the client forwards raw
-  stdin bytes, so a real arrow press is **not** rewritten from CSI to SS3 when
-  the server app set DECCKM — that needs a small escape-sequence rewriter on the
-  input path (arrows + Home/End). Legacy mouse modes X10(9)/hilite(1001)/
-  UTF-8(1005)/urxvt(1015) remain unmodeled. *(Client mode-reset-on-exit — now
-  including DECCKM (`?1l`) — and the `[mish]` title prefix are done.)*
+- **DECCKM cursor-key input translation, legacy mouse encodings, SGR blink (5),
+  screen-reverse DECSCNM (`?5h`)** — *decided, not pending.* These are now in
+  [`NOT_IMPLEMENTING.md`](NOT_IMPLEMENTING.md): the first two are low-value legacy
+  corners almost no current program needs (and the DECCKM rewrite would sit on the
+  regression-sensitive raw-input path), and the last two are blocked at the
+  emulator layer (alacritty models neither blink nor DECSCNM). *(Client
+  mode-reset-on-exit — now including DECCKM (`?1l`) — and the `[mish]` title prefix
+  are done.)*
 - **Prediction-ack timing + paste guard + cursor validation** — *done* (except
   `PredictMode::Experimental`). The paste guard (no prediction for an input
   batch over 100 bytes), predicted-cursor validation against the server cursor,
