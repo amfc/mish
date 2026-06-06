@@ -37,6 +37,10 @@ boundary is explicit.
 | Pre-handshake junk doesn't exhaust the server | quinn endpoint drops invalid packets | `wire_attacks.rs::server_survives_pre_handshake_junk_flood` |
 | Client key not leaked to logs | only on the SSH-tunneled stdout line, never stderr | `mosh/tests/key_hygiene.rs` |
 | Malformed/hostile SSP input is safe | no-panic, bounded memory, compression-bomb cap | `fuzz_hostile.rs`, `fuzz_driver_live.rs`, `instruction.rs` |
+| Builtin bootstrap rejects a *changed* host key | `classify_host_key` over russh `check_known_hosts` (match→accept, mismatch→refuse, unknown→TOFU) | `bootstrap.rs` `host_key_{matching,mismatch,unknown}_*` |
+| Builtin bootstrap can't be shell-injected | `shell_quote` single-quote escaping of the remote command/session name | `bootstrap.rs` `shell_quote_resists_injection_in_real_sh` (real `/bin/sh`), `shell_quote_round_trips_through_split` |
+| Hostile/buggy server can't exhaust client memory at bootstrap | bounded `MISH CONNECT` scan (`MAX_CONNECT_SCAN`, both transports) | `bootstrap.rs` `scan_connect_*`, `bootstrap_parse` fuzz target |
+| Bootstrap parsers are panic-free on arbitrary bytes | proptest + coverage-guided libFuzzer | `bootstrap.rs` `fuzz_parse_never_panics`, `fuzz/.../bootstrap_parse` |
 
 ## What we rely on QUIC (quinn) to enforce — not separately re-tested
 

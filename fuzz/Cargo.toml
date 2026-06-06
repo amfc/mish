@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 mish-ssp = { path = "../crates/mish-ssp" }
 mish-terminal = { path = "../crates/mish-terminal" }
+mish = { path = "../crates/mish" }
 vt100 = "0.16.2"
 
 [[bin]]
@@ -81,6 +82,13 @@ bench = false
 [[bin]]
 name = "client_render_safety"
 path = "fuzz_targets/client_render_safety.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bootstrap_parse"
+path = "fuzz_targets/bootstrap_parse.rs"
 test = false
 doc = false
 bench = false

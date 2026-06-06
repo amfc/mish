@@ -200,6 +200,8 @@ the independent UDP/QUIC path.
 | Security: mutual auth | a client with no / wrong client cert is rejected (config + against the *real* server binary); a client rejects a wrong server cert; 0-RTT early data is off | `mish-quic/tests/auth.rs`, `mosh/tests/auth_e2e.rs`, `config.rs::early_data_is_off` |
 | Security: wire attacks | bit-flipped datagram (AEAD-rejected → heals), duplicated datagram (no double-apply), off-path injection, and a pre-handshake junk flood can't disrupt/hijack/exhaust the session | `mish-quic/tests/wire_attacks.rs` |
 | Security: key hygiene | the client private key never appears in the server's log (stderr) output | `mosh/tests/key_hygiene.rs` |
+| Security: builtin bootstrap | host-key change rejected / unknown = TOFU (real keys + temp known_hosts), `shell_quote` can't be shell-injected (real `/bin/sh`), the `MISH CONNECT` scan is memory-bounded, all parsers panic-free under proptest + a `bootstrap_parse` libFuzzer target | `mosh/src/bootstrap.rs` tests, `fuzz/fuzz_targets/bootstrap_parse.rs` |
+| Builtin bootstrap e2e | the real `mish-client` builtin (russh) + system-ssh transports both carry a command end-to-end against a live sshd; auto-fallback + unknown-user rejection | `scripts/test-builtin-bootstrap.sh` |
 
 See **[`SECURITY.md`](SECURITY.md)** for the full threat model and what's
 enforced/tested versus relied on QUIC (quinn) for (roaming-hijack path
@@ -333,9 +335,12 @@ cargo +nightly fuzz run screen_apply         # one cargo-fuzz target (needs carg
 cargo +nightly miri test -p mish-ssp --lib   # UB/aliasing check on the sans-IO core
 ```
 
-There are six coverage-guided libFuzzer targets (`instruction_decode`,
-`screen_apply`, `diff_roundtrip`, `frag_reassemble`, `userstream_decode`,
-`differential_emulator`). CI smoke-runs each for 40 s as a regression gate; for a
+There are coverage-guided libFuzzer targets for the protocol core
+(`instruction_decode`, `screen_apply`, `diff_roundtrip`, `frag_reassemble`,
+`userstream_decode`, `differential_emulator`) and for the security seams
+(`answerback_safety`, `tty_emission_safety`, `frag_memory_bounds`,
+`client_render_safety`, and `bootstrap_parse` — the session-bootstrap parsers +
+bounded `MISH CONNECT` scanner). CI smoke-runs each for 40 s as a regression gate; for a
 real campaign, **[`scripts/fuzz-overnight.sh`](scripts/fuzz-overnight.sh)** runs
 all of them at once in libFuzzer fork mode, saturating every core and surviving
 crashes (each saved, fuzzing continues), with a per-target time budget:

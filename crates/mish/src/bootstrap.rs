@@ -47,7 +47,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use russh::client::{self};
 use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use russh::{ChannelMsg, Disconnect};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 /// A bootstrapped session target: where to connect, the cert to trust, and the
@@ -386,8 +385,44 @@ fn shell_quote(arg: &str) -> String {
     }
 }
 
+/// The outcome of checking a server host key against `known_hosts`.
+#[derive(Debug, PartialEq, Eq)]
+enum HostKeyVerdict {
+    /// The host is in `known_hosts` and the key matches — accept.
+    Trusted,
+    /// The host is not in `known_hosts` — accept on a trust-on-first-use basis
+    /// (logged, not persisted).
+    FirstUse,
+    /// The host is known but the key **differs** (possible MITM), or
+    /// `known_hosts` is unreadable — refuse.
+    Rejected,
+}
+
+/// Classify a server key against `known_hosts` (the default file when `path` is
+/// `None`, else the given file — the seam the tests drive). This centralizes the
+/// security policy so it can be unit-tested without a live SSH server:
+///
+/// - match → [`Trusted`](HostKeyVerdict::Trusted)
+/// - host absent → [`FirstUse`](HostKeyVerdict::FirstUse)
+/// - key mismatch / unreadable file → [`Rejected`](HostKeyVerdict::Rejected)
+///
+/// `Rejected` is fail-closed: a known host whose key changed is the
+/// security-critical case, so anything that isn't a clean match-or-absent is a
+/// refusal.
+fn classify_host_key(host: &str, port: u16, key: &PublicKey, path: Option<&Path>) -> HostKeyVerdict {
+    let checked = match path {
+        Some(p) => russh::keys::check_known_hosts_path(host, port, key, p),
+        None => russh::keys::check_known_hosts(host, port, key),
+    };
+    match checked {
+        Ok(true) => HostKeyVerdict::Trusted,
+        Ok(false) => HostKeyVerdict::FirstUse,
+        Err(_) => HostKeyVerdict::Rejected,
+    }
+}
+
 /// russh client handler: verifies the server host key against
-/// `~/.ssh/known_hosts`.
+/// `~/.ssh/known_hosts` via [`classify_host_key`].
 struct BuiltinHandler {
     host: String,
     port: u16,
@@ -397,11 +432,9 @@ impl client::Handler for BuiltinHandler {
     type Error = russh::Error;
 
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
-        match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
-            // Known and matching.
-            Ok(true) => Ok(true),
-            // Not in known_hosts: trust on first use (logged, not persisted).
-            Ok(false) => {
+        match classify_host_key(&self.host, self.port, server_public_key, None) {
+            HostKeyVerdict::Trusted => Ok(true),
+            HostKeyVerdict::FirstUse => {
                 eprintln!(
                     "[mish-client] warning: {}:{} is not in known_hosts; \
                      accepting its key on first use (not saved)",
@@ -409,11 +442,10 @@ impl client::Handler for BuiltinHandler {
                 );
                 Ok(true)
             }
-            // A mismatch (or unreadable known_hosts): refuse — this is the
-            // security-critical case (possible MITM).
-            Err(e) => {
+            HostKeyVerdict::Rejected => {
                 eprintln!(
-                    "[mish-client] host key verification failed for {}:{}: {e}",
+                    "[mish-client] host key verification FAILED for {}:{} \
+                     (known host key changed, or known_hosts unreadable) — refusing",
                     self.host, self.port
                 );
                 Ok(false)
@@ -481,6 +513,71 @@ async fn authenticate(handle: &mut client::Handle<BuiltinHandler>, user: &str) -
     )
 }
 
+/// The parsed contents of a `MISH CONNECT` line.
+struct ConnectInfo {
+    port: u16,
+    server_cert: Vec<u8>,
+    client_cert: Vec<u8>,
+    client_key: Vec<u8>,
+}
+
+/// Cap on bytes buffered while scanning for the `MISH CONNECT` line. The real
+/// line is a few KB (a port plus three hex-encoded DER blobs); a server that
+/// sends far more without a newline is buggy or hostile, so we refuse rather
+/// than buffer it unboundedly. Both transports read server-controlled stdout, so
+/// both go through [`scan_connect`] and honour this. 256 KiB is comfortably above
+/// any legitimate line.
+const MAX_CONNECT_SCAN: usize = 256 * 1024;
+
+/// Pull complete (`\n`-terminated) lines out of `buf`, draining them, and return
+/// the first one that parses as a `MISH CONNECT` line.
+///
+/// - `Ok(Some(info))` — found it.
+/// - `Ok(None)` — no connect line yet; keep reading (the unterminated tail stays
+///   in `buf`, bounded below).
+/// - `Err(_)` — the unterminated tail exceeded [`MAX_CONNECT_SCAN`]; refuse, so a
+///   server that streams endless data with no newline can't exhaust memory.
+fn scan_connect(buf: &mut Vec<u8>) -> Result<Option<ConnectInfo>> {
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=nl).collect();
+        let text = String::from_utf8_lossy(&line);
+        if let Some(parsed) = parse_connect(text.trim_end()) {
+            return Ok(Some(parsed));
+        }
+    }
+    if buf.len() > MAX_CONNECT_SCAN {
+        bail!(
+            "server sent {} bytes with no MISH CONNECT line (cap {MAX_CONNECT_SCAN}); refusing",
+            buf.len()
+        );
+    }
+    Ok(None)
+}
+
+/// Read from `r` until [`scan_connect`] finds the `MISH CONNECT` line, EOF, the
+/// 30s timeout, or the size cap. Generic over the reader so it is unit-testable
+/// with an in-memory cursor (and shared by the `ssh`/local and builtin paths).
+async fn read_connect_from<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<ConnectInfo> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let read = async {
+        loop {
+            let n = r.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(anyhow!("server exited before printing a MISH CONNECT line"));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(info) = scan_connect(&mut buf)? {
+                return Ok(info);
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), read)
+        .await
+        .context("timed out waiting for the server to start")?
+}
+
 /// Read the builtin SSH channel's stdout until the `MISH CONNECT` line appears,
 /// forwarding the server's stderr to ours so its diagnostics aren't swallowed.
 async fn read_connect_channel(channel: &mut russh::Channel<client::Msg>) -> Result<ConnectInfo> {
@@ -492,13 +589,8 @@ async fn read_connect_channel(channel: &mut russh::Channel<client::Msg>) -> Resu
             match msg {
                 ChannelMsg::Data { data } => {
                     buf.extend_from_slice(&data[..]);
-                    // Scan complete lines as they arrive.
-                    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                        let line: Vec<u8> = buf.drain(..=nl).collect();
-                        let text = String::from_utf8_lossy(&line);
-                        if let Some(parsed) = parse_connect(text.trim_end()) {
-                            return Ok(parsed);
-                        }
+                    if let Some(info) = scan_connect(&mut buf)? {
+                        return Ok(info);
                     }
                 }
                 // ext == 1 is the remote stderr; surface it like the `ssh`
@@ -517,34 +609,13 @@ async fn read_connect_channel(channel: &mut russh::Channel<client::Msg>) -> Resu
         .context("timed out waiting for the server to start")?
 }
 
-/// The parsed contents of a `MISH CONNECT` line.
-struct ConnectInfo {
-    port: u16,
-    server_cert: Vec<u8>,
-    client_cert: Vec<u8>,
-    client_key: Vec<u8>,
-}
-
 /// Read the child's stdout until the `MISH CONNECT` line appears.
 async fn read_connect(child: &mut Child) -> Result<ConnectInfo> {
-    let stdout = child
+    let mut stdout = child
         .stdout
         .take()
         .context("bootstrap child has no stdout")?;
-    let mut lines = BufReader::new(stdout).lines();
-
-    let read = async {
-        while let Some(line) = lines.next_line().await? {
-            if let Some(parsed) = parse_connect(&line) {
-                return Ok(parsed);
-            }
-        }
-        Err(anyhow!("server exited before printing a MISH CONNECT line"))
-    };
-
-    tokio::time::timeout(Duration::from_secs(30), read)
-        .await
-        .context("timed out waiting for the server to start")?
+    read_connect_from(&mut stdout).await
 }
 
 /// Parse a `MISH CONNECT <port> <server-cert> <client-cert> <client-key>` line
@@ -565,6 +636,34 @@ fn parse_connect(line: &str) -> Option<ConnectInfo> {
         client_cert,
         client_key,
     })
+}
+
+/// Fuzz entry point — **not** part of the public API (`#[doc(hidden)]`). Drives
+/// every parser that consumes server- or config-controlled bytes during
+/// bootstrap, plus the bounded line scanner, asserting no panic and that
+/// [`scan_connect`] keeps the buffer within [`MAX_CONNECT_SCAN`]. Used by the
+/// `bootstrap_parse` cargo-fuzz target.
+#[doc(hidden)]
+pub fn fuzz_parse(data: &[u8]) {
+    let s = String::from_utf8_lossy(data);
+    let _ = from_hex(&s);
+    let _ = shell_split(&s);
+    let _ = parse_connect(&s);
+    // Stream the bytes through the scanner in small chunks, like the network
+    // does; the buffer must stay bounded and the scanner must never panic.
+    let mut buf = Vec::new();
+    for chunk in data.chunks(8) {
+        buf.extend_from_slice(chunk);
+        match scan_connect(&mut buf) {
+            Ok(_) => assert!(buf.len() <= MAX_CONNECT_SCAN),
+            Err(_) => break, // hit the cap; refusal is the expected outcome
+        }
+    }
+    // Quoting any string and splitting it back must round-trip (no shell
+    // injection / mangling), exercised here on arbitrary bytes too.
+    if let Ok(split) = shell_split(&shell_quote(&s)) {
+        assert_eq!(split, vec![s.into_owned()]);
+    }
 }
 
 /// Lowercase-hex encode (used by `mish-server` to print the cert DER).
@@ -696,6 +795,41 @@ mod tests {
             let _ = shell_split(&s);
             let _ = parse_connect(&s);
         }
+
+        /// The whole bootstrap-parse fuzz body (same one the cargo-fuzz target
+        /// drives) must not panic on arbitrary bytes, chunked arbitrarily.
+        #[test]
+        fn fuzz_parse_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
+            fuzz_parse(&bytes);
+        }
+
+        /// Security: shell-quoting any argument and splitting it back must yield
+        /// exactly that argument — no word-splitting, no injection, no mangling.
+        /// (`shell_split` is an independent POSIX-ish parser, so this cross-checks
+        /// `shell_quote`; a real-`/bin/sh` check lives in
+        /// `shell_quote_resists_injection_in_real_sh`.)
+        #[test]
+        fn shell_quote_round_trips_through_split(s in ".*") {
+            let split = shell_split(&shell_quote(&s)).expect("quoted form parses");
+            prop_assert_eq!(split, vec![s]);
+        }
+
+        /// Security/robustness: the connect-line scanner stays within its cap no
+        /// matter how arbitrary bytes are chunked, and never panics.
+        #[test]
+        fn scan_connect_stays_bounded(
+            bytes in prop::collection::vec(any::<u8>(), 0..4096),
+            chunk in 1usize..64,
+        ) {
+            let mut buf = Vec::new();
+            for piece in bytes.chunks(chunk) {
+                buf.extend_from_slice(piece);
+                match scan_connect(&mut buf) {
+                    Ok(_) => prop_assert!(buf.len() <= MAX_CONNECT_SCAN),
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
     #[test]
@@ -798,5 +932,182 @@ mod tests {
         // Unbalanced quotes are an error.
         assert!(shell_split("ssh 'oops").is_err());
         assert!(shell_split(r#"ssh "oops"#).is_err());
+    }
+
+    // ---- Security: host-key verification (the builtin transport's MITM guard) ----
+
+    // Two real ed25519 public keys (throwaway, generated for these tests only).
+    const K1: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDWO4UsqbDO6O4P3u0wxQaMf2sspfcwMcA6MZa0rjs9y k1";
+    const K2: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINt84Un6pxLPKzOT9r80lD+p+PcKuq+S7ouwbTZV91Op k2";
+
+    /// A temp file removed on drop (no `tempfile` dev-dep needed).
+    struct TmpFile(PathBuf);
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn write_tmp(name: &str, content: &str) -> TmpFile {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "mish-test-{name}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, content).expect("write temp file");
+        TmpFile(path)
+    }
+
+    fn pubkey(openssh: &str) -> PublicKey {
+        let mut k = PublicKey::from_openssh(openssh).expect("valid openssh public key");
+        // The key russh presents from the handshake (and the one parsed from a
+        // known_hosts line) has no comment; `ssh_key::PublicKey`'s `==` compares
+        // comments, so clear it here to mirror production and compare on key
+        // material only.
+        k.set_comment("");
+        k
+    }
+    /// A `known_hosts` line: `host <alg> <base64>` (the pubkey's first two fields).
+    fn known_hosts_line(host: &str, openssh: &str) -> String {
+        let mut it = openssh.split_whitespace();
+        let alg = it.next().unwrap();
+        let data = it.next().unwrap();
+        format!("{host} {alg} {data}\n")
+    }
+
+    #[test]
+    fn host_key_matching_is_trusted() {
+        let kh = write_tmp("kh", &known_hosts_line("testhost", K1));
+        assert_eq!(
+            classify_host_key("testhost", 22, &pubkey(K1), Some(&kh.0)),
+            HostKeyVerdict::Trusted
+        );
+    }
+
+    #[test]
+    fn host_key_mismatch_is_rejected() {
+        // testhost is pinned to K1; presenting K2 (a different key) MUST be
+        // refused — this is the core MITM protection. Empirically confirms russh
+        // surfaces a mismatch as an error (mapped to Rejected), not as "absent".
+        let kh = write_tmp("kh", &known_hosts_line("testhost", K1));
+        assert_eq!(
+            classify_host_key("testhost", 22, &pubkey(K2), Some(&kh.0)),
+            HostKeyVerdict::Rejected,
+            "a changed host key must be rejected, not trusted"
+        );
+    }
+
+    #[test]
+    fn host_key_unknown_is_first_use() {
+        let kh = write_tmp("kh", &known_hosts_line("testhost", K1));
+        assert_eq!(
+            classify_host_key("otherhost", 22, &pubkey(K1), Some(&kh.0)),
+            HostKeyVerdict::FirstUse
+        );
+    }
+
+    // ---- Robustness: the bounded MISH CONNECT scanner ----
+
+    fn valid_connect_line() -> String {
+        format!(
+            "MISH CONNECT 51234 {} {} {}\n",
+            to_hex(&[0xde, 0xad]),
+            to_hex(&[0xbe, 0xef]),
+            to_hex(&[0x01, 0x02])
+        )
+    }
+
+    #[test]
+    fn scan_connect_reassembles_split_line() {
+        let line = valid_connect_line();
+        let (a, b) = line.split_at(10); // mid-"MOSH CONN…"
+        let mut buf = Vec::new();
+        buf.extend_from_slice(a.as_bytes());
+        assert!(scan_connect(&mut buf).unwrap().is_none()); // no newline yet
+        buf.extend_from_slice(b.as_bytes());
+        let info = scan_connect(&mut buf).unwrap().expect("line completed");
+        assert_eq!(info.port, 51234);
+        assert_eq!(info.client_key, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn scan_connect_skips_junk_lines_and_handles_crlf() {
+        let mut buf = Vec::new();
+        // Junk line, then the real one with a CRLF terminator.
+        buf.extend_from_slice(b"hello from the server\r\n");
+        buf.extend_from_slice(valid_connect_line().trim_end().as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        let info = scan_connect(&mut buf).unwrap().expect("found after junk");
+        assert_eq!(info.port, 51234);
+    }
+
+    #[test]
+    fn scan_connect_refuses_oversized_unterminated_input() {
+        // A server streaming endless data with no newline must be refused, not
+        // buffered unboundedly.
+        let mut buf = vec![b'x'; MAX_CONNECT_SCAN + 1];
+        assert!(scan_connect(&mut buf).is_err());
+    }
+
+    #[tokio::test]
+    async fn read_connect_from_reads_line_then_errors_on_eof() {
+        // Happy path: junk + the line over an in-memory reader.
+        let mut input = format!("noise\n{}", valid_connect_line()).into_bytes();
+        let mut slice: &[u8] = &input;
+        let info = read_connect_from(&mut slice).await.expect("reads the line");
+        assert_eq!(info.port, 51234);
+
+        // EOF before any connect line is an error, not a hang.
+        input = b"just some noise, no connect line\n".to_vec();
+        let mut slice2: &[u8] = &input;
+        assert!(read_connect_from(&mut slice2).await.is_err());
+    }
+
+    // ---- Security: real-/bin/sh proof that shell_quote can't be escaped ----
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_quote_resists_injection_in_real_sh() {
+        use std::process::Command as PCommand;
+        // Each payload, quoted, is handed to a real shell as a single argument;
+        // the shell must reproduce it byte-for-byte with no expansion, no command
+        // substitution, and no extra words — i.e. no injection.
+        let payloads = [
+            "; rm -rf /tmp/nope",
+            "$(touch /tmp/mish_pwned)",
+            "`id`",
+            "a && b",
+            "x | y",
+            "two words",
+            "quote'inside",
+            "back\\slash",
+            "tab\tand\nnewline",
+            "$HOME ${PATH}",
+            "*",
+            "",
+        ];
+        for p in payloads {
+            let q = shell_quote(p);
+            let script = format!("printf '%s' {q}");
+            let out = PCommand::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("run /bin/sh");
+            assert!(out.status.success(), "sh failed for {p:?} (quoted {q})");
+            assert_eq!(
+                out.stdout,
+                p.as_bytes(),
+                "payload {p:?} was mangled/injected as {q}"
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "payload {p:?} produced stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
