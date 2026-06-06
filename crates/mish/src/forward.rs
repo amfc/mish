@@ -392,6 +392,7 @@ pub async fn run_local_forward(
 /// A live `-R` remote-forward registration. Holding it keeps the server's
 /// listener open (the control stream stays open); dropping it tears the forward
 /// down. The session keeps these alive for its lifetime.
+#[derive(Debug)]
 pub struct RemoteForward {
     /// The server-side port actually bound (useful when an ephemeral port was
     /// requested).
