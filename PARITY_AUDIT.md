@@ -70,8 +70,10 @@ TLS verification" line is stale, but the *client-auth* direction is the real gap
   model it and `Screen` has no field for it (appears twice across parser & framebuffer dims).
 - Terminal **bell (BEL)** never synced or emitted — mosh syncs it; alacritty surfaces
   `Event::Bell`, dropped by the same `_ => {}`.
-- User-input **SS3→CSI cursor-key translation** for application-cursor-keys mode (DECCKM) not
-  done — arrow keys send the wrong form to apps that set DECCKM.
+- User-input **CSI→SS3 cursor-key translation** for application-cursor-keys mode (DECCKM) not
+  done — the synced *mode* is honored on the wheel→arrow path, but a real arrow press keeps the
+  local terminal's CSI form. *Declined* — see `NOT_IMPLEMENTING.md` (virtually all TUIs accept
+  CSI arrows; the rewrite would sit on the regression-sensitive raw-input path).
 
 **Network / SSP**
 - **ECN congestion signal** that throttles SSP frame rate absent.
@@ -116,7 +118,8 @@ TLS verification" line is stale, but the *client-auth* direction is the real gap
 - **SGR blink (5)** dropped from cell renditions — *blocked at the emulator
   layer* (alacritty has no blink cell flag; see FUTURE_WORK.md).
 - Legacy **mouse encodings/modes** not modeled: X10 (9), VT220-hilite (1001), UTF-8 (1005),
-  urxvt (1015).
+  urxvt (1015). *Declined* (obsolete framings; modern SGR mouse 1006 is synced) — see
+  `NOT_IMPLEMENTING.md`.
 - Client exit mode-reset — *done.* On exit the client resets mouse reporting,
   SGR-mouse, bracketed paste, reverse video, and application-cursor-keys
   (DECCKM), restores alternate-scroll, and shows the cursor (`RESET_MODES`).

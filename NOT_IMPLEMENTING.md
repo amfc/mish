@@ -66,6 +66,30 @@ the scrolling region as persistent state, and origin / insert / auto-wrap modes.
 The rendered cell grid is what's synced; these affect only how the *server's* own
 emulator interprets subsequent bytes, which it does locally.
 
+## Legacy terminal input/rendition features (low value, declined)
+
+Decades-old VT/xterm corners that almost no current program depends on. Porting
+them would add code (often on the hot input path) for ~zero real-world payoff —
+exactly the kind of protocol cruft a fresh implementation should *not* inherit.
+
+- **DECCKM application-cursor-keys *input* translation (CSI→SS3).** The cursor-key
+  *mode* is synced (`Screen::app_cursor_keys`, emitted in `display.rs`, honored by
+  the wheel→arrow path), but a real arrow press is forwarded as the local
+  terminal's CSI form (`ESC [ A`) and **not** rewritten to SS3 (`ESC O A`) when the
+  remote app set DECCKM. In practice every current TUI (vim, less, htop, emacs,
+  fzf, tmux) accepts CSI arrows regardless of DECCKM, so this is pure spec
+  fidelity. The rewrite would have to live on the raw keystroke path — the most
+  regression-sensitive code in the client — discriminate unmodified arrows from
+  the Shift-Arrow scrollback sequences, plumb the synced flag into the input task,
+  and handle CSI sequences split across reads. High blast radius, ~zero benefit.
+- **Legacy mouse encodings X10 (9), VT220-hilite (1001), UTF-8 (1005), urxvt
+  (1015).** Obsolete framings. We sync the modern SGR mouse mode (1006) and the
+  click/drag/any-motion modes; the legacy encodings are effectively dead.
+- **SGR blink (5) and screen-reverse DECSCNM (`?5h`).** Not a *decline* so much as
+  blocked at the emulator layer — alacritty models neither as observable cell/
+  screen state (no blink flag; no DECSCNM). See `FUTURE_WORK.md`; capturing them
+  would need emulator-side work, not a diff-layer change.
+
 ## Known inherited divergence (won't fix at our layer)
 
 - **`CSI 1 J` (erase-above) with the cursor on row 1** leaves row 0 intact in our
