@@ -54,3 +54,19 @@ path = "fuzz_targets/differential_emulator.rs"
 test = false
 doc = false
 bench = false
+
+# --- security-seam targets ---
+
+[[bin]]
+name = "answerback_safety"
+path = "fuzz_targets/answerback_safety.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tty_emission_safety"
+path = "fuzz_targets/tty_emission_safety.rs"
+test = false
+doc = false
+bench = false

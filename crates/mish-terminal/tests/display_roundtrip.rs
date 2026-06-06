@@ -415,6 +415,41 @@ proptest! {
     }
 }
 
+/// Security regression (found by the `tty_emission_safety` fuzzer): a malicious
+/// server's window title / OSC 8 hyperlink URI is emitted inside an OSC frame to
+/// the client's real terminal. Control bytes in those fields must be stripped so
+/// they can't terminate the frame and inject terminal commands — emitting them
+/// raw let a title of "\n" / a URI containing ESC corrupt the visible grid.
+#[test]
+fn malicious_osc_fields_cannot_break_out() {
+    use mish_terminal::screen::Hyperlink;
+    let (cols, rows) = (20u16, 3u16);
+    let mut emu = Emulator::new(cols, rows);
+    emu.feed(b"ABCDEFGHIJ");
+    let mut screen = emu.snapshot();
+
+    // Attacker-controlled OSC fields full of frame-breaking control bytes.
+    screen.title = "\x1b]0;pwn\x07\x1b[2J\x1b[H".to_string();
+    screen.cells[0].hyperlink = Some(Hyperlink {
+        id: Some("a\x1b\\b".to_string()),
+        uri: "x\x1b]52;c;evil\x07y".to_string(),
+    });
+
+    let frame = new_frame(&Screen::blank(cols, rows), &screen, false);
+    let mut real = Emulator::new(cols, rows);
+    real.feed(&frame);
+    let seen = real.snapshot();
+
+    // The grid the user actually sees is untouched by the OSC field content.
+    let glyphs = |s: &Screen| s.cells.iter().map(|c| c.c).collect::<Vec<_>>();
+    assert_eq!(glyphs(&seen), glyphs(&screen), "OSC field injected into the grid");
+    assert_eq!(
+        (seen.cursor_row, seen.cursor_col),
+        (screen.cursor_row, screen.cursor_col),
+        "OSC field moved the cursor"
+    );
+}
+
 /// Regression (found by the `diff_roundtrip` fuzzer): a wide (CJK) glyph whose
 /// spacer column gets overwritten by a real glyph — via insert-character (ICH)
 /// shifting into it — leaves the emulator in a "broken wide char" state (wide

@@ -19,6 +19,29 @@ use crate::screen::{
     Cell, Color, Hyperlink, Screen, F_BOLD, F_DIM, F_HIDDEN, F_INVERSE, F_ITALIC, F_STRIKEOUT,
     F_UNDERLINE, NAMED_BACKGROUND, NAMED_FOREGROUND,
 };
+use std::borrow::Cow;
+
+/// True for bytes that must never appear *inside* an OSC frame we emit to the
+/// client's real terminal: C0 controls (incl. ESC, BEL, CR, LF), DEL, and C1
+/// controls. Any of them can terminate or break out of the frame, turning the
+/// following bytes into terminal commands.
+fn is_osc_unsafe(c: char) -> bool {
+    let u = c as u32;
+    u < 0x20 || u == 0x7f || (0x80..=0x9f).contains(&u)
+}
+
+/// Strip control characters from an attacker-influenced string (window title,
+/// OSC 8 hyperlink id / URI) before it goes inside an OSC frame, so it can't
+/// carry a frame terminator and inject commands into the user's terminal. The
+/// common case (no control chars) borrows without allocating. Hardened after the
+/// `tty_emission_safety` fuzz target showed a title/URI could break OSC framing.
+fn osc_sanitize(s: &str) -> Cow<'_, str> {
+    if s.chars().any(is_osc_unsafe) {
+        Cow::Owned(s.chars().filter(|&c| !is_osc_unsafe(c)).collect())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 /// Builder that accumulates the output frame and tracks the emulated cursor /
 /// rendition so it can optimize moves and SGR emission.
@@ -80,11 +103,13 @@ impl FrameState {
         self.current_link = Some(link.clone());
         match link {
             Some(h) => {
+                // Sanitize the id/URI: control bytes here would break the OSC 8
+                // frame and inject into the client's terminal.
                 let params = match &h.id {
-                    Some(id) => format!("id={id}"),
+                    Some(id) => format!("id={}", osc_sanitize(id)),
                     None => String::new(),
                 };
-                self.push(&format!("\x1b]8;{};{}\x1b\\", params, h.uri));
+                self.push(&format!("\x1b]8;{};{}\x1b\\", params, osc_sanitize(&h.uri)));
             }
             None => self.push("\x1b]8;;\x1b\\"),
         }
@@ -243,9 +268,11 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
     let initialized = initialized && !resized;
 
     // Title (OSC 0): always on a full repaint, otherwise only when it changed.
+    // Sanitize: a control byte in the title would break out of the OSC frame and
+    // inject terminal commands on the client's real TTY.
     if !initialized || old.title != new.title {
         frame.push("\x1b]0;");
-        frame.push(&new.title);
+        frame.push(&osc_sanitize(&new.title));
         frame.out.push(0x07);
     }
 
