@@ -11,7 +11,7 @@ boundary is explicit.
   server cert, and the minted **client cert + key** — travels only over it.
   - With `--bootstrap=ssh` (the default when `ssh` is present) this is the system
     OpenSSH client, with its full host-key / agent / config handling.
-  - With `--bootstrap=built-in` the SSH layer is our own [`russh`] client. It
+  - With `--bootstrap=builtin` the SSH layer is our own [`russh`] client. It
     still verifies the server against `~/.ssh/known_hosts` and **rejects a key
     mismatch**, but — unlike OpenSSH's interactive prompt — an *unknown* host is
     accepted trust-on-first-use (logged, not persisted). So the bootstrap channel

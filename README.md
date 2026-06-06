@@ -89,14 +89,14 @@ way:
 
 - `--bootstrap=ssh` — shell out to the system `ssh` binary, exactly like upstream
   mosh (full ssh-config / agent / proxy support; pass extra flags via `--ssh`).
-- `--bootstrap=built-in` — a built-in, pure-Rust SSH client ([`russh`]) that needs
+- `--bootstrap=builtin` — a builtin, pure-Rust SSH client ([`russh`]) that needs
   no external `ssh`. It authenticates via the ssh-agent or your default
   `~/.ssh/id_{ed25519,ecdsa,rsa}` keys, checks the host key against
   `~/.ssh/known_hosts`, and takes the SSH port from `--ssh-port` (default 22).
 - `--bootstrap=auto` (the default) — use the system `ssh` if it's on `PATH`, else
-  fall back to the built-in client.
+  fall back to the builtin client.
 
-The built-in client is what will let `mish` run where mosh never could —
+The builtin client is what will let `mish` run where mosh never could —
 notably **Windows**, which has no upstream mosh. (The Windows port itself is
 still future work; this just removes the hard dependency on an external `ssh`.)
 
@@ -107,8 +107,8 @@ still future work; this just removes the hard dependency on an external `ssh`.)
 mish-client user@host
 mish-client user@host -- tmux attach     # run a specific command
 
-# Force the built-in (no external ssh) SSH client, on a non-standard port.
-mish-client --bootstrap=built-in --ssh-port 2222 user@host
+# Force the builtin (no external ssh) SSH client, on a non-standard port.
+mish-client --bootstrap=builtin --ssh-port 2222 user@host
 
 # Local mode for testing: start mish-server as a child, no SSH.
 mish-client --local

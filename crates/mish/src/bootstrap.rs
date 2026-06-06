@@ -24,15 +24,15 @@
 //!
 //! - [`BootstrapMode::Ssh`] — shell out to the system `ssh` binary (this is what
 //!   upstream mosh does, and the default when `ssh` is on `PATH`).
-//! - [`BootstrapMode::BuiltIn`] — a built-in, pure-Rust SSH client ([`russh`]),
+//! - [`BootstrapMode::Builtin`] — a builtin, pure-Rust SSH client ([`russh`]),
 //!   so no external `ssh` is required. This is the path that will let `mish`
 //!   run on platforms where mosh never could (notably **Windows**, which has no
 //!   `mosh` today); the Windows port itself is future work.
 //! - [`BootstrapMode::Auto`] (the default) — use the system `ssh` if it is on
-//!   `PATH`, otherwise fall back to the built-in client.
+//!   `PATH`, otherwise fall back to the builtin client.
 //!
 //! The bootstrap handle (the local server process, the `ssh` process, or the
-//! built-in SSH connection) is held for the lifetime of the [`Bootstrap`] and
+//! builtin SSH connection) is held for the lifetime of the [`Bootstrap`] and
 //! torn down on drop. (Upstream mosh daemonizes the server so SSH can fully
 //! close; we run the server with `--detach` over SSH, so the daemon survives
 //! either transport closing.)
@@ -66,13 +66,13 @@ pub struct Bootstrap {
 }
 
 /// Whatever needs to stay alive for the bootstrapped session: a child process
-/// (local server, or the external `ssh`), or the built-in SSH connection.
+/// (local server, or the external `ssh`), or the builtin SSH connection.
 enum Guard {
     /// A child process (the `--local` server, or the external `ssh`). Killed on
     /// drop — these are also spawned with `kill_on_drop`, so this is belt-and-
     /// braces.
     Child(Child),
-    /// A built-in [`russh`] SSH connection, held open for the whole session and
+    /// A builtin [`russh`] SSH connection, held open for the whole session and
     /// closed on drop. We deliberately keep it open rather than disconnecting
     /// once `MISH CONNECT` is read: the server prints that line, then writes one
     /// more diagnostic to stderr *before* it forks the `--detach` daemon, so
@@ -80,7 +80,7 @@ enum Guard {
     /// detaches. The daemon (post-fork, stdio redirected to /dev/null) outlives
     /// this connection regardless. Held only for its `Drop`; never read.
     #[allow(dead_code)]
-    Connection(client::Handle<BuiltInHandler>),
+    Connection(client::Handle<BuiltinHandler>),
 }
 
 impl Drop for Guard {
@@ -96,35 +96,34 @@ impl Drop for Guard {
 /// Which SSH transport the client uses to bootstrap the session (`--bootstrap`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BootstrapMode {
-    /// Prefer the system `ssh` binary; fall back to the built-in client if it is
+    /// Prefer the system `ssh` binary; fall back to the builtin client if it is
     /// not on `PATH`. The default.
     #[default]
     Auto,
     /// Always shell out to the system `ssh` binary (upstream mosh's behaviour).
     Ssh,
-    /// Always use the built-in, pure-Rust SSH client (no external `ssh`).
-    BuiltIn,
+    /// Always use the builtin, pure-Rust SSH client (no external `ssh`).
+    Builtin,
 }
 
 impl BootstrapMode {
-    /// Parse the `--bootstrap` value. Accepts `auto`, `ssh`, and `built-in`
-    /// (also spelled `builtin`).
+    /// Parse the `--bootstrap` value: `auto`, `ssh`, or `builtin`.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "auto" => Ok(BootstrapMode::Auto),
             "ssh" => Ok(BootstrapMode::Ssh),
-            "built-in" | "builtin" => Ok(BootstrapMode::BuiltIn),
-            other => bail!("unknown --bootstrap mode {other:?} (auto|ssh|built-in)"),
+            "builtin" => Ok(BootstrapMode::Builtin),
+            other => bail!("unknown --bootstrap mode {other:?} (auto|ssh|builtin)"),
         }
     }
 
-    /// Decide whether to use the built-in client, given the system `ssh` program
+    /// Decide whether to use the builtin client, given the system `ssh` program
     /// name (the first word of `--ssh`). In [`Auto`](Self::Auto) mode this checks
     /// whether that program is on `PATH`.
-    pub fn use_built_in(self, ssh_prog: &str) -> bool {
+    pub fn use_builtin(self, ssh_prog: &str) -> bool {
         match self {
             BootstrapMode::Ssh => false,
-            BootstrapMode::BuiltIn => true,
+            BootstrapMode::Builtin => true,
             BootstrapMode::Auto => !program_on_path(ssh_prog),
         }
     }
@@ -271,8 +270,8 @@ pub async fn ssh(
     })
 }
 
-/// Bootstrap with the built-in, pure-Rust SSH client ([`russh`]) instead of the
-/// system `ssh` binary — `--bootstrap=built-in`.
+/// Bootstrap with the builtin, pure-Rust SSH client ([`russh`]) instead of the
+/// system `ssh` binary — `--bootstrap=builtin`.
 ///
 /// `host` is `[user@]hostname` (no `ssh -p` parsing — the port comes from
 /// `port`, the client's `--ssh-port`). We connect, authenticate (ssh-agent first,
@@ -285,7 +284,7 @@ pub async fn ssh(
 /// on-disk keys only (no password / keyboard-interactive). Host keys are checked
 /// against `~/.ssh/known_hosts` — a mismatch is rejected; an unknown host is
 /// accepted on a trust-on-first-use basis (logged, but not written back).
-pub async fn built_in(
+pub async fn builtin(
     host: &str,
     port: u16,
     server_cmd: &str,
@@ -296,7 +295,7 @@ pub async fn built_in(
     let user = user.unwrap_or_else(default_user);
 
     let config = Arc::new(client::Config::default());
-    let handler = BuiltInHandler {
+    let handler = BuiltinHandler {
         host: hostname.clone(),
         port,
     };
@@ -327,7 +326,7 @@ pub async fn built_in(
     channel
         .exec(true, argv.as_bytes())
         .await
-        .context("running mish-server over the built-in SSH channel")?;
+        .context("running mish-server over the builtin SSH channel")?;
 
     let creds = read_connect_channel(&mut channel).await?;
 
@@ -389,12 +388,12 @@ fn shell_quote(arg: &str) -> String {
 
 /// russh client handler: verifies the server host key against
 /// `~/.ssh/known_hosts`.
-struct BuiltInHandler {
+struct BuiltinHandler {
     host: String,
     port: u16,
 }
 
-impl client::Handler for BuiltInHandler {
+impl client::Handler for BuiltinHandler {
     type Error = russh::Error;
 
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
@@ -425,7 +424,7 @@ impl client::Handler for BuiltInHandler {
 
 /// Authenticate `handle` as `user`: try every ssh-agent identity first (Unix
 /// only), then the default unencrypted `~/.ssh/id_*` keys. Errors if none work.
-async fn authenticate(handle: &mut client::Handle<BuiltInHandler>, user: &str) -> Result<()> {
+async fn authenticate(handle: &mut client::Handle<BuiltinHandler>, user: &str) -> Result<()> {
     // 1. ssh-agent (the common case: keys unlocked once, held by the agent).
     //    Unix-only for now — the Windows named-pipe agent is future work.
     #[cfg(unix)]
@@ -476,13 +475,13 @@ async fn authenticate(handle: &mut client::Handle<BuiltInHandler>, user: &str) -
         .await;
     bail!(
         "authentication failed for {user} (tried ssh-agent and ~/.ssh/id_ed25519, \
-         id_ecdsa, id_rsa). The built-in bootstrap supports ssh-agent and \
+         id_ecdsa, id_rsa). The builtin bootstrap supports ssh-agent and \
          unencrypted key files only; for passwords or other methods use \
          --bootstrap=ssh."
     )
 }
 
-/// Read the built-in SSH channel's stdout until the `MISH CONNECT` line appears,
+/// Read the builtin SSH channel's stdout until the `MISH CONNECT` line appears,
 /// forwarding the server's stderr to ours so its diagnostics aren't swallowed.
 async fn read_connect_channel(channel: &mut russh::Channel<client::Msg>) -> Result<ConnectInfo> {
     use std::io::Write;
@@ -730,24 +729,21 @@ mod tests {
         assert_eq!(BootstrapMode::parse("auto").unwrap(), BootstrapMode::Auto);
         assert_eq!(BootstrapMode::parse("ssh").unwrap(), BootstrapMode::Ssh);
         assert_eq!(
-            BootstrapMode::parse("built-in").unwrap(),
-            BootstrapMode::BuiltIn
-        );
-        assert_eq!(
             BootstrapMode::parse("builtin").unwrap(),
-            BootstrapMode::BuiltIn
+            BootstrapMode::Builtin
         );
+        assert!(BootstrapMode::parse("built-in").is_err()); // dashed form removed
         assert!(BootstrapMode::parse("nope").is_err());
         assert_eq!(BootstrapMode::default(), BootstrapMode::Auto);
     }
 
     #[test]
-    fn use_built_in_respects_explicit_modes() {
+    fn use_builtin_respects_explicit_modes() {
         // Explicit modes ignore PATH entirely.
-        assert!(!BootstrapMode::Ssh.use_built_in("definitely-not-a-real-program"));
-        assert!(BootstrapMode::BuiltIn.use_built_in("ssh"));
-        // Auto falls back to the built-in client when the program is missing.
-        assert!(BootstrapMode::Auto.use_built_in("definitely-not-a-real-program-xyz"));
+        assert!(!BootstrapMode::Ssh.use_builtin("definitely-not-a-real-program"));
+        assert!(BootstrapMode::Builtin.use_builtin("ssh"));
+        // Auto falls back to the builtin client when the program is missing.
+        assert!(BootstrapMode::Auto.use_builtin("definitely-not-a-real-program-xyz"));
     }
 
     #[test]
