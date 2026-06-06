@@ -16,7 +16,7 @@ use mish_ssp::transport::Transport;
 use mish_terminal::display::new_frame;
 use mish_terminal::history::HistoryResponse;
 use mish_terminal::predict::{PredictMode, PredictionEngine};
-use mish_terminal::screen::{Screen, MOUSE_CLICK, MOUSE_SGR};
+use mish_terminal::screen::Screen;
 use mish_terminal::user::UserStream;
 use tokio::sync::mpsc;
 
@@ -62,9 +62,11 @@ pub enum ClientInput {
     /// Raw keystroke bytes to forward to the remote shell.
     Keys(Vec<u8>),
     /// A complete SGR mouse report (`ESC [ < … M/m`) read from the local
-    /// terminal. `run_client` routes it: wheel notches drive scrollback at the
-    /// shell prompt, scroll an alt-screen pager, or — when the remote app reads
-    /// the mouse itself — are forwarded verbatim.
+    /// terminal. In normal use these only arrive when the remote app is reading
+    /// the mouse (vim, tmux, htop…), and `run_client` forwards them verbatim — the
+    /// wheel at the shell prompt is left to the terminal's native scrolling. (If a
+    /// terminal does still deliver wheel reports at the prompt, `run_client` falls
+    /// back to routing them to scrollback / an alt-screen pager.)
     Mouse(Vec<u8>),
     /// The local terminal was resized.
     Resize { cols: u16, rows: u16 },
@@ -75,6 +77,13 @@ pub enum ClientInput {
     ScrollUp,
     /// Scroll one page back down toward the live screen (exits scrollback at 0).
     ScrollDown,
+    /// A scrollback *key* (Shift-Up / Shift-Down): scroll mosh's history when the
+    /// user is at the shell prompt, but — since full-screen apps (vim, etc.) may
+    /// bind Shift-Arrow themselves — pass it through to the app when one is on the
+    /// alternate screen or reading the mouse. `passthrough` is the raw bytes to
+    /// forward in that case. (Shift-PageUp/Down use [`ScrollUp`]/[`ScrollDown`],
+    /// which always scroll.)
+    ScrollKey { up: bool, passthrough: Vec<u8> },
     /// The user detached (e.g. Ctrl-]): begin a clean shutdown.
     Detach,
 }
@@ -176,15 +185,15 @@ pub async fn run_client<T: Transport>(
                 mish_terminal::notification::stalled_overlay(&predicted, silent_secs)
                     .unwrap_or(predicted)
             };
-            // Mouse-wheel capture: when the remote app isn't reading the mouse,
-            // keep SGR button reporting on (and alternate-scroll off) on the
-            // real terminal so the wheel arrives as a report we can route to
-            // scrollback — instead of the terminal translating it into arrow
-            // keys (which the shell would read as command-history navigation).
-            // Apps that do read the mouse keep their exact modes, so their own
-            // event encoding round-trips untouched.
-            if shown.mouse_mode == 0 {
-                shown.mouse_mode = MOUSE_CLICK | MOUSE_SGR;
+            // Let the terminal handle the wheel natively (scroll its own
+            // scrollback) rather than capturing it for ours — native scrolling and
+            // click-drag selection are what users expect, and mosh's server-side
+            // scrollback lives on Shift-Up/Down (and Shift-PageUp/Down). At the
+            // shell prompt we still pin alternate-scroll OFF so a wheel notch can't
+            // be turned into arrow keys (which the shell would read as command-
+            // history navigation). A full-screen app keeps its own modes, so its
+            // wheel/mouse handling round-trips exactly.
+            if shown.mouse_mode == 0 && !shown.alt_screen {
                 shown.alternate_scroll = false;
             }
             // Prefix the window title so the user can tell they're in mosh (like
@@ -321,6 +330,28 @@ pub async fn run_client<T: Transport>(
                     // Keyboard scroll (Shift-PageUp/Down): one page up/down.
                     Some(ClientInput::ScrollUp) => scroll_up!(),
                     Some(ClientInput::ScrollDown) => scroll_down!(),
+                    // Shift-Up / Shift-Down: scroll mosh's history at the shell
+                    // prompt, but hand the key to a full-screen app (which may use
+                    // Shift-Arrow itself) when one is active, so we never swallow
+                    // its input.
+                    Some(ClientInput::ScrollKey { up, passthrough }) => {
+                        if server_screen.alt_screen || server_screen.mouse_mode != 0 {
+                            exit_scroll!();
+                            stream.push_keystroke(passthrough.clone());
+                            handle.set_local(stream.clone());
+                            engine.new_user_bytes(
+                                &passthrough,
+                                &server_screen,
+                                stream.total(),
+                                clock.now_ms(),
+                            );
+                            repaint!();
+                        } else if up {
+                            scroll_up!();
+                        } else {
+                            scroll_down!();
+                        }
+                    }
                     // A mouse report from the local terminal. Route by what the
                     // remote app wants and where it is:
                     Some(ClientInput::Mouse(seq)) => {

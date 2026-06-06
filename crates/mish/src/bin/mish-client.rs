@@ -8,9 +8,11 @@
 //! tracks SIGWINCH resizes. Quick-detach with `Ctrl-]`. The escape prefix
 //! `Ctrl-^` (configurable via `MOSH_ESCAPE_KEY`) then `.` quits, the prefix again
 //! sends it literally, and `Ctrl-Z` suspends; on resume (`fg`/SIGCONT) raw mode
-//! is restored and the screen repainted. **Shift-PageUp / Shift-PageDown** scroll
-//! into the server's scrollback history (fetched over a reliable side-channel);
-//! any other keystroke returns to the live screen.
+//! is restored and the screen repainted. **Shift-Up / Shift-Down** (and
+//! **Shift-PageUp / Shift-PageDown** for whole pages) scroll into the server's
+//! scrollback history (fetched over a reliable side-channel); any other keystroke
+//! returns to the live screen. The mouse wheel is left to the terminal (native
+//! scrolling/selection); the Shift-Arrow keys pass through to full-screen apps.
 //!
 //! Usage:
 //! ```text
@@ -463,6 +465,22 @@ async fn run_terminal(t: transport::QuicTransport, predict: PredictMode, no_init
                 }
                 b"\x1b[6;2~" => {
                     let _ = key_tx.send(ClientInput::ScrollDown).await;
+                    continue;
+                }
+                // Shift-Up / Shift-Down (xterm modifier encoding): scroll mosh's
+                // history at the shell prompt — a keyboard path that works on
+                // laptops without a PageUp key and needs no mouse reporting.
+                // `run_client` passes these through to full-screen apps instead.
+                b"\x1b[1;2A" => {
+                    let _ = key_tx
+                        .send(ClientInput::ScrollKey { up: true, passthrough: chunk.to_vec() })
+                        .await;
+                    continue;
+                }
+                b"\x1b[1;2B" => {
+                    let _ = key_tx
+                        .send(ClientInput::ScrollKey { up: false, passthrough: chunk.to_vec() })
+                        .await;
                     continue;
                 }
                 _ => {}

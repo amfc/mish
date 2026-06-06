@@ -118,22 +118,26 @@ mish-client --local -- /bin/bash
 #          --predict <mode>  --no-init
 # Keys: Ctrl-] quick-detach; escape prefix Ctrl-^ (MOSH_ESCAPE_KEY) then
 #       `.` quit / Ctrl-Z suspend (resumes cleanly on `fg`).
-#       Mouse wheel (or Shift-PageUp/PageDown) scrolls into server-held scrollback.
+#       Shift-Up/Down (or Shift-PageUp/PageDown) scrolls server-held scrollback.
 ```
 
 **Scrollback (better than mosh).** Unlike upstream mosh — which has no
 scrollback and tells you to run tmux — `mish-client` can scroll into the
-server's terminal history with the **mouse wheel** (or **Shift-PageUp /
-Shift-PageDown**). The live screen keeps riding loss-tolerant datagrams; history
-is fetched on demand over a **reliable QUIC side-channel** and shown as a paused
-viewport (any keystroke returns to live). See [`NEXT_FEATURES.md`](NEXT_FEATURES.md).
+server's terminal history with **Shift-Up / Shift-Down** (or **Shift-PageUp /
+Shift-PageDown** for whole pages). The live screen keeps riding loss-tolerant
+datagrams; history is fetched on demand over a **reliable QUIC side-channel** and
+shown as a paused viewport (any other keystroke returns to live). The viewport is
+anchored to the buffer, not the live edge, so output arriving while you're
+scrolled doesn't slide it out from under you. See
+[`NEXT_FEATURES.md`](NEXT_FEATURES.md).
 
-At the shell prompt the wheel scrolls *mosh's* scrollback; inside a full-screen
-app (vim, less, htop…) it reaches the app as usual, so those keep their own
-scrolling. To make this work the client turns on mouse reporting at the prompt,
-which — as with tmux — means native click-drag text selection there now needs
-the terminal's bypass modifier held (**Shift** on most terminals, **⌥/Option**
-on macOS Terminal & iTerm2).
+The scrollback keys reach mosh's *own* server-side history — including lines the
+terminal never rendered (produced before you connected, or while you were away on
+a reattach). At the shell prompt the **mouse wheel is left to your terminal**, so
+two-finger / wheel scrolling, native click-drag selection, and your terminal's
+own scrollback all work exactly as they do for any other program (no forced mouse
+reporting). Inside a full-screen app (vim, less, htop…) the wheel and Shift-Arrow
+reach the app as usual, so those keep their own scrolling/bindings.
 
 **Persistent sessions / reattach (also better than mosh).** With `--session
 NAME`, the server keeps the shell + terminal state alive across disconnects, and

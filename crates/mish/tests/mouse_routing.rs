@@ -112,6 +112,28 @@ async fn mouse_forwarded_when_app_reads_mouse() {
     expect_pty_input(&mut pty_in_rx, click).await;
 }
 
+/// Shift-Up scrolls mosh's history at the prompt, but a full-screen app may bind
+/// Shift-Arrow itself — so when the app is on the alternate screen the key must
+/// pass through to it verbatim, not get swallowed as a scrollback command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shift_up_passes_through_on_alt_screen() {
+    let (pty_out_tx, mut pty_in_rx, cin_tx, mut cout_rx) = harness();
+
+    // Enter the alternate screen (a full-screen app is now active).
+    sync_state(&pty_out_tx, &mut cout_rx, b"\x1b[?1049hALTMARK", b"ALTMARK").await;
+
+    // Shift-Up must reach the app unchanged (CSI 1 ; 2 A).
+    let shift_up = b"\x1b[1;2A";
+    cin_tx
+        .send(ClientInput::ScrollKey {
+            up: true,
+            passthrough: shift_up.to_vec(),
+        })
+        .await
+        .unwrap();
+    expect_pty_input(&mut pty_in_rx, shift_up).await;
+}
+
 /// A plain pager on the alternate screen (no mouse mode) doesn't read mouse
 /// reports — it relies on alternate-scroll. The wheel must reach it as arrow
 /// keys, so it scrolls its own content rather than mosh's scrollback.
