@@ -206,6 +206,34 @@ impl Screen {
     pub fn to_text(&self) -> String {
         self.to_lines().join("\n")
     }
+
+    /// A copy of this screen fitted to a different terminal size by **clipping or
+    /// padding from the top-left** — used for read-only viewers of a shared
+    /// session whose own terminal differs from the owner's ("owner drives, viewers
+    /// clip", `NEXT_FEATURES.md` #3). Overlapping cells are copied verbatim; any
+    /// new area is blank; the cursor is clamped into range. Screen-wide state
+    /// (title, mouse/cursor/paste modes, clipboard, `echo_ack`, …) is preserved —
+    /// only the grid geometry changes. This is a viewport crop, **not** a terminal
+    /// reflow: long lines are cut, never rewrapped.
+    pub fn resized_view(&self, cols: u16, rows: u16) -> Screen {
+        if self.cols == cols && self.rows == rows {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        out.cols = cols;
+        out.rows = rows;
+        out.cells = vec![Cell::default(); cols as usize * rows as usize];
+        let copy_rows = rows.min(self.rows) as usize;
+        let copy_cols = cols.min(self.cols) as usize;
+        for r in 0..copy_rows {
+            let src = r * self.cols as usize;
+            let dst = r * cols as usize;
+            out.cells[dst..dst + copy_cols].clone_from_slice(&self.cells[src..src + copy_cols]);
+        }
+        out.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        out.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        out
+    }
 }
 
 /// Diff header (little-endian) preceding the mosh `new_frame` escape stream:
@@ -357,6 +385,45 @@ mod tests {
         let mut s = Screen::blank(80, 24);
         s.apply_diff(&d); // must not panic
         assert_eq!((s.cols, s.rows), (80, 24));
+    }
+
+    /// `resized_view` crops/pads from the top-left, preserves screen-wide state,
+    /// clamps the cursor, and is identity at the same size — the contract the
+    /// shared-session viewer path relies on ("owner drives, viewers clip").
+    #[test]
+    fn resized_view_clips_pads_and_clamps() {
+        // Fill a 4×3 screen with distinct glyphs so cropping is observable.
+        let mut s = Screen::blank(4, 3);
+        for r in 0..3u16 {
+            for c in 0..4u16 {
+                s.cells[r as usize * 4 + c as usize].c =
+                    char::from(b'a' + (r * 4 + c) as u8);
+            }
+        }
+        s.cursor_row = 2;
+        s.cursor_col = 3;
+        s.title = "hi".into();
+        s.echo_ack = 7;
+
+        // Identity at the same size.
+        assert_eq!(s.resized_view(4, 3), s);
+
+        // Crop to 2×2: keep the top-left block; cursor clamps to (1,1).
+        let small = s.resized_view(2, 2);
+        assert_eq!((small.cols, small.rows), (2, 2));
+        assert_eq!(small.to_lines(), vec!["ab".to_string(), "ef".to_string()]);
+        assert_eq!((small.cursor_row, small.cursor_col), (1, 1));
+        assert_eq!(small.title, "hi"); // screen-wide state preserved
+        assert_eq!(small.echo_ack, 7);
+
+        // Pad to 6×4: original content stays top-left, new area is blank, and the
+        // cursor (in range) is unchanged.
+        let big = s.resized_view(6, 4);
+        assert_eq!((big.cols, big.rows), (6, 4));
+        assert_eq!(big.cells.len(), 24);
+        assert_eq!(big.to_lines()[0], "abcd"); // trailing blanks trimmed
+        assert_eq!(big.to_lines()[3], ""); // padded row is blank
+        assert_eq!((big.cursor_row, big.cursor_col), (2, 3));
     }
 
     #[test]
