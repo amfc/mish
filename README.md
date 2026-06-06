@@ -28,6 +28,9 @@ it by sending diffs over unreliable datagrams. There is no retransmit queue — 
 lost datagram just means the next one re-diffs from further back. That design
 maps perfectly onto QUIC's unreliable datagram extension, and QUIC gives us the
 crypto, congestion control, and connection migration mosh had to build by hand.
+For how that transport choice compares to upstream mosh's hand-rolled UDP — and
+the measured proof it stays at parity under loss — see
+[`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Architecture
 
