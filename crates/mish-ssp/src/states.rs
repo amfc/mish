@@ -12,7 +12,7 @@ use crate::state::SyncState;
 /// LE][tail bytes]`. Applying it truncates the reference to the common prefix
 /// then appends the tail. This exercises the `diff_from(prev)` path rather than
 /// shipping the whole state every time.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BytesState(pub Vec<u8>);
 
 impl BytesState {

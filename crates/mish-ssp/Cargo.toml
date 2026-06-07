@@ -17,5 +17,11 @@ bincode = { workspace = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 
 [dev-dependencies]
+stateright = "0.31"
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+# `cargo kani` builds with `--cfg kani`; register it so the `#[cfg(kani)]` proof
+# module doesn't trip `unexpected_cfgs` under the workspace's `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

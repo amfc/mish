@@ -121,6 +121,33 @@ prediction overlay). Clean — no UB. Can't run the tokio/PTY layers (that's TSa
 - `mosh/tests/key_hygiene.rs`: the client key never appears in server stderr.
 - `instruction.rs`: compression-bomb cap (`inflate_rejects_a_bomb`).
 
+### 14. Exhaustive bounded model checking — `mish-ssp/src/stateright_model.rs` (Stateright)
+Where the sim (#2) drives the two real `SspCore`s through *one* random schedule
+per seed, this drives them through **every** schedule interleaving up to a bounded
+scenario length, via a [Stateright](https://www.stateright.rs/) `Model` whose
+nondeterminism *is* the schedule (which datagram to deliver next, drop, duplicate;
+when each side mutates its state). Runs as a plain `cargo test -p mish-ssp`
+(`stateright_model::tests::*`), so it's covered by CI's `cargo test --workspace`.
+- **Two link models:** an *adversarial* link (drop/dup/reorder) checks **safety** —
+  `no_divergence` (a receiver never holds a value the sender never sent),
+  `bounded_received`/`bounded_sent` (queue caps hold under sustained faults), and a
+  `sometimes can_converge` non-vacuity guard; a *fair* link (reorder but eventual
+  delivery, baked into the action policy) checks **liveness** — `eventually
+  converge`. Last run: ~134k unique adversarial states, ~1.6k fair states.
+- **Bounded, but a real theorem.** The real core has unbounded counters
+  (`next_seq`, state `num`s, ms timers) and `f64` RTT, so there's no finite closed
+  space. We bound the *scenario length* with a strictly-decreasing `steps_left`
+  budget (which also keeps the graph acyclic — required for sound `eventually`) and
+  exhaust all interleavings within it. The fingerprint (`Hash`/`Eq` on `SspCore`,
+  `cfg(test)` in `core.rs`) is faithful — every behavior-affecting field including
+  the `f64`s by bit pattern — so dedup never silently merges distinct cores.
+- **Found:** `add_sent_state` computed its eviction index as `len - 16`, assuming
+  `max_sent_states ≥ 16` (true for the default 32, so production never hit it). For
+  any smaller cap it underflowed — a debug panic, and in release a wrap to a no-op
+  `VecDeque::remove` that *leaks the memory bound*. Fixed to
+  `len.saturating_sub(16).max(1)` (identical for the production cap; never evicts
+  the acked front).
+
 ## Learnings / tricky bits
 
 - **Corruption on an authenticated wire = a drop, not garbage.** A bit-flip that

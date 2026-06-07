@@ -94,6 +94,7 @@ async fn shutdown_responder_closes_without_being_acked() {
     // it defragments every inbound datagram.
     let shutdown = Instruction {
         protocol_version: PROTOCOL_VERSION,
+        seq: 0,
         old_num: 0,
         new_num: SHUTDOWN_NUM,
         ack_num: 0,

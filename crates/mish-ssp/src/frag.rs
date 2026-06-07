@@ -10,6 +10,7 @@
 //! sender re-diffs and retransmits a fresh one. Incomplete reassembly buffers
 //! are therefore disposable and bounded — stale ones are evicted.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use bytes::Bytes;
@@ -69,6 +70,11 @@ struct Partial {
     count: u16,
     received: u16,
     chunks: Vec<Option<Vec<u8>>>,
+    /// Running byte cost of this reassembly — the pre-allocated chunk-slot vector
+    /// plus the buffered fragment bodies so far. Summed into
+    /// [`Defragmenter::buffered`] so the memory cap is an O(1) check rather than a
+    /// full rescan of every reassembly on each push.
+    bytes: usize,
 }
 
 /// Reassembles fragments back into whole instruction payloads.
@@ -76,6 +82,10 @@ pub struct Defragmenter {
     in_progress: HashMap<u32, Partial>,
     /// Cap on concurrently-reassembling instructions; stale ones are evicted.
     max_in_progress: usize,
+    /// Running sum of every [`Partial::bytes`], kept in lockstep with insertions,
+    /// slot fills, and removals so [`buffered_bytes`](Self::buffered_bytes) is
+    /// O(1) on the per-datagram recv hot path.
+    buffered: usize,
 }
 
 impl Default for Defragmenter {
@@ -83,6 +93,7 @@ impl Default for Defragmenter {
         Self {
             in_progress: HashMap::new(),
             max_in_progress: 64,
+            buffered: 0,
         }
     }
 }
@@ -96,16 +107,17 @@ impl Defragmenter {
     /// in-progress reassemblies — the pre-allocated chunk-slot vectors (sized from
     /// the peer-supplied `count`) plus the buffered fragment bodies. The
     /// `frag_memory_bounds` fuzz target asserts a hostile peer can't drive this
-    /// unbounded.
+    /// unbounded. Maintained incrementally (see [`Defragmenter::buffered`]), so
+    /// this is O(1).
     #[doc(hidden)]
     pub fn buffered_bytes(&self) -> usize {
-        self.in_progress
-            .values()
-            .map(|p| {
-                p.chunks.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
-                    + p.chunks.iter().flatten().map(Vec::len).sum::<usize>()
-            })
-            .sum()
+        self.buffered
+    }
+
+    /// The byte cost of a chunk-slot table for `count` fragments (the fixed
+    /// overhead charged when a reassembly is first opened, before any bodies land).
+    fn slot_table_bytes(count: u16) -> usize {
+        count as usize * std::mem::size_of::<Option<Vec<u8>>>()
     }
 
     /// Feed one received datagram. Returns the full payload once the last
@@ -126,15 +138,25 @@ impl Defragmenter {
 
         // Fast path: single-fragment instruction.
         if count == 1 {
-            self.in_progress.remove(&id);
+            if let Some(removed) = self.in_progress.remove(&id) {
+                self.buffered -= removed.bytes;
+            }
             return Some(body.to_vec());
         }
 
-        let entry = self.in_progress.entry(id).or_insert_with(|| Partial {
-            count,
-            received: 0,
-            chunks: vec![None; count as usize],
-        });
+        let entry = match self.in_progress.entry(id) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                let overhead = Self::slot_table_bytes(count);
+                self.buffered += overhead;
+                v.insert(Partial {
+                    count,
+                    received: 0,
+                    chunks: vec![None; count as usize],
+                    bytes: overhead,
+                })
+            }
+        };
         // Guard against inconsistent `count` across fragments of one id.
         if entry.count != count {
             return None;
@@ -143,10 +165,13 @@ impl Defragmenter {
         if slot.is_none() {
             *slot = Some(body.to_vec());
             entry.received += 1;
+            entry.bytes += body.len();
+            self.buffered += body.len();
         }
 
         if entry.received == entry.count {
             let entry = self.in_progress.remove(&id).expect("just inserted");
+            self.buffered -= entry.bytes;
             let mut payload = Vec::new();
             for chunk in entry.chunks {
                 payload.extend_from_slice(&chunk.expect("all chunks present"));
@@ -159,13 +184,13 @@ impl Defragmenter {
         // byte cap matters because `count` is peer-controlled (up to 65535), so a
         // hostile peer could open many ids each pre-allocating a huge chunk table;
         // capping only the entry count leaves total memory unbounded.
-        while self.in_progress.len() > self.max_in_progress
-            || self.buffered_bytes() > MAX_REASSEMBLY_BYTES
-        {
+        while self.in_progress.len() > self.max_in_progress || self.buffered > MAX_REASSEMBLY_BYTES {
             let Some(&oldest) = self.in_progress.keys().min() else {
                 break;
             };
-            self.in_progress.remove(&oldest);
+            if let Some(removed) = self.in_progress.remove(&oldest) {
+                self.buffered -= removed.bytes;
+            }
         }
         None
     }

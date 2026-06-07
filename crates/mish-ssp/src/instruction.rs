@@ -11,17 +11,26 @@
 use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bumped on incompatible wire changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2 added the per-packet [`Instruction::seq`] (RTT reorder guard).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Sentinel state number used by mosh to mean "shutdown" (`uint64(-1)`).
 /// Reserved here; the shutdown handshake is not yet implemented.
 pub const SHUTDOWN_NUM: u64 = u64::MAX;
 
 /// A single SSP message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Instruction {
     /// Protocol version of the sender.
     pub protocol_version: u32,
+    /// Monotonic per-*packet* sequence number (distinct from the state `*_num`s):
+    /// incremented on every emitted instruction — data, retransmit, or pure ack.
+    /// The receiver uses it purely as a reorder guard for RTT sampling: a packet
+    /// arriving with `seq` below the highest seen is late/reordered, so it must not
+    /// feed the RTT estimator (its echoed timestamp would be stale and inflate the
+    /// RTO). Mirrors mosh's `Packet::seq` / `expected_receiver_seq`. It does *not*
+    /// gate state application — the `old_num`/`new_num` chain handles that.
+    pub seq: u64,
     /// State number this diff is computed *from* (the assumed receiver state).
     /// The receiver must already hold a state with this number, or it drops the
     /// instruction — this is how idempotency and replay-safety are enforced.
@@ -139,6 +148,7 @@ mod tests {
     fn encode_decode_roundtrip() {
         let inst = Instruction {
             protocol_version: PROTOCOL_VERSION,
+            seq: 42,
             old_num: 3,
             new_num: 4,
             ack_num: 7,
@@ -164,6 +174,7 @@ mod tests {
     fn inst_with_diff(diff: Vec<u8>) -> Instruction {
         Instruction {
             protocol_version: PROTOCOL_VERSION,
+            seq: 0,
             old_num: 1,
             new_num: 2,
             ack_num: 0,
