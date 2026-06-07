@@ -480,6 +480,33 @@ fn control_char_title_round_trips() {
     );
 }
 
+/// Regression (found by the `diff_roundtrip` fuzzer): a title whose leading edge
+/// is a control char followed by whitespace, e.g. `<U+008F> &`. Alacritty strips
+/// leading + trailing whitespace from a title on parse, but a control char at the
+/// edge "protects" the adjacent space (the control isn't whitespace). `osc_sanitize`
+/// then removes the control *after* parsing, exposing a leading space the wire diff
+/// can't reproduce (re-parse strips it). So the snapshot must trim *both* ends, not
+/// just the trailing one.
+#[test]
+fn edge_whitespace_title_round_trips() {
+    let mut emu = Emulator::new(40, 12);
+    emu.feed(b"\x1b]0;\xc2\x8f &\x07"); // OSC 0: title "<U+008F> &" -> should normalize to "&"
+    let cur = emu.snapshot();
+
+    assert_eq!(
+        cur.title, "&",
+        "snapshot title should be trimmed of the exposed leading space: {:?}",
+        cur.title
+    );
+    let got = paint(&cur);
+    assert!(
+        screen_eq(&cur, &got),
+        "edge-whitespace title failed to round-trip: cur={:?} got={:?}",
+        cur.title,
+        got.title
+    );
+}
+
 /// Regression (found by the `diff_roundtrip` fuzzer): a wide (CJK) glyph whose
 /// spacer column gets overwritten by a real glyph — via insert-character (ICH)
 /// shifting into it — leaves the emulator in a "broken wide char" state (wide

@@ -283,12 +283,17 @@ impl Emulator {
             cursor_col: cursor.column.0 as u16,
             cursor_visible: mode.contains(TermMode::SHOW_CURSOR),
             // Normalize the title to exactly what survives a clean OSC round-trip:
-            // strip control chars (new_frame strips them on emit) and trailing
-            // whitespace (alacritty drops it when re-parsing the emitted title).
-            // Otherwise the stored title keeps content the wire diff can't
-            // reproduce, breaking round-trip identity (diff_roundtrip fuzzer).
+            // strip control chars (new_frame strips them on emit) and leading +
+            // trailing whitespace (alacritty drops both when re-parsing the emitted
+            // title). Trimming *both* ends matters because osc_sanitize removes a
+            // control char that was sitting at an edge — which alacritty had let
+            // protect an adjacent space — exposing whitespace the wire diff can't
+            // reproduce (alacritty re-strips it), breaking round-trip identity.
+            // Found by the diff_roundtrip fuzzer (leading-space case: "\x8f &").
+            // trim() never drops a *legitimate* edge space: alacritty already
+            // stripped those at the original parse, before snapshot ran.
             title: crate::display::osc_sanitize(&self.listener.title.lock().unwrap())
-                .trim_end()
+                .trim()
                 .to_string(),
             echo_ack: 0, // set by the server session, not the emulator
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
