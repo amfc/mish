@@ -1048,3 +1048,54 @@ mod model_check_traits {
         }
     }
 }
+
+/// Unit tests for the RTT estimator. The convergence/model-check tests assert
+/// *that* the protocol syncs and stays bounded, but deliberately ignore timing —
+/// so the latency-critical Jacobson/Karels arithmetic (mosh's keyboard-tail
+/// math) was otherwise unpinned. These pin it to exact values; the inputs are
+/// chosen so every intermediate is dyadic (exactly representable in `f64`), so
+/// any arithmetic change (operator swap, dropped `.abs()`, skipped seeding) moves
+/// a result and is caught. (Surfaced by `cargo mutants`.)
+#[cfg(test)]
+mod rtt_tests {
+    use super::Rtt;
+
+    #[test]
+    fn first_sample_seeds_srtt_and_rttvar() {
+        let mut rtt = Rtt::new();
+        rtt.sample(120);
+        assert!(rtt.initialized);
+        assert_eq!(rtt.srtt, 120.0); // srtt = r
+        assert_eq!(rtt.rttvar, 60.0); // rttvar = r / 2
+        assert_eq!(rtt.rto(), 120.0 + 4.0 * 60.0); // rto = srtt + 4*rttvar
+    }
+
+    #[test]
+    fn second_sample_applies_jacobson_ewma() {
+        let mut rtt = Rtt::new();
+        rtt.sample(100); // seeds srtt=100, rttvar=50
+        rtt.sample(200);
+        // rttvar = 3/4*50 + 1/4*|100-200| = 37.5 + 25 = 62.5
+        // srtt   = 7/8*100 + 1/8*200      = 87.5 + 25 = 112.5
+        assert_eq!(rtt.rttvar, 62.5);
+        assert_eq!(rtt.srtt, 112.5);
+        assert_eq!(rtt.rto(), 112.5 + 4.0 * 62.5);
+    }
+
+    #[test]
+    fn rttvar_uses_absolute_deviation() {
+        // A sample below srtt must move rttvar exactly like one equally above it:
+        // pins the `.abs()` (a `srtt - r` -> `srtt + r` mutation breaks this).
+        let mut below = Rtt::new();
+        below.sample(100);
+        below.sample(40); // |100-40| = 60
+        let mut above = Rtt::new();
+        above.sample(100);
+        above.sample(160); // |100-160| = 60
+        assert_eq!(below.rttvar, above.rttvar);
+        assert_eq!(below.rttvar, 52.5); // 3/4*50 + 1/4*60
+        // srtt is directional, though:
+        assert_eq!(below.srtt, 92.5); // 7/8*100 + 1/8*40
+        assert_eq!(above.srtt, 107.5); // 7/8*100 + 1/8*160
+    }
+}

@@ -91,4 +91,21 @@ mod tests {
         roundtrip(b"same", b"same");
         roundtrip(b"prefix-changes", b"completely different");
     }
+
+    #[test]
+    fn diff_compresses_shared_prefix() {
+        // The round-trip tests pass even if the diff just reships the whole state,
+        // so they don't pin `common_prefix_len` (a `-> 0` mutation degrades this
+        // to a full-replacement diff unnoticed). Assert the diff carries only the
+        // 4-byte prefix-length header + the differing tail, not the long prefix.
+        let prev = BytesState::new(vec![7u8; 1000]);
+        let mut bytes = vec![7u8; 1000];
+        bytes.extend_from_slice(b"tail");
+        let next = BytesState::new(bytes);
+        let diff = next.diff_from(&prev);
+        assert_eq!(diff.len(), 4 + b"tail".len(), "diff must not reship the prefix");
+        let mut applied = prev.clone();
+        applied.apply_diff(&diff);
+        assert_eq!(applied, next);
+    }
 }
