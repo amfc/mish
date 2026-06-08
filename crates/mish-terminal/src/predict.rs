@@ -79,6 +79,13 @@ fn is_blank_glyph(c: char) -> bool {
     c == ' ' || c == '\0'
 }
 
+/// readline's default word definition: a "word" is a maximal run of
+/// alphanumeric characters, everything else a delimiter. Used to predict the
+/// word-wise cursor motions (`M-b`/`M-f`, Ctrl-arrow).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric()
+}
+
 /// Parse state for an in-progress input escape sequence, so we can predict the
 /// cursor-moving arrow keys (`ESC [ C/D`, `ESC O C/D`) instead of abandoning
 /// prediction the moment an escape byte appears. Persists across input batches
@@ -135,8 +142,13 @@ pub struct PredictionEngine {
     /// for the rest of the current input batch (the escape sequence's remaining
     /// bytes must not be echoed as text).
     suppress: bool,
-    /// In-progress input escape-sequence parse (for arrow-key prediction).
+    /// In-progress input escape-sequence parse (for cursor-motion prediction).
     esc: EscPhase,
+    /// Accumulated CSI parameter bytes (digits and `;`) of the in-progress
+    /// sequence, so a parameterised motion like `ESC [ 1 ; 5 C` (Ctrl-Right) or
+    /// `ESC [ 4 ~` (End) can be distinguished from a bare arrow. Cleared when a
+    /// fresh CSI begins; only ASCII digits/`;` are ever pushed.
+    esc_params: Vec<u8>,
     /// Latest SRTT estimate (ms), for adaptive gating.
     srtt_ms: f64,
     /// Whether the SRTT-based adaptive trigger is currently *latched on*. Updated
@@ -194,6 +206,7 @@ impl PredictionEngine {
             utf8: Vec::new(),
             suppress: false,
             esc: EscPhase::None,
+            esc_params: Vec::new(),
             srtt_ms: 0.0,
             srtt_showing: false,
             flagging: true,
@@ -352,7 +365,7 @@ impl PredictionEngine {
         // Continue an in-progress escape sequence (arrow-key prediction). Persists
         // across batches, so check it before the per-batch `suppress` gate.
         if self.esc != EscPhase::None {
-            self.continue_escape(ch, input_index, now_ms);
+            self.continue_escape(ch, input_index, base, now_ms);
             return;
         }
         if self.suppress {
@@ -404,7 +417,18 @@ impl PredictionEngine {
                 self.cursor_at_ms = now_ms;
                 self.cursor_epoch = self.prediction_epoch;
             }
-            // Escape: begin an escape sequence — it may be an arrow key we can
+            // Ctrl-A / Ctrl-E: readline beginning-/end-of-line. Pure cursor moves,
+            // gated by the epoch like the arrow keys — if this context doesn't bind
+            // them this way (an app that grabs Ctrl-A), the prediction is
+            // contradicted by the server and dropped without ever displaying.
+            '\u{1}' => {
+                self.predict_cursor_to(0, input_index, now_ms);
+            }
+            '\u{5}' => {
+                let e = self.line_end_col(self.cursor_row, base);
+                self.predict_cursor_to(e, input_index, now_ms);
+            }
+            // Escape: begin an escape sequence — it may be a cursor motion we can
             // predict (handled by `continue_escape`); we only abandon if it turns
             // out to be something else.
             '\u{1b}' => {
@@ -543,43 +567,172 @@ impl PredictionEngine {
             .find(|&p| !is_blank_glyph(self.displayed_cell(row, p, base).c))
     }
 
-    /// Continue parsing an input escape sequence, predicting the left/right arrow
-    /// keys (which just move the cursor) and abandoning prediction for anything
-    /// else (as before — we can't safely predict arbitrary escape effects).
-    fn continue_escape(&mut self, ch: char, input_index: u64, now_ms: u64) {
-        match (self.esc, ch) {
-            (EscPhase::Esc, '[') => self.esc = EscPhase::Csi,
-            (EscPhase::Esc, 'O') => self.esc = EscPhase::Ss3,
-            (EscPhase::Csi | EscPhase::Ss3, 'C') => {
+    /// Continue parsing an input escape sequence, predicting the cursor-only
+    /// motions — arrows, Home/End, and word-wise jumps (`M-b`/`M-f`, Ctrl-arrow)
+    /// — and abandoning prediction for anything else (we can't safely predict
+    /// arbitrary escape effects). Every motion is stamped in the current epoch,
+    /// so the gate withholds it until the context is confirmed to echo it.
+    fn continue_escape(&mut self, ch: char, input_index: u64, base: &Screen, now_ms: u64) {
+        match self.esc {
+            EscPhase::Esc => match ch {
+                '[' => {
+                    self.esc = EscPhase::Csi;
+                    self.esc_params.clear();
+                }
+                'O' => self.esc = EscPhase::Ss3,
+                // Meta (Alt) word motions are default readline bindings:
+                // `ESC b` = backward-word, `ESC f` = forward-word.
+                'b' => {
+                    self.esc = EscPhase::None;
+                    let c = self.word_left(self.cursor_row, base);
+                    self.predict_cursor_to(c, input_index, now_ms);
+                }
+                'f' => {
+                    self.esc = EscPhase::None;
+                    let c = self.word_right(self.cursor_row, base);
+                    self.predict_cursor_to(c, input_index, now_ms);
+                }
+                _ => self.abandon_escape(),
+            },
+            EscPhase::Ss3 => {
                 self.esc = EscPhase::None;
-                self.predict_cursor_h(true, input_index, now_ms); // right
+                match ch {
+                    'C' => self.predict_cursor_h(true, input_index, now_ms), // right
+                    'D' => self.predict_cursor_h(false, input_index, now_ms), // left
+                    'H' => self.predict_cursor_to(0, input_index, now_ms),   // Home
+                    'F' => {
+                        let e = self.line_end_col(self.cursor_row, base); // End
+                        self.predict_cursor_to(e, input_index, now_ms);
+                    }
+                    _ => self.abandon_escape(),
+                }
             }
-            (EscPhase::Csi | EscPhase::Ss3, 'D') => {
+            EscPhase::Csi => {
+                // Accumulate parameter bytes (digits / `;`) until the final byte.
+                if ch.is_ascii_digit() || ch == ';' {
+                    if self.esc_params.len() < 16 {
+                        self.esc_params.push(ch as u8);
+                    }
+                    return; // stay in CSI
+                }
                 self.esc = EscPhase::None;
-                self.predict_cursor_h(false, input_index, now_ms); // left
+                // A modifier param (e.g. `1;5` Ctrl, `1;3` Alt) turns the arrow
+                // finals C/D into word motions, matching the usual inputrc
+                // bindings; a bare or `1` param is a single-column arrow.
+                let modified = self.esc_has_modifier();
+                match ch {
+                    'C' if modified => {
+                        let c = self.word_right(self.cursor_row, base);
+                        self.predict_cursor_to(c, input_index, now_ms);
+                    }
+                    'D' if modified => {
+                        let c = self.word_left(self.cursor_row, base);
+                        self.predict_cursor_to(c, input_index, now_ms);
+                    }
+                    'C' => self.predict_cursor_h(true, input_index, now_ms), // right
+                    'D' => self.predict_cursor_h(false, input_index, now_ms), // left
+                    'H' => self.predict_cursor_to(0, input_index, now_ms),   // Home
+                    'F' => {
+                        let e = self.line_end_col(self.cursor_row, base); // End
+                        self.predict_cursor_to(e, input_index, now_ms);
+                    }
+                    // `ESC [ n ~` variants: 1/7 = Home, 4/8 = End.
+                    '~' => match self.esc_leading_param() {
+                        1 | 7 => self.predict_cursor_to(0, input_index, now_ms),
+                        4 | 8 => {
+                            let e = self.line_end_col(self.cursor_row, base);
+                            self.predict_cursor_to(e, input_index, now_ms);
+                        }
+                        _ => self.abandon_escape(),
+                    },
+                    _ => self.abandon_escape(),
+                }
             }
-            _ => {
-                // Not an arrow key — abandon prediction for the rest of the batch.
-                self.esc = EscPhase::None;
-                self.reset();
-                self.suppress = true;
-            }
+            // Only reached with esc != None (guarded by the caller).
+            EscPhase::None => {}
         }
+    }
+
+    /// Abandon the in-progress escape sequence: flush speculation and suppress
+    /// prediction for the rest of this input batch.
+    fn abandon_escape(&mut self) {
+        self.esc = EscPhase::None;
+        self.reset();
+        self.suppress = true;
+    }
+
+    /// The second (modifier) CSI parameter is present and > 1 — i.e. the key was
+    /// pressed with Ctrl/Alt/Shift (`1;5C` etc.), marking a word-wise arrow.
+    fn esc_has_modifier(&self) -> bool {
+        let s = std::str::from_utf8(&self.esc_params).unwrap_or("");
+        s.split(';')
+            .nth(1)
+            .and_then(|m| m.parse::<u32>().ok())
+            .is_some_and(|m| m >= 2)
+    }
+
+    /// The leading CSI parameter as a number (0 if absent/unparseable), used to
+    /// classify the `ESC [ n ~` family.
+    fn esc_leading_param(&self) -> u32 {
+        let s = std::str::from_utf8(&self.esc_params).unwrap_or("");
+        s.split(';').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0)
     }
 
     /// Predict a one-column cursor move (right if `right`, else left), clamped to
     /// the screen — no cell changes.
     fn predict_cursor_h(&mut self, right: bool, input_index: u64, now_ms: u64) {
-        if right {
-            if self.cursor_col + 1 < self.cols {
-                self.cursor_col += 1;
-            }
+        let col = if right {
+            self.cursor_col + 1
         } else {
-            self.cursor_col = self.cursor_col.saturating_sub(1);
-        }
+            self.cursor_col.saturating_sub(1)
+        };
+        self.predict_cursor_to(col, input_index, now_ms);
+    }
+
+    /// Predict an absolute cursor column on the current row (clamped to the
+    /// screen), with no cell changes. Stamped in the current prediction epoch
+    /// like the arrow keys, so the epoch gate withholds it until this context is
+    /// confirmed to echo cursor moves.
+    fn predict_cursor_to(&mut self, col: u16, input_index: u64, now_ms: u64) {
+        self.cursor_col = col.min(self.cols.saturating_sub(1));
         self.cursor_index = input_index;
         self.cursor_at_ms = now_ms;
         self.cursor_epoch = self.prediction_epoch;
+    }
+
+    /// The end-of-line cursor column for `row`: one past the rightmost non-blank
+    /// cell (readline's end-of-line / `Ctrl-E`), or column 0 on a blank row.
+    /// [`Self::predict_cursor_to`] clamps it to the screen width.
+    fn line_end_col(&self, row: u16, base: &Screen) -> u16 {
+        self.line_content_end(row, base).map_or(0, |e| e + 1)
+    }
+
+    /// Predicted column after a readline `backward-word` (`M-b`) from the cursor:
+    /// skip delimiters left, then the word's characters, landing at its start.
+    fn word_left(&self, row: u16, base: &Screen) -> u16 {
+        let mut i = self.cursor_col;
+        while i > 0 && !is_word_char(self.displayed_cell(row, i - 1, base).c) {
+            i -= 1;
+        }
+        while i > 0 && is_word_char(self.displayed_cell(row, i - 1, base).c) {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Predicted column after a readline `forward-word` (`M-f`) from the cursor:
+    /// skip delimiters right, then the word's characters, landing just past its
+    /// end. Bounded by the line's content extent so it can't run off into blanks.
+    fn word_right(&self, row: u16, base: &Screen) -> u16 {
+        let end = self.line_end_col(row, base);
+        let mut i = self.cursor_col;
+        while i < end && !is_word_char(self.displayed_cell(row, i, base).c) {
+            i += 1;
+        }
+        while i < end && is_word_char(self.displayed_cell(row, i, base).c) {
+            i += 1;
+        }
+        i
     }
 
     fn advance_cursor(&mut self) {
@@ -1207,6 +1360,82 @@ mod tests {
             3,
             "right arrow moved the cursor"
         );
+    }
+
+    /// Ctrl-A / Ctrl-E and the Home/End keys (CSI, SS3, and `ESC [ n ~` forms)
+    /// are predicted as beginning-/end-of-line cursor jumps.
+    #[test]
+    fn predicts_line_home_end() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
+        let base = screen_with_ack(20, 3, 0);
+        p.new_user_bytes(b"abc", &base, 3, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 3);
+
+        // Ctrl-A → beginning of line.
+        p.new_user_bytes(b"\x01", &base, 4, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 0, "Ctrl-A → col 0");
+        // Ctrl-E → end of line (one past the last glyph 'c').
+        p.new_user_bytes(b"\x05", &base, 5, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 3, "Ctrl-E → line end");
+
+        // Home key, CSI form (ESC [ H) and ESC [ 1 ~.
+        p.new_user_bytes(b"\x1b[H", &base, 6, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 0, "CSI Home");
+        p.new_user_bytes(b"\x1b[4~", &base, 7, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 3, "CSI End (ESC[4~)");
+        // SS3 Home (ESC O H).
+        p.new_user_bytes(b"\x1bOH", &base, 8, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 0, "SS3 Home");
+    }
+
+    /// Word-wise motions: `M-b` / `M-f` (default readline) and Ctrl-arrow
+    /// (`ESC [ 1 ; 5 D/C`) jump over whole alphanumeric words.
+    #[test]
+    fn predicts_word_motions() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
+        let base = screen_with_ack(20, 3, 0);
+        p.new_user_bytes(b"foo bar", &base, 7, 0); // cursor at col 7 (end)
+        assert_eq!(p.predicted_screen(&base).cursor_col, 7);
+
+        // M-b: back to the start of "bar".
+        p.new_user_bytes(b"\x1bb", &base, 8, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 4, "M-b → start of bar");
+        // M-b again: back to the start of "foo".
+        p.new_user_bytes(b"\x1bb", &base, 9, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 0, "M-b → start of foo");
+        // M-f: forward to the end of "foo".
+        p.new_user_bytes(b"\x1bf", &base, 10, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 3, "M-f → end of foo");
+        // Ctrl-Right (ESC[1;5C): forward to the end of "bar".
+        p.new_user_bytes(b"\x1b[1;5C", &base, 11, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 7, "Ctrl-Right → end of bar");
+        // Ctrl-Left (ESC[1;5D): back to the start of "bar".
+        p.new_user_bytes(b"\x1b[1;5D", &base, 12, 0);
+        assert_eq!(p.predicted_screen(&base).cursor_col, 4, "Ctrl-Left → start of bar");
+    }
+
+    /// A motion the server contradicts is dropped by the epoch gate without
+    /// corrupting any glyphs (the cursor-only motions never touch cells).
+    #[test]
+    fn mispredicted_motion_does_not_corrupt_cells() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
+        let base = screen_with_ack(20, 3, 0);
+        p.new_user_bytes(b"abc", &base, 3, 0);
+        // Ctrl-A predicts col 0, but the server (some app that rebinds it) leaves
+        // the cursor at col 3 and the glyphs intact.
+        p.new_user_bytes(b"\x01", &base, 4, 0);
+        let mut confirmed = screen_with_ack(20, 3, 4);
+        confirmed.cursor_col = 3;
+        for (i, c) in "abc".chars().enumerate() {
+            confirmed.cells[i].c = c;
+        }
+        p.new_server_screen(&confirmed, 0);
+        let shown = p.predicted_screen(&confirmed);
+        assert_eq!(shown.cursor_col, 3, "cursor resyncs to the server");
+        assert_eq!(shown.cell(0, 0).unwrap().c, 'a', "glyphs untouched by the bad motion");
     }
 
     /// Typing in the *middle* of a line is predicted as an insert that shifts the
