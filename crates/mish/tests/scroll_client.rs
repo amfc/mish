@@ -66,6 +66,7 @@ async fn scroll_up_renders_history() {
         clock,
         PredictMode::Never,
         Some(history),
+        None, // session name (display-only)
         in_rx,
         out_tx,
     ));
@@ -102,6 +103,7 @@ async fn shift_up_at_prompt_renders_history() {
         clock,
         PredictMode::Never,
         Some(history),
+        None, // session name (display-only)
         in_rx,
         out_tx,
     ));
@@ -143,6 +145,7 @@ async fn wheel_up_at_prompt_renders_history() {
         clock,
         PredictMode::Never,
         Some(history),
+        None, // session name (display-only)
         in_rx,
         out_tx,
     ));

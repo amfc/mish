@@ -48,6 +48,7 @@ async fn quic_pty_full_stack() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));
@@ -104,6 +105,7 @@ async fn shell_exit_disconnects_client() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

@@ -115,6 +115,7 @@ async fn server_output_reaches_client_and_input_reaches_server() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));
@@ -176,6 +177,7 @@ async fn redraw_forces_full_repaint() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));
@@ -232,6 +234,7 @@ async fn client_resize_propagates_to_server_pty() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));
@@ -292,6 +295,7 @@ async fn child_exit_shuts_down_client() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

@@ -52,6 +52,7 @@ fn harness() -> (
         clock,
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

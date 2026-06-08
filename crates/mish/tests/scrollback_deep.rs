@@ -74,6 +74,7 @@ async fn deep_scrollback_reaches_every_line_and_the_command() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         Some(hist),
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

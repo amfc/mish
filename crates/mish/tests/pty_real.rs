@@ -43,6 +43,7 @@ async fn real_shell_output_reaches_client() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));
@@ -93,6 +94,7 @@ async fn flow_control_does_not_deadlock() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

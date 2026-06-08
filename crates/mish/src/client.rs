@@ -17,12 +17,30 @@ use mish_terminal::display::new_frame;
 use mish_terminal::history::HistoryResponse;
 use mish_terminal::predict::{PredictMode, PredictionEngine};
 use mish_terminal::screen::Screen;
+use mish_terminal::statusbar::LinkStats;
 use mish_terminal::user::UserStream;
 use tokio::sync::mpsc;
 
 /// Lines fed to an alt-screen pager per mouse-wheel notch (matches the usual
 /// terminal alternate-scroll step).
 const WHEEL_STEP_LINES: usize = 3;
+
+/// Window (ms) over which the status bar reports packet loss: the delta of the
+/// transport's cumulative (sent, lost) counters across this span. One minute,
+/// matching the prediction-accuracy window, so both meters cover "the last
+/// minute" as the user expects.
+const LOSS_WINDOW_MS: u64 = 60_000;
+
+/// Loss fraction (`0.0..=1.0`) across the sampling window: `(lost_now -
+/// lost_oldest) / (sent_now - sent_oldest)`. `None` until there are two samples
+/// spanning some sent packets (nothing meaningful to divide yet).
+fn window_loss(window: &[(u64, u64, u64)]) -> Option<f64> {
+    let (_, first_sent, first_lost) = *window.first()?;
+    let (_, last_sent, last_lost) = *window.last()?;
+    let sent = last_sent.saturating_sub(first_sent);
+    let lost = last_lost.saturating_sub(first_lost);
+    (sent > 0).then(|| (lost as f64 / sent as f64).clamp(0.0, 1.0))
+}
 
 /// Decode an SGR mouse report (`ESC [ < Cb ; Cx ; Cy M`) as a vertical wheel
 /// event: `Some(true)` = wheel up, `Some(false)` = wheel down, `None` for any
@@ -86,6 +104,8 @@ pub enum ClientInput {
     ScrollKey { up: bool, passthrough: Vec<u8> },
     /// The user detached (e.g. Ctrl-]): begin a clean shutdown.
     Detach,
+    /// Toggle the network/prediction status bar (Ctrl-^ u).
+    ToggleStats,
 }
 
 /// Fetches server-held scrollback history for the client's scroll mode. The
@@ -127,11 +147,17 @@ pub async fn run_client<T: Transport>(
     clock: Arc<dyn Clock>,
     predict: PredictMode,
     history: Option<Arc<dyn HistoryFetcher>>,
+    session: Option<String>,
     mut input: mpsc::Receiver<ClientInput>,
     output: mpsc::UnboundedSender<Vec<u8>>,
 ) {
-    let (driver, handle) =
-        Driver::<T, UserStream, Screen>::with(transport, clock.clone(), SspConfig::default().with_env_overrides());
+    // The driver owns the transport for the session; keep a cloned `Arc` so the
+    // status bar can read its loss counters / peer address (both `&self`).
+    let (driver, handle) = Driver::<T, UserStream, Screen>::with(
+        transport.clone(),
+        clock.clone(),
+        SspConfig::default().with_env_overrides(),
+    );
     let driver_task = driver.spawn();
 
     // Accumulate the user-input log. We keep the full prefix so diffs against
@@ -150,6 +176,15 @@ pub async fn run_client<T: Transport>(
     // only minimal updates (mosh's Display::new_frame), not full repaints.
     let mut painted = Screen::new_initial();
     let mut painted_once = false;
+
+    // Status bar (Ctrl-^ u): when on, a reverse-video top row shows live link +
+    // prediction health. `loss_window` samples the transport's cumulative
+    // (sent, lost) packet counters on the periodic tick; the displayed loss rate
+    // is the delta across the window, so it reflects the last [`LOSS_WINDOW_MS`]
+    // rather than a lifetime average. Sampled even while the bar is off, so it has
+    // data the moment it's toggled on.
+    let mut stats_on = false;
+    let mut loss_window: Vec<(u64, u64, u64)> = Vec::new();
 
     // Scrollback state: when `scroll_offset > 0` the client is paused in history,
     // showing `scroll_view` (the last fetched window) instead of the live screen;
@@ -182,8 +217,29 @@ pub async fn run_client<T: Transport>(
                 engine.advance(now);
                 let predicted = engine.predicted_screen(&server_screen);
                 let silent_secs = now.saturating_sub(handle.last_recv_ms()) / 1000;
-                mish_terminal::notification::stalled_overlay(&predicted, silent_secs)
-                    .unwrap_or(predicted)
+                // The stall banner takes the top row when the link is silent;
+                // otherwise the status bar (when toggled on) gets it. The two never
+                // share the row — a stalled link is the more urgent message and
+                // already reports "last contact".
+                match mish_terminal::notification::stalled_overlay(&predicted, silent_secs) {
+                    Some(stalled) => stalled,
+                    None if stats_on => {
+                        let stats = LinkStats {
+                            session: session.clone(),
+                            rtt_ms: handle.srtt_ms(),
+                            loss: window_loss(&loss_window),
+                            prediction: engine.accuracy(now),
+                            predicting: engine.is_showing(),
+                            glitchy: engine.is_glitchy(),
+                            predict_mode: engine.mode(),
+                            peer: transport.peer_addr(),
+                            silent_secs,
+                        };
+                        mish_terminal::statusbar::status_bar_overlay(&predicted, &stats)
+                            .unwrap_or(predicted)
+                    }
+                    None => predicted,
+                }
             };
             // Let the terminal handle the wheel natively (scroll its own
             // scrollback) rather than capturing it for ours — native scrolling and
@@ -218,7 +274,17 @@ pub async fn run_client<T: Transport>(
 
     loop {
         tokio::select! {
-            _ = tick.tick() => { repaint!(); }
+            _ = tick.tick() => {
+                // Sample the transport's loss counters into the rolling window
+                // (cheap; done even when the bar is off so it's warm on toggle).
+                if let Some(counters) = transport.loss_counters() {
+                    let now = clock.now_ms();
+                    loss_window.push((now, counters.0, counters.1));
+                    let cutoff = now.saturating_sub(LOSS_WINDOW_MS);
+                    loss_window.retain(|&(t, _, _)| t >= cutoff);
+                }
+                repaint!();
+            }
             inp = input.recv() => {
                 // Leaving scrollback: drop the history view and force a full
                 // repaint of the live screen on the next `repaint!`.
@@ -403,6 +469,13 @@ pub async fn run_client<T: Transport>(
                     // real terminal lost our painted state, so re-emit the whole
                     // screen rather than an incremental diff against `painted`.
                     Some(ClientInput::Redraw) => {
+                        painted_once = false;
+                        repaint!();
+                    }
+                    // Toggle the status bar. Force a full repaint so the row it
+                    // occupies (or vacates) is rewritten cleanly.
+                    Some(ClientInput::ToggleStats) => {
+                        stats_on = !stats_on;
                         painted_once = false;
                         repaint!();
                     }

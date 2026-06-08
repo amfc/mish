@@ -102,6 +102,17 @@ impl Transport for QuicTransport {
         // the SSP layer's own timestamp sampling. The core uses it for cadence/RTO.
         Some(self.conn.rtt())
     }
+
+    fn loss_counters(&self) -> Option<(u64, u64)> {
+        // quinn's per-path loss-detection counters (RFC 9002). Cumulative since the
+        // connection opened; the client samples the deltas for its status bar.
+        let path = self.conn.stats().path;
+        Some((path.sent_packets, path.lost_packets))
+    }
+
+    fn peer_addr(&self) -> Option<String> {
+        Some(self.conn.remote_address().to_string())
+    }
 }
 
 /// Build a server endpoint bound to `addr` (use port 0 for an ephemeral port).

@@ -24,6 +24,7 @@ pub mod notification;
 pub mod predict;
 pub mod render;
 pub mod screen;
+pub mod statusbar;
 pub mod user;
 
 /// Kani bounded-proof harnesses for the screen path's structural core (run with

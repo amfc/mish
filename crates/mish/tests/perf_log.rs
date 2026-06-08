@@ -63,6 +63,7 @@ async fn perf_log_records_keystroke_latency() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Always,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

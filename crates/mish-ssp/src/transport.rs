@@ -58,4 +58,21 @@ pub trait Transport: Send + Sync + 'static {
     fn rtt(&self) -> Option<Duration> {
         None
     }
+
+    /// Cumulative `(sent, lost)` packet counts since the connection opened, if
+    /// the transport tracks them. QUIC does (RFC 9002 loss detection); the client
+    /// samples the deltas to show a rolling loss rate in its status bar. These are
+    /// QUIC-packet-level counters, not application datagrams, but they are the
+    /// transport's own honest view of how lossy the path is. `None` (the default)
+    /// ⇒ the transport keeps no such estimate (e.g. the in-memory test transport).
+    fn loss_counters(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// The peer's current address, if the transport has one. Changes when a QUIC
+    /// connection migrates (roaming), so the status bar can show where the session
+    /// is currently anchored. `None` (the default) ⇒ no addressable peer.
+    fn peer_addr(&self) -> Option<String> {
+        None
+    }
 }

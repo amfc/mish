@@ -7,7 +7,8 @@
 //! raw keystrokes (forwarded as a `UserStream`), repaints received screens, and
 //! tracks SIGWINCH resizes. Quick-detach with `Ctrl-]`. The escape prefix
 //! `Ctrl-^` (configurable via `MOSH_ESCAPE_KEY`) then `.` quits, the prefix again
-//! sends it literally, and `Ctrl-Z` suspends; on resume (`fg`/SIGCONT) raw mode
+//! sends it literally, `Ctrl-Z` suspends, `u` toggles the network/prediction
+//! status bar, and `l`/`Ctrl-L` forces a repaint; on resume (`fg`/SIGCONT) raw mode
 //! is restored and the screen repainted. **Shift-Up / Shift-Down** (and
 //! **Shift-PageUp / Shift-PageDown** for whole pages) scroll into the server's
 //! scrollback history (fetched over a reliable side-channel); any other keystroke
@@ -57,9 +58,12 @@ const SERVER_BIN: &str = "mish-server";
 const DETACH: u8 = 0x1d;
 
 /// Default escape prefix: Ctrl-^ (0x1e), as in upstream mosh. Followed by `.` to
-/// quit, the prefix again to send it literally, or Ctrl-Z to suspend.
+/// quit, the prefix again to send it literally, Ctrl-Z to suspend, `u` to toggle
+/// the status bar, or `l`/Ctrl-L to force a repaint.
 const DEFAULT_ESCAPE: u8 = 0x1e;
 const CTRL_Z: u8 = 0x1a;
+/// Ctrl-L (0x0c): after the escape prefix, force a full repaint (also `l`).
+const CTRL_L: u8 = 0x0c;
 
 /// Resolve the escape prefix byte from `MOSH_ESCAPE_KEY` (its first byte; a bare
 /// ASCII letter is taken as its control code, e.g. `a` → Ctrl-A), else the default.
@@ -315,6 +319,7 @@ fn print_usage() {
          \x20 --perf-log <path>    record per-keystroke keypress->display latency (JSON lines)\n\
          \x20 --version            print version and exit\n\
          \x20 -h, --help           show this help\n\n\
+         keys: Ctrl-] detach · Ctrl-^ then . quit / Ctrl-Z suspend / u status bar / l repaint\n\
          env: MOSH_PREDICTION_DISPLAY, MOSH_NO_TERM_INIT, MOSH_ESCAPE_KEY"
     );
 }
@@ -363,6 +368,7 @@ async fn main() -> Result<()> {
             opts.no_init,
             opts.local_forwards,
             opts.remote_forwards,
+            opts.session.clone(),
         )
         .await?;
         exit_now();
@@ -442,6 +448,7 @@ async fn main() -> Result<()> {
         opts.no_init,
         opts.local_forwards,
         opts.remote_forwards,
+        opts.session,
     )
     .await;
     tracing::info!(target: "mish::client", "client session ended; tearing down");
@@ -494,6 +501,7 @@ async fn attach_session(
     no_init: bool,
     local_forwards: Vec<mish::forward::ForwardSpec>,
     remote_forwards: Vec<mish::forward::ForwardSpec>,
+    session: Option<String>,
 ) -> Result<()> {
     let creds = std::env::var("MISH_CONNECT").context(
         "--attach requires $MISH_CONNECT = hex `<server-cert> <client-cert> <client-key>`",
@@ -522,7 +530,7 @@ async fn attach_session(
     let t = transport::connect(&endpoint, addr, "localhost")
         .await
         .context("connecting to server")?;
-    run_terminal(t, predict, no_init, local_forwards, remote_forwards).await;
+    run_terminal(t, predict, no_init, local_forwards, remote_forwards, session).await;
     Ok(())
 }
 
@@ -533,6 +541,7 @@ async fn run_terminal(
     no_init: bool,
     local_forwards: Vec<mish::forward::ForwardSpec>,
     remote_forwards: Vec<mish::forward::ForwardSpec>,
+    session: Option<String>,
 ) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
@@ -658,6 +667,25 @@ async fn run_terminal(
                             let _ = key_tx.send(ClientInput::Detach).await;
                             return;
                         }
+                        b'u' => {
+                            // Toggle the network/prediction status bar. Flush any
+                            // keystrokes typed before the prefix first, in order.
+                            if !batch.is_empty() {
+                                let _ = key_tx
+                                    .send(ClientInput::Keys(std::mem::take(&mut batch)))
+                                    .await;
+                            }
+                            let _ = key_tx.send(ClientInput::ToggleStats).await;
+                        }
+                        b'l' | CTRL_L => {
+                            // Force a full repaint (e.g. after local corruption).
+                            if !batch.is_empty() {
+                                let _ = key_tx
+                                    .send(ClientInput::Keys(std::mem::take(&mut batch)))
+                                    .await;
+                            }
+                            let _ = key_tx.send(ClientInput::Redraw).await;
+                        }
                         x if x == escape => batch.push(escape), // literal prefix
                         CTRL_Z => {
                             // Flush pending keys, then suspend; on resume the
@@ -765,6 +793,7 @@ async fn run_terminal(
         clock,
         predict,
         Some(history),
+        session,
         in_rx,
         out_tx,
     )

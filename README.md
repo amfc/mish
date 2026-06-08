@@ -129,7 +129,8 @@ mish-client host -R 9000:localhost:3000     # remote 9000 → your localhost:300
 # Options: --bootstrap <how>  --ssh <cmd>  --ssh-port <n>  --server <cmd>
 #          --predict <mode>  --no-init  -L/-R [bind:]port:host:hostport
 # Keys: Ctrl-] quick-detach; escape prefix Ctrl-^ (MOSH_ESCAPE_KEY) then
-#       `.` quit / Ctrl-Z suspend (resumes cleanly on `fg`).
+#       `.` quit / Ctrl-Z suspend (resumes cleanly on `fg`) / `u` toggle the
+#       network+prediction status bar / `l` (or Ctrl-L) force a repaint.
 #       Shift-Up/Down (or Shift-PageUp/PageDown) scrolls server-held scrollback.
 ```
 
@@ -196,6 +197,14 @@ configured, so a hostile server can't reach arbitrary client-local addresses. Se
 
 A blue status banner ("mish: Last contact N seconds ago…") appears when the link
 stalls, and the window title is prefixed `[mish]`.
+
+**Status bar (`Ctrl-^ u`).** A reverse-video top row, toggled on demand, shows
+live link and prediction health: the session name, the smoothed **RTT**, recent
+**packet loss** (the delta of QUIC's loss counters over the last minute),
+**prediction accuracy** and state over the last minute, and the current **peer
+address** (which changes when the connection roams). It shares the top row with
+the stall banner — the banner wins while the link is silent — and toggles off
+the same way.
 
 `mish-server` (run on the remote by the bootstrap, or standalone) binds a UDP
 port and prints `MISH CONNECT <port> <server-cert> <client-cert> <client-key>`

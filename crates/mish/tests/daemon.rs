@@ -79,6 +79,7 @@ async fn detach_survives_parent_exit() {
         clock,
         PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

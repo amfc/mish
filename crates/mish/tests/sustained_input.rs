@@ -55,6 +55,7 @@ async fn sustained_keystrokes_all_arrive() {
         clock.clone(),
         mish_terminal::predict::PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

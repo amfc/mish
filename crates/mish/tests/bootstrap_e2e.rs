@@ -53,6 +53,7 @@ async fn local_bootstrap_starts_server_and_connects() {
         clock,
         PredictMode::Never,
         None,
+        None, // session name (display-only)
         cin_rx,
         cout_tx,
     ));

@@ -46,6 +46,12 @@ const ADAPTIVE_SRTT_TRIGGER_LOW_MS: f64 = 20.0;
 /// correct, show them even on a marginal link. A misprediction resets it to 0.
 const CONFIDENCE_TRIGGER: u32 = 10;
 
+/// Window (ms) over which [`PredictionEngine::accuracy`] reports prediction
+/// accuracy for the client status bar: recent enough to reflect the current
+/// link/app, long enough to be a stable percentage. One minute, matching the
+/// status bar's loss window.
+const OUTCOME_WINDOW_MS: u64 = 60_000;
+
 /// Cap so confidence can't grow unboundedly (and so a recent misprediction's
 /// reset meaningfully delays re-enabling, rather than being instantly refilled).
 const CONFIDENCE_CAP: u32 = 20;
@@ -190,6 +196,12 @@ pub struct PredictionEngine {
     confirmed_epoch: u64,
     cols: u16,
     rows: u16,
+    /// Rolling record of prediction outcomes for the client status bar, one entry
+    /// per server confirmation: `(time_ms, correct, total)` where `total` is how
+    /// many confirmed predictions that update carried and `correct` how many
+    /// matched. Pruned to [`OUTCOME_WINDOW_MS`] in [`Self::new_server_screen`], so
+    /// [`Self::accuracy`] reports recent accuracy rather than a lifetime average.
+    outcomes: std::collections::VecDeque<(u64, u32, u32)>,
 }
 
 impl PredictionEngine {
@@ -221,6 +233,7 @@ impl PredictionEngine {
             confirmed_epoch: 0,
             cols: 0,
             rows: 0,
+            outcomes: std::collections::VecDeque::new(),
         }
     }
 
@@ -249,6 +262,55 @@ impl PredictionEngine {
     /// Toggle underlining of tentative predictions (default on).
     pub fn set_flagging(&mut self, on: bool) {
         self.flagging = on;
+    }
+
+    /// Record one server update's prediction tally and prune outcomes older than
+    /// [`OUTCOME_WINDOW_MS`], so [`Self::accuracy`] stays a recent-window meter.
+    /// A zero-total update is skipped (nothing was confirmed to score).
+    fn record_outcome(&mut self, now_ms: u64, correct: u32, total: u32) {
+        if total > 0 {
+            self.outcomes.push_back((now_ms, correct, total));
+        }
+        let cutoff = now_ms.saturating_sub(OUTCOME_WINDOW_MS);
+        while let Some(&(t, _, _)) = self.outcomes.front() {
+            if t < cutoff {
+                self.outcomes.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Prediction accuracy over the recent window for the client status bar:
+    /// `(total_confirmed, fraction_correct)`. `None` when no predictions have been
+    /// confirmed in the window (nothing to report — the bar shows a dash).
+    pub fn accuracy(&self, now_ms: u64) -> Option<(u32, f64)> {
+        let cutoff = now_ms.saturating_sub(OUTCOME_WINDOW_MS);
+        let (mut correct, mut total) = (0u64, 0u64);
+        for &(t, c, n) in &self.outcomes {
+            if t >= cutoff {
+                correct += c as u64;
+                total += n as u64;
+            }
+        }
+        (total > 0).then(|| (total as u32, correct as f64 / total as f64))
+    }
+
+    /// Whether the speculative overlay is currently being displayed (predictions
+    /// visible to the user), for the status bar's prediction status.
+    pub fn is_showing(&self) -> bool {
+        self.showing()
+    }
+
+    /// Whether predictions are currently flagged as glitchy (pending long enough
+    /// that the link looks stalled), for the status bar.
+    pub fn is_glitchy(&self) -> bool {
+        self.glitch_trigger > 0
+    }
+
+    /// The configured prediction mode, for the status bar.
+    pub fn mode(&self) -> PredictMode {
+        self.mode
     }
 
     /// Whether predictions should currently be displayed.
@@ -773,6 +835,11 @@ impl PredictionEngine {
         let mut visible_mispredict = false;
         let mut tentative_mispredict = false;
         let mut max_correct_epoch = prev_confirmed;
+        // Tally this update's confirmed cell predictions for the status-bar
+        // accuracy meter (cursor moves are excluded — a cell glyph is the
+        // outcome the user actually reads).
+        let mut n_correct: u32 = 0;
+        let mut n_total: u32 = 0;
         for p in &self.cells {
             if p.input_index > ack {
                 continue;
@@ -781,7 +848,9 @@ impl PredictionEngine {
                 .cell(p.row, p.col)
                 .map(|actual| actual.c == p.cell.c)
                 .unwrap_or(false);
+            n_total += 1;
             if correct {
+                n_correct += 1;
                 max_correct_epoch = max_correct_epoch.max(p.epoch);
             } else if p.epoch <= prev_confirmed {
                 visible_mispredict = true;
@@ -789,6 +858,7 @@ impl PredictionEngine {
                 tentative_mispredict = true;
             }
         }
+        self.record_outcome(now_ms, n_correct, n_total);
         // The cursor prediction, same treatment (mosh's
         // `ConditionalCursorMove::get_validity` → `IncorrectOrExpired`).
         if self.have_cursor && self.cursor_index <= ack {
@@ -999,6 +1069,32 @@ mod tests {
         s.echo_ack = ack;
         s.cursor_col = cursor_col;
         s
+    }
+
+    #[test]
+    fn accuracy_tracks_recent_outcomes() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch(); // established context, so predictions are visible
+        assert_eq!(p.accuracy(0), None, "nothing confirmed yet → no meter");
+
+        // Type 'x'; the server confirms it correctly at (0,0).
+        let base = screen_with_ack(20, 2, 0);
+        p.new_user_bytes(b"x", &base, 1, 0);
+        let mut good = confirmed_screen(20, 2, 1, 1);
+        good.cells[0].c = 'x';
+        p.new_server_screen(&good, 10);
+        assert_eq!(p.accuracy(10), Some((1, 1.0)), "one correct → 100%");
+
+        // Type 'y' (predicted at the new cursor col 1); the server contradicts it.
+        p.new_user_bytes(b"y", &good, 2, 20);
+        let mut bad = confirmed_screen(20, 2, 2, 1);
+        bad.cells[0].c = 'x'; // the already-confirmed glyph stays
+        bad.cells[1].c = 'Z'; // but 'y' was mispredicted here
+        p.new_server_screen(&bad, 30);
+        assert_eq!(p.accuracy(30), Some((2, 0.5)), "one of two correct → 50%");
+
+        // Both samples age out of the one-minute window.
+        assert_eq!(p.accuracy(30 + 60_001), None, "old outcomes drop from the window");
     }
 
     #[test]
