@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 # The cargo-fuzz crate links libFuzzer and only builds under `cargo fuzz`; keep
 # it out of normal workspace builds/tests.
-exclude = ["fuzz"]
+exclude = ["fuzz", "crates/.claude"]
 
 [workspace.package]
 edition = "2021"

@@ -28,9 +28,15 @@ pub enum PredictMode {
     Adaptive,
 }
 
-/// SRTT (ms) at or above which adaptive prediction switches on. Mirrors mosh's
-/// notion that prediction helps once the round-trip is perceptible.
-const ADAPTIVE_SRTT_TRIGGER_MS: f64 = 50.0;
+/// SRTT (ms) thresholds for switching adaptive prediction on/off, as a
+/// *hysteresis band* rather than a single cutoff (mosh's `SRTT_TRIGGER_HIGH` /
+/// `SRTT_TRIGGER_LOW`). The overlay turns **on** once SRTT rises above HIGH and
+/// turns **off** only once it falls back to/below LOW; in the band between, the
+/// previous on/off state is held. A single threshold would flap the overlay on
+/// and off frame-to-frame on a link hovering right at the cutoff — the band
+/// prevents that.
+const ADAPTIVE_SRTT_TRIGGER_HIGH_MS: f64 = 30.0;
+const ADAPTIVE_SRTT_TRIGGER_LOW_MS: f64 = 20.0;
 
 /// Number of *credited-correct* predictions (correct AND they changed the
 /// screen) that must accumulate before [`PredictMode::Adaptive`] will display
@@ -133,6 +139,11 @@ pub struct PredictionEngine {
     esc: EscPhase,
     /// Latest SRTT estimate (ms), for adaptive gating.
     srtt_ms: f64,
+    /// Whether the SRTT-based adaptive trigger is currently *latched on*. Updated
+    /// with hysteresis in [`Self::set_srtt`] (band between
+    /// [`ADAPTIVE_SRTT_TRIGGER_LOW_MS`] and [`ADAPTIVE_SRTT_TRIGGER_HIGH_MS`]
+    /// holds the previous state), so the overlay doesn't flap near the threshold.
+    srtt_showing: bool,
     /// Underline tentative (unconfirmed) predictions so they read as speculative
     /// (mosh's prediction "flagging").
     flagging: bool,
@@ -184,6 +195,7 @@ impl PredictionEngine {
             suppress: false,
             esc: EscPhase::None,
             srtt_ms: 0.0,
+            srtt_showing: false,
             flagging: true,
             resync_suppress: false,
             glitch_trigger: 0,
@@ -209,9 +221,16 @@ impl PredictionEngine {
         self.prediction_epoch = self.prediction_epoch.saturating_add(1);
     }
 
-    /// Update the SRTT estimate used by [`PredictMode::Adaptive`] gating.
+    /// Update the SRTT estimate used by [`PredictMode::Adaptive`] gating, and
+    /// re-evaluate the latched SRTT trigger with hysteresis: cross above HIGH to
+    /// latch on, fall to/below LOW to latch off, hold state in between.
     pub fn set_srtt(&mut self, srtt_ms: f64) {
         self.srtt_ms = srtt_ms;
+        if srtt_ms > ADAPTIVE_SRTT_TRIGGER_HIGH_MS {
+            self.srtt_showing = true;
+        } else if srtt_ms <= ADAPTIVE_SRTT_TRIGGER_LOW_MS {
+            self.srtt_showing = false;
+        }
     }
 
     /// Toggle underlining of tentative predictions (default on).
@@ -233,7 +252,7 @@ impl PredictionEngine {
             // pending long enough to look stalled (glitch trigger) — then we
             // surface the speculation so typing doesn't appear to vanish.
             PredictMode::Adaptive => {
-                self.srtt_ms >= ADAPTIVE_SRTT_TRIGGER_MS
+                self.srtt_showing
                     || self.confidence >= CONFIDENCE_TRIGGER
                     || self.glitch_trigger > 0
             }
@@ -992,6 +1011,31 @@ mod tests {
         // Laggy link: now the prediction is shown.
         p.set_srtt(120.0);
         assert_eq!(p.predicted_screen(&base).cell(0, 0).unwrap().c, 'x');
+    }
+
+    #[test]
+    fn adaptive_srtt_trigger_has_hysteresis() {
+        let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        p.prime_epoch();
+        let base = screen_with_ack(20, 2, 0);
+        p.new_user_bytes(b"x", &base, 1, 0);
+        let shown = |p: &PredictionEngine| p.predicted_screen(&base).cell(0, 0).unwrap().c == 'x';
+
+        // Starts off; below LOW stays off.
+        p.set_srtt(10.0);
+        assert!(!shown(&p));
+        // In the band (LOW, HIGH] while off → still off (no premature flip).
+        p.set_srtt(25.0);
+        assert!(!shown(&p), "band must not turn the overlay on from off");
+        // Above HIGH → latch on.
+        p.set_srtt(35.0);
+        assert!(shown(&p));
+        // Back into the band while on → stays on (no flap).
+        p.set_srtt(25.0);
+        assert!(shown(&p), "band must hold the overlay on once latched");
+        // At/below LOW → latch off.
+        p.set_srtt(20.0);
+        assert!(!shown(&p));
     }
 
     #[test]
