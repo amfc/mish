@@ -32,6 +32,7 @@
 //!   --predict <mode>   adaptive|always|never|experimental (default: adaptive);
 //!     -a/-n            also via MOSH_PREDICTION_DISPLAY; -a=always, -n=never
 //!   --no-init          don't enter the alternate screen (MOSH_NO_TERM_INIT)
+//!   --perf-log <path>  record per-keystroke keypress→display latency (JSON lines)
 //!   -L [bind:]port:host:hostport  forward a local port to a remote target (ssh -L)
 //!   -R [bind:]port:host:hostport  forward a remote port to a local target (ssh -R)
 //!   --version          print version and exit
@@ -137,6 +138,10 @@ struct Options {
     log_file: Option<std::path::PathBuf>,
     /// Max verbosity for the event log (`--log-level`, default debug).
     log_level: tracing::Level,
+    /// Record per-keystroke keypress→display latency as JSON lines here
+    /// (`--perf-log`); `None` disables it. Used to reproduce the Mosh paper's
+    /// response-time graph from a real session (see `perf/`).
+    perf_log: Option<std::path::PathBuf>,
 }
 
 /// Resolve a `--predict` / `MOSH_PREDICTION_DISPLAY` mode name. `experimental`
@@ -183,6 +188,7 @@ fn parse_args() -> Result<Options> {
         command: None,
         log_file: None,
         log_level: tracing::Level::DEBUG,
+        perf_log: None,
     };
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -257,6 +263,9 @@ fn parse_args() -> Result<Options> {
             "--log-level" => {
                 opts.log_level = mish::trace::parse_level(&args.next().context("--log-level needs a LEVEL")?);
             }
+            "--perf-log" => {
+                opts.perf_log = Some(args.next().context("--perf-log needs a PATH")?.into());
+            }
             "--version" => {
                 println!("mish-client (mish) {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -303,6 +312,7 @@ fn print_usage() {
          \x20 --attach IP PORT     attach to a running server ($MISH_CONNECT creds; for testing)\n\
          \x20 --log-file <path>    write a JSON event log (for debugging)\n\
          \x20 --log-level <lvl>    log verbosity: error|warn|info|debug|trace (default debug)\n\
+         \x20 --perf-log <path>    record per-keystroke keypress->display latency (JSON lines)\n\
          \x20 --version            print version and exit\n\
          \x20 -h, --help           show this help\n\n\
          env: MOSH_PREDICTION_DISPLAY, MOSH_NO_TERM_INIT, MOSH_ESCAPE_KEY"
@@ -332,6 +342,15 @@ async fn main() -> Result<()> {
         }
     }
     tracing::info!(target: "mish::client", local = opts.local, "client starting");
+
+    // Optional keystroke-latency recording (--perf-log): like the event log,
+    // install the global recorder before the session runs so every keystroke is
+    // captured. See `perf/` for turning the log into the Mosh-paper CDF.
+    if let Some(path) = &opts.perf_log {
+        if let Err(e) = mish::perf::init(path) {
+            eprintln!("[mish-client] warning: could not open perf log {}: {e}", path.display());
+        }
+    }
 
     // Raw attach (--attach IP PORT): connect directly to a running server with
     // credentials from $MISH_CONNECT, no bootstrap. (Used by test harnesses;
@@ -444,6 +463,11 @@ async fn main() -> Result<()> {
 /// server/SSH child, so there is nothing left to clean up: exit now.
 fn exit_now() -> ! {
     use std::io::Write;
+    // Flush the perf log (no-op without --perf-log): we exit via `process::exit`,
+    // which runs no destructors, so the recorder's buffered tail must be flushed
+    // here. `run_client` already flushes on a clean session end; this covers the
+    // `--attach` path and any early exit.
+    mish::perf::finish();
     let _ = std::io::stdout().flush();
     std::process::exit(0);
 }

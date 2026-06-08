@@ -1,0 +1,43 @@
+{
+  "_comment": [
+    "APPROXIMATE reference curves for the keystroke-response-time CDF from the",
+    "Mosh paper, for visual context only — NOT digitized point-for-point from the",
+    "figure. The shapes reproduce the paper's qualitative result and are pinned to",
+    "its quoted headline statistics; replace the points below with exact digitized",
+    "values if you need a precise overlay.",
+    "",
+    "Source: Keith Winstein and Hari Balakrishnan, 'Mosh: An Interactive Remote",
+    "Shell for Mobile Clients', USENIX ATC 2012 (Figure 2, 'keystroke response",
+    "time'). Quoted: over a commercial EV-DO (3G) network, Mosh displayed ~70% of",
+    "keystrokes instantly via predictive local echo, with a median keystroke",
+    "response time < 5 ms, versus 503 ms for SSH.",
+    "",
+    "Each curve is a list of [response_ms, cumulative_fraction] points defining a",
+    "CDF (fraction of keystrokes displayed within response_ms)."
+  ],
+  "citation": "Winstein & Balakrishnan, \"Mosh\", USENIX ATC 2012 (Fig. 2) — approximate, illustrative",
+  "network": "commercial EV-DO (3G); Mosh median <5 ms, SSH median 503 ms",
+  "approximate": true,
+  "curves": {
+    "Mosh (paper, ~3G)": [
+      [0.0, 0.0],
+      [1.0, 0.55],
+      [5.0, 0.70],
+      [50.0, 0.74],
+      [200.0, 0.82],
+      [400.0, 0.90],
+      [800.0, 0.97],
+      [1500.0, 1.0]
+    ],
+    "SSH (paper, ~3G)": [
+      [60.0, 0.0],
+      [200.0, 0.08],
+      [350.0, 0.25],
+      [503.0, 0.50],
+      [650.0, 0.65],
+      [900.0, 0.83],
+      [1500.0, 0.95],
+      [3000.0, 1.0]
+    ]
+  }
+}

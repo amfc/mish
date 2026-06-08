@@ -660,6 +660,20 @@ impl PredictionEngine {
     pub fn active_predictions(&self) -> usize {
         self.cells.len()
     }
+
+    /// Whether the input event at `idx` (a `UserStream::total()` value) is being
+    /// *displayed right now* as predictive local echo — i.e. predictions are
+    /// showing and this keystroke contributed a visible cell or a cursor move.
+    /// Used by the client's perf recorder to tell a locally-echoed keystroke
+    /// (response ≈ 0) from one still waiting on the server. Because a keystroke is
+    /// only registered just before this is queried, the server has not yet acked
+    /// it (`echo_ack < idx`), so any prediction tagged with `idx` is necessarily
+    /// overlaid by [`Self::predicted_screen`] when [`Self::showing`] holds.
+    pub fn displaying_input(&self, idx: u64) -> bool {
+        self.showing()
+            && (self.cells.iter().any(|p| p.input_index == idx)
+                || (self.have_cursor && self.cursor_index == idx))
+    }
 }
 
 #[cfg(test)]
@@ -680,6 +694,25 @@ mod tests {
         s.echo_ack = ack;
         s.cursor_col = cursor_col;
         s
+    }
+
+    #[test]
+    fn displaying_input_tracks_shown_keystrokes() {
+        // Always mode: a freshly typed key at input index 2 is displayed locally.
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 3, 0);
+        p.new_user_bytes(b"hi", &base, 2, 0);
+        assert!(p.displaying_input(2), "the typed keystroke is locally echoed");
+        assert!(!p.displaying_input(99), "an unrelated index is not displayed");
+
+        // Adaptive mode below the SRTT trigger: predictions tracked but not shown,
+        // so the keystroke is *not* counted as locally displayed.
+        let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        p.set_srtt(5.0);
+        p.new_user_bytes(b"x", &base, 1, 0);
+        assert!(!p.displaying_input(1), "hidden prediction is not displayed");
+        p.set_srtt(120.0); // laggy link → now shown
+        assert!(p.displaying_input(1), "shown once the link is laggy");
     }
 
     #[test]

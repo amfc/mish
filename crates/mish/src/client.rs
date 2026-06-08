@@ -316,11 +316,21 @@ pub async fn run_client<T: Transport>(
                     Some(ClientInput::Keys(b)) => {
                         // Any keystroke returns to the live screen and is forwarded.
                         exit_scroll!();
+                        let press_ms = clock.now_ms();
                         stream.push_keystroke(b.clone());
                         handle.set_local(stream.clone());
+                        let idx = stream.total();
                         // Speculatively echo the keystroke immediately.
-                        engine.new_user_bytes(&b, &server_screen, stream.total(), clock.now_ms());
+                        engine.new_user_bytes(&b, &server_screen, idx, press_ms);
                         repaint!();
+                        // Perf (`--perf-log`): record keypress→display latency. A
+                        // no-op without the flag; when on, whether the key is being
+                        // locally echoed *now* decides response ≈ 0 (predicted) vs
+                        // the server round-trip (resolved later in the ack arm).
+                        if crate::perf::enabled() {
+                            let shown = engine.displaying_input(idx);
+                            crate::perf::on_keystroke(idx, press_ms, shown, b.len());
+                        }
                     }
                     Some(ClientInput::Resize { cols, rows }) => {
                         exit_scroll!();
@@ -410,13 +420,22 @@ pub async fn run_client<T: Transport>(
                     tracing::info!(target: "mish::client", "client: remote driver stopped; ending session");
                     break; // driver stopped
                 }
+                let now = clock.now_ms();
                 server_screen = remote.borrow_and_update().clone();
                 // Validate/cull predictions against the freshly-confirmed screen.
-                engine.new_server_screen(&server_screen, clock.now_ms());
+                engine.new_server_screen(&server_screen, now);
+                // Perf: finalize any keystrokes this screen confirms (no-op
+                // without --perf-log). `echo_ack` is the server's applied-input
+                // count, so all pending keys with idx <= it round-tripped by now.
+                crate::perf::on_ack(server_screen.echo_ack, now);
                 repaint!();
             }
         }
     }
+
+    // Flush any displayed-but-unconfirmed keystrokes to the perf log before we
+    // tear down (no-op without --perf-log).
+    crate::perf::finish();
 
     // Clean shutdown: ask the peer to close, then wait briefly for the driver to
     // finish the handshake.

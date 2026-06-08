@@ -170,6 +170,14 @@ minority — and the moment after you press Enter — actually feel, and it's wh
 the network shows through. mish and mosh predict equally well, so the
 comparison that matters is the round-trip column.
 
+**Measuring it from a real session.** The bench harness above is a synthetic A/B;
+to see the paper's keystroke-response-time CDF for *your own* typing, run the
+client with `--perf-log PATH` over a real link. It records, from inside the
+client, the keypress→display latency of every keystroke (predicted echo ≈ 0 ms,
+unpredicted ≈ the round-trip), and `perf/perf-latency-graph.py` renders the CDF
+in the style of the Mosh paper's Figure 2 with its Mosh/SSH curves overlaid. See
+[`perf/README.md`](perf/README.md).
+
 ## The one residual, and why it isn't what it looks like
 
 Under BRUTAL — the synthetic worst case (140 ms RTT + bursts + 10 % reorder) —

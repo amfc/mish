@@ -1,0 +1,7 @@
+# Python venv for the grapher (recreate with the README recipe).
+.venv/
+# Recorded perf logs and rendered graphs are local artifacts, not source.
+*.jsonl
+*.png
+*.pdf
+*.svg
