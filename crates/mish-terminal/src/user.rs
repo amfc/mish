@@ -12,6 +12,26 @@ use std::collections::VecDeque;
 use mish_ssp::state::SyncState;
 use serde::{Deserialize, Serialize};
 
+/// Upper bound on the number of event bodies the *receiver* (server) retains in
+/// a single reconstructed `UserStream`.
+///
+/// The receiver only ever *reads* the suffix it has not yet processed (via
+/// [`UserStream::events_since`]); older event bodies are dead weight kept solely
+/// because [`SyncState::apply_diff`] appends. Without a bound the deque grows
+/// without limit — both as a slow leak on any long-lived session (the receiver,
+/// unlike the sender, never trims as the peer keeps typing) and as a post-auth
+/// memory-amplification DoS: a peer can stream input while pinning
+/// `throwaway_num` so the SSP core can't GC the snapshots that hold these
+/// streams (see `core::SspCore::recv`). We trim from the *front*, which preserves
+/// [`UserStream::total`] and therefore both the idempotent `abs >= total`
+/// accounting and the `old_num -> new_num` diff chain. The cap is far above any
+/// legitimate unprocessed backlog — the server drains the whole newest stream on
+/// every datagram through the latest-wins `watch` channel — so a real session
+/// never drops unread input; only a flooding/stalled peer ever reaches it, and
+/// it only harms its own connection. Mirrors the byte caps in `frag.rs` and the
+/// `max_received_states` quench.
+const MAX_RETAINED_EVENTS: usize = 1 << 16;
+
 /// One unit of user input.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum UserEvent {
@@ -53,6 +73,12 @@ impl UserStream {
 
     pub fn push_resize(&mut self, cols: u16, rows: u16) {
         self.push(UserEvent::Resize { cols, rows });
+    }
+
+    /// Number of event bodies currently retained (after front-trimming). Bounded
+    /// by `MAX_RETAINED_EVENTS`; useful for diagnostics and the retention test.
+    pub fn retained_len(&self) -> usize {
+        self.events.len()
     }
 
     /// Iterate events whose absolute index is `>= from`. The server calls this
@@ -115,6 +141,14 @@ impl SyncState for UserStream {
             if abs >= total {
                 self.events.push_back(ev);
             }
+        }
+        // Bound retained event bodies so a flooding/stalled peer can't grow this
+        // stream without limit. Trimming the front advances `base` and leaves
+        // `total()` unchanged, so the idempotent `abs >= total` guard above and
+        // the SSP diff chain are unaffected — see `MAX_RETAINED_EVENTS`.
+        while self.events.len() > MAX_RETAINED_EVENTS {
+            self.events.pop_front();
+            self.base += 1;
         }
     }
 

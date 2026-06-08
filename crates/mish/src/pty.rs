@@ -12,6 +12,12 @@ use tokio::sync::mpsc;
 
 use crate::server::PtyControl;
 
+/// Environment variables that may carry session credentials and must never be
+/// inherited by the spawned login shell (where any same-user process could read
+/// them via `/proc/<pid>/environ`). `MISH_CONNECT` holds the full connect line
+/// including the client private key; `MOSH_KEY` is the mosh-style session key.
+const SENSITIVE_ENV_VARS: &[&str] = &["MISH_CONNECT", "MOSH_KEY"];
+
 /// A spawned child process on a PTY, exposed as channels.
 pub struct PtyProcess {
     /// Child output bytes (stdout + stderr on the PTY).
@@ -54,6 +60,15 @@ impl PtyProcess {
 
         let mut cmd = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
         cmd.env("TERM", "xterm-256color");
+        // Scrub credential-bearing vars before the login shell inherits the
+        // server's environment. The session key normally rides the SSH-encrypted
+        // `MISH CONNECT` stdout line (never an env var), but if the server was
+        // ever launched with one of these set (nested invocation, CI, the
+        // `--attach` test harness), it would otherwise be readable by any
+        // same-user process via /proc/<shell-pid>/environ or `ps -E`.
+        for var in SENSITIVE_ENV_VARS {
+            cmd.env_remove(var);
+        }
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave); // child holds the slave now
 

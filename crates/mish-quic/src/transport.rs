@@ -96,6 +96,12 @@ impl Transport for QuicTransport {
         // so the fragmenter never produces 1-byte fragments.
         self.conn.max_datagram_size().unwrap_or(1200).max(512)
     }
+
+    fn rtt(&self) -> Option<std::time::Duration> {
+        // quinn's smoothed RTT (RFC 9002) — reorder- and retransmit-robust, unlike
+        // the SSP layer's own timestamp sampling. The core uses it for cadence/RTO.
+        Some(self.conn.rtt())
+    }
 }
 
 /// Build a server endpoint bound to `addr` (use port 0 for an ephemeral port).

@@ -12,12 +12,17 @@ boundary is explicit.
   - With `--bootstrap=ssh` (the default when `ssh` is present) this is the system
     OpenSSH client, with its full host-key / agent / config handling.
   - With `--bootstrap=builtin` the SSH layer is our own [`russh`] client. It
-    still verifies the server against `~/.ssh/known_hosts` and **rejects a key
-    mismatch**, but — unlike OpenSSH's interactive prompt — an *unknown* host is
-    accepted trust-on-first-use (logged, not persisted). So the bootstrap channel
-    is confidential and integrity-protected against a passive attacker, but a
-    first-contact active MITM on an unknown host is not caught; `--bootstrap=ssh`
-    is the stricter choice when that matters. Auth supports the ssh-agent,
+    verifies the server against `~/.ssh/known_hosts` and **rejects a key
+    mismatch**. For an *unknown* host it now behaves like OpenSSH's
+    `StrictHostKeyChecking=ask`: it **prompts on the controlling terminal**
+    (showing the SHA256 fingerprint) and, on acceptance, **records the key to
+    `known_hosts`** so a later key change is caught as a possible MITM. With no
+    terminal to prompt on it **fails closed** (refuses). `$MISH_STRICT_HOST_KEYS`
+    overrides this: `accept-new` records without prompting (for automation),
+    `yes` refuses any not-already-known host. A first-contact active MITM is still
+    only as strong as the user's verification of the displayed fingerprint, so
+    `--bootstrap=ssh` remains the stricter choice when that matters. Auth supports
+    the ssh-agent,
     identity files (incl. **passphrase-protected** keys, prompted on the TTY),
     keyboard-interactive, and password — the latter two prompt for and send a
     secret, but only over this confidential, host-verified channel. `ProxyJump`

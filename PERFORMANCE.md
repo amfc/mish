@@ -87,7 +87,7 @@ All transport config lives in `crates/mish-quic/src/config.rs`.
 | **prospective resend** | on (mosh's optimization) | when nearly free, anchor a diff on the *acked* state, so a single lost datagram recovers a round-trip sooner |
 | **per-instruction deflate** | on, for payloads > 64 B | terminal diffs are redundant; smaller datagrams = fewer fragments = less loss exposure (tiny keystrokes/acks skip it) |
 | **keepalive / idle** | 5 s / 60 s | keep the link warm and NAT bindings alive across naps and roaming |
-| **congestion controller** | Cubic (BBR opt-in via `MISH_CC=bbr`) | Cubic is fine once pacing is gone; BBR (no cwnd collapse on loss) is an experimental escape hatch |
+| **congestion controller** | Cubic (BBR opt-in via `MISH_CC=bbr`) | Cubic is fine once pacing is gone; BBR (no cwnd collapse on loss) was A/B'd and did **not** narrow the BRUTAL tail (see residual section), so Cubic stays default — the opt-in remains as an escape hatch |
 
 ### What we deliberately *don't* do (mosh-aligned)
 
@@ -215,6 +215,169 @@ instrumented the transport three independent ways:
 > internals to diff per-keystroke recovery timing — a large effort for a small,
 > tail-only delta under one pathological condition.
 
+We did, however, test the most fixable suspect directly. The prime hypothesis was
+Cubic's multiplicative **cwnd collapse** on loss (back off the window in a burst,
+throttle the next keystrokes). QUIC's BBR controller doesn't collapse cwnd on
+loss, so it's a clean A/B: if cwnd collapse fattens the tail, BBR flattens it.
+Re-running the 300-sample BRUTAL keyboard-off A/B with `MISH_CC=bbr` against the
+Cubic baseline, with the **mosh row as a cross-run anchor** (mosh ignores
+`MISH_CC`, so it calibrates how comparable the two sessions' conditions were):
+
+| BRUTAL kbd-off p90 | Cubic | BBR |
+| --- | --- | --- |
+| mish | 645.8 ms | 715.6 ms |
+| mosh (anchor) | 327.3 ms | 357.0 ms |
+| **mish / mosh ratio** | **1.97×** | **2.00×** |
+
+The anchor-normalized ratio is **unchanged** — the absolute rise in the BBR column
+is entirely the BBR session running ~9 % hotter (the mosh anchor rose in lockstep),
+and the per-seed-median spread didn't tighten either (sd 23.7 → 23.6). **BBR does
+not narrow the tail**, which **rules out cwnd collapse** as the cause and is why
+Cubic stays the default.
+
+### Pinning the tail: it's the SSP core's retry timing, not quinn
+
+With the transport probes and the BBR A/B all pointing *away* from quinn, we pinned
+the cause directly with a **deterministic, quinn-free probe** (`mish-ssp`'s
+`examples/tail_probe.rs`): two bare `SspCore`s exchanging keystroke→echo round trips
+over a virtual-time link whose loss/delay/reorder model is copied byte-for-byte from
+the bench relay. Same BRUTAL impairment, *zero* QUIC. The protocol alone reproduces
+the tail:
+
+| BRUTAL kbd-off (15×200 samples) | median | p90 |
+| --- | --- | --- |
+| sim — SSP core only, **no quinn** | 188 ms | **568 ms** |
+| mish real (core + quinn) | 201 ms | 646 ms |
+| mosh real | 195 ms | 327 ms |
+
+The core *by itself* produces a 568 ms p90; quinn adds only the remaining ~80 ms
+(the per-packet framing the three transport probes already measured). **So the tail
+is in the State Synchronization Protocol, not the transport.** Bisecting it in the
+sim isolates the mechanism cleanly:
+
+- **Send cadence is not it.** Forcing the data-frame interval from `[20,250]` down
+  to a flat 20 ms changed the p90 by noise (568 → 561). The latency-paced re-diff
+  cadence is *not* what gates recovery.
+- **`prospective_resend` is not it** (568 → 567 with it off).
+- **The retransmission timeout (RTO) is.** Capping `rto` 1000 → 200 ms cut the p90
+  to 484 with no median cost; the live stack agreed — `MISH_SSP_RTO=250` moved the
+  real mish p90 645.8 → 551.6 (anchored ratio 1.97 → 1.60), median unchanged.
+
+The reason cadence is irrelevant and RTO dominates is in `calculate_timers`: after
+every (re)send, `update_assumed_receiver_state` immediately re-grants the
+just-sent state benefit-of-the-doubt, so `current == assumed` and the sender drops
+into the *"unacked but assumed-delivered → wait a full `timeout()`"* branch. **Each
+retry therefore waits a whole RTO + `ack_delay`, never the frame interval.** Under
+BRUTAL the +80 ms reordered packets inflate `rttvar`, ballooning
+`RTO = srtt + 4·rttvar` (removing just the reorder drops the sim p90 568 → 481), and
+a keystroke caught in a deep burst eats several of those RTO-spaced retries.
+
+mosh — running the same protocol but its own C++ implementation — tails ~240 ms
+thinner at p90, so this is a recovery-timing **divergence from mosh in our port**,
+not a cost inherent to QUIC.
+
+### Two candidate fixes, and what the live bench said about each
+
+The mechanism suggests two levers. The probe and the live bench disagree about
+which one actually works — a useful lesson in not trusting a synthetic-burst sim
+past the thing it was validated on.
+
+**(a) Retry faster after loss (`ResendMode`).** Re-poking at the frame interval
+during the unacked window instead of waiting a full RTO. In the sim this is dramatic
+— flat frame-rate retries collapse the p90 568 → 366 and cut the spread 3×
+(sd 296 → 100). A loss-gated variant (`FrameRateOnLoss`: stay optimistic for one RTO,
+escalate to frame-rate only once loss is confirmed) was added to try to keep the
+no-loss median; in the sim it lands at p90 399 / median 250. **But on the live stack
+it did essentially nothing:** `MISH_SSP_RESEND=frame_on_loss` left the BRUTAL p90
+at an anchored 1.91× (vs the 1.97× baseline — noise). The reason is burst *depth*:
+the sim's synthetic Gilbert bursts drop several packets in a row, so a faster 2nd/3rd
+retry helps; real BRUTAL tail keystrokes mostly need a **single** retransmit, so
+there are no later retries to speed up — the cost is the *first-detection* RTO. The
+modes stay as `ResendMode` knobs (default `Rto`, unchanged) but are not the fix.
+
+**(b) Shrink the first-detection RTO — this is the one that works.** Capping the RTO
+attacks the detection latency directly, and BRUTAL inflates that RTO precisely
+because the +80 ms reordered acks pump `rttvar` into `srtt + 4·rttvar`. Validated on
+the live stack (`MISH_SSP_RTO`, mosh row as cross-run anchor), **median-preserving
+throughout**:
+
+| BRUTAL kbd-off (live) | mish p90 | mish median | mish / mosh p90 |
+| --- | --- | --- | --- |
+| RTO = 1000 (default) | 645.8 ms | 201.2 ms | **1.97×** |
+| RTO = 250 | 551.6 ms | 200.8 ms | 1.60× |
+| RTO = 180 | 483.3 ms | 201.9 ms | **1.37×** |
+
+The tail shrinks from 1.97× → 1.37× of mosh with the median pinned at ~201 ms. (The
+sim agreed on direction — `rto` 1000→200 cut its p90 568→484 — and on the floor: a
+too-low `rto`=100 wrecks the median, 188→256, from spurious early retransmits.)
+
+### The shipped fix: derive the RTO from the transport's *base* RTT
+
+An absolute RTO cap can't be the default — 180 ms sits below the RTT on a genuinely
+slow link and would cause constant spurious retransmits. The robust form is to make
+the RTO track the path's *base* RTT rather than a reorder-inflated estimate. That's
+exactly what **mosh** does: its `Connection` (network.cc) stamps every packet with a
+monotonic `seq` and excludes out-of-order packets from the RTT estimator
+(`if p.seq < expected_receiver_seq { return p.payload; }` — the payload still feeds
+state sync, but never the RTT), so BRUTAL's +80 ms reordered acks never inflate its
+`SRTT`/`RTTVAR`. Mosh's sender branch logic is otherwise identical to ours (verified:
+it also waits a full `timeout()+ACK_DELAY` between retransmits) — the *only* reason
+its tail is thinner is that its RTO stays small.
+
+We tried two robust ways to estimate that base RTT.
+
+**First attempt — consume quinn's RTT.** We're on QUIC, which already maintains a
+reorder/retransmit-robust RTT (RFC 9002), so we surfaced `Transport::rtt()` and fed
+it to the core. A wrinkle the bench exposed: quinn's *smoothed* RTT is itself
+inflated under BRUTAL (loss + ack-delay), so `RTO = 2·srtt` gave no improvement
+(anchored 1.95×). Tracking the **minimum** of quinn's reported RTT — an estimate of
+the base RTT, immune to that inflation — and setting `RTO = 1.5 · min_rtt` worked
+(1.59×, median preserved). But quinn only exposes the *smoothed* RTT publicly
+(`min_rtt` lives in `RttEstimator`/BBR internals and the maintainers won't surface
+it), so we were taking the min of a smoothed value — noisy across runs, and a
+standing dependency on a thin, grudging API.
+
+**Shipped fix — our own seq + internal `min_rtt`.** So we ported mosh's mechanism:
+a monotonic per-packet `Instruction::seq` (protocol v2) and the same reorder guard
+in `recv` — a packet whose `seq` is below the highest seen is excluded from RTT
+sampling (its state is still applied; only timing is protected). Two findings:
+
+- **The seq guard *alone* didn't move the tail** (2.05× — noise). The bench types
+  one key at a time and waits for the echo, so packets in each direction are spaced
+  ~a round-trip apart; a +80 ms reorder almost never leapfrogs a packet sent ~200 ms
+  later, so there are essentially no seq-inversions for the guard to filter. (It
+  *does* matter under packet streaming — fast typing, screen bursts — which this
+  benchmark doesn't exercise; see "what the sim/bench miss" in the residual notes.)
+- **The win is the clean internal `min_rtt`** the guard enables: we track the
+  minimum of the (seq-guarded) RTT samples and set `RTO = 1.5 · min_rtt`. A minimum
+  is naturally robust — loss, reorder, and jitter only ever *add* to a sample, never
+  lower it — so it tracks the true base RTT without needing quinn at all.
+
+| BRUTAL kbd-off (live, mosh-anchored) | mish p90 | median | mish / mosh p90 | per-seed sd |
+| --- | --- | --- | --- | --- |
+| baseline (`srtt + 4·rttvar`, no guard) | 645.8 ms | 201.2 ms | **1.97×** | 22.5 |
+| seq-guard alone (still `srtt+4·rttvar`) | 666.9 ms | 201.7 ms | 2.05× (no help) | 16.8 |
+| quinn **min** RTT × 1.5 | 546.2 ms | 200.6 ms | 1.59× | 18.0 |
+| **seq-guard + internal min RTT × 1.5 (default)** | **529.9 ms** | **200.7 ms** | **1.58×** | 28.2 |
+
+The shipped default cuts the BRUTAL tail 1.97× → 1.58× of mosh with the median
+pinned at ~201 ms, and — unlike the quinn path — is **fully self-contained**: no
+dependency on the transport's RTT API. `RTO = rto_srtt_factor · min_rtt` (default
+1.5×) scales correctly on a slow link (large base RTT ⇒ large RTO) and needs no
+magic constant; `MISH_SSP_RTO_FACTOR` and an absolute cap `MISH_SSP_RTO` remain
+for tuning, and `MISH_SSP_RTT_SRC=quinn` selects the transport-RTT path for A/B.
+Because this lever lives in the internal estimator, the **deterministic sim now
+shows it too** (BRUTAL p90 568 → 499) — the first of these RTT fixes that does.
+
+It still doesn't fully reach mosh (1.58×, not 1.0×), and that residual is *not* the
+RTO anymore — it's two things QUIC imposes that mosh avoids: (1) the ~2–3 ms
+per-packet QUIC framing, which over a multi-round-trip burst recovery compounds into
+the ~80 ms the sim attributes to the transport (protocol-only sim 568 vs real
+mish 646); and (2) mosh measures a marginally cleaner base RTT via its dedicated
+Connection-layer seq than we recover from `min` of the app-layer samples. In short:
+the *recovery-timing* divergence is closed; what's left is the cost of riding a real
+transport, which predictive echo hides at ~2 ms regardless.
+
 That's the honest bottom line: across everything a real session encounters —
 including heavy and bursty loss — mish matches mosh at the median, with a
 slightly heavier tail only under a synthetic worst case, demonstrably not the
@@ -233,3 +396,52 @@ it runs mish only). `BENCH_ONLY=LOSSY,BRUTAL` restricts to a subset for a fast
 A/B. Always benchmark a **release** build — a debug mish vs. the release system
 `mosh` is an unfair comparison. See `crates/bench-harness/README.md` for the full
 methodology, the floor/`rt`/`loc` tagging, and how the loss models are configured.
+
+### Reproducing the tail investigation
+
+The 300-sample BRUTAL keyboard distribution (mean/sd/p90, the `[stats]` lines) and
+the SSP-timing A/B knobs:
+
+```sh
+# 300-sample (15 seeds × 20) BRUTAL keyboard-off distribution, both clients:
+BENCH_ONLY=BRUTAL BENCH_KBD_ONLY=1 BENCH_SEEDS=15 BENCH_KSAMPLES=20 MISH_STATS=1 \
+  cargo run -p bench-harness --release --bin bench-harness
+
+# SSP recovery-timing levers (mosh ignores them, so its row stays a clean anchor):
+MISH_SSP_RTO_FACTOR=1.5 ...   # RTO = factor · base(min) RTT — the shipped fix (default 1.5)
+MISH_SSP_RTT_SRC=quinn  ...   # base RTT from quinn's min instead of our seq-guarded min (A/B)
+MISH_SSP_RTO=180        ...   # hard cap on the RTO (ms); absolute, so unsafe as a default
+MISH_SSP_RESEND=frame_on_loss ...  # loss-gated frame-rate retries — helps the sim, not the bench
+MISH_CC=bbr             ...   # BBR congestion controller (ruled out above)
+
+# Deterministic, quinn-free protocol probe (instant; isolates core from transport):
+cargo run -p mish-ssp --release --example tail_probe -- BRUTAL   # COND ∈ {LAN-ish via WAN,LOSSY,BURSTY,REORDER,BRUTAL,BRUTAL_NOREORDER}
+RESEND=rto|frame|frame_on_loss   RTO=<ms>   SEND_MIN=<ms>   PROSPECTIVE=0|1   ./target/release/examples/tail_probe BRUTAL
+
+# Deterministic, quinn-IN-THE-LOOP probe (instant; the real QUIC stack over turmoil):
+cargo run -p mish-quic --features turmoil --example turmoil_latency -- BRUTAL   # COND ∈ {LAN,WAN,LOSSY,BURSTY,BRUTAL}
+MISH_SSP_RTO_FACTOR=1.5  KEYS=300  cargo run -p mish-quic --features turmoil --example turmoil_latency -- BRUTAL
+```
+
+### Three harnesses, and what each one sees
+
+The tail investigation surfaced a fidelity ladder — each rung adds realism, and a
+fix that moves one rung may not move another, so it pays to know which is which:
+
+| harness | transport | clock | what it captures | what it misses |
+| --- | --- | --- | --- | --- |
+| `tail_probe` (mish-ssp) | none (sans-IO core) | virtual | the SSP protocol + recovery timing, instantly & deterministically | QUIC entirely; reorder only bites when packets stream |
+| `turmoil_latency` (mish-quic) | **real quinn** | turmoil (simulated) | QUIC framing / acks / RTT estimator / congestion control, deterministically & instantly | a *real* OS network stack and scheduler |
+| `bench-harness` (mish-ssp) | real quinn + real `mosh` | wall-clock | the true A/B against upstream mosh through one relay | reproducibility; it's slow and noisy |
+
+Two concrete cases this ladder explains: (1) the **`frame_on_loss`** retry change
+helped `tail_probe` but not the bench — its synthetic bursts are deeper than what
+quinn's real datagram pacing produces, so faster *subsequent* retries had nothing to
+bite. (2) The **seq guard** moves neither `tail_probe` nor the bench's
+*keyboard* number, because both type one key at a time and wait — packets never
+stream closely enough to reorder; the guard earns its keep under fast typing / screen
+bursts, a workload none of these three exercises yet (a streaming mode is the obvious
+next sim upgrade). The RTT/RTO fix, by contrast, shows on all three — which is why we
+trust it. `turmoil_latency` exists so that QUIC-in-the-loop questions no longer
+*require* the slow wall-clock bench: it resolves the RTO lever cleanly (BRUTAL p90
+≈478 ms at `rto_factor=1.5` vs ≈908 ms at 5.0).

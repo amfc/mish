@@ -121,3 +121,24 @@ jobs:
             fi
             cargo fuzz run "$t" -- -max_total_time=40 -print_final_stats=1
           done
+
+  kani:
+    name: kani (bounded proofs on the reassembler + screen geometry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Bounded model checking, the complete complement to the sampled fuzz
+      # targets. Two crates carry the index/arithmetic surface a solver can
+      # discharge:
+      #   * mish-ssp  — the reassembler's header decode, the `index < count`
+      #     guard, and the `buffered` byte accounting (crates/mish-ssp/src/
+      #     kani_proofs.rs);
+      #   * mish-terminal — the screen path's geometry core: `resized_view`'s
+      #     crop/pad stays in bounds and rectangular, and `cell` is a sound
+      #     bounds-checked accessor (crates/mish-terminal/src/kani_proofs.rs).
+      # Both are panic- and overflow-free for *every* input within the harness
+      # bounds. Harnesses are `#[cfg(kani)]`; the action pulls its own pinned
+      # nightly + CBMC backend.
+      - uses: model-checking/kani-github-action@v1
+        with:
+          args: "-p mish-ssp -p mish-terminal"

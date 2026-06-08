@@ -104,6 +104,11 @@ struct CellPrediction {
     /// Monotonic time (ms) this prediction was made, for the long-pending
     /// "glitch" aging (mosh's `ConditionalOverlay::prediction_time`).
     predicted_at_ms: u64,
+    /// The prediction epoch this was made in (mosh's `tentative_until_epoch`).
+    /// The prediction is only *displayed* once [`PredictionEngine::confirmed_epoch`]
+    /// reaches this value — i.e. once a prediction in this epoch (or an earlier
+    /// one) has been confirmed correct by the server. See the engine fields.
+    epoch: u64,
 }
 
 /// Speculative overlay of unconfirmed local input.
@@ -115,6 +120,8 @@ pub struct PredictionEngine {
     cursor_index: u64,
     /// Time (ms) the cursor prediction was last moved, for glitch aging.
     cursor_at_ms: u64,
+    /// Prediction epoch the cursor move was made in (see `prediction_epoch`).
+    cursor_epoch: u64,
     have_cursor: bool,
     /// Buffer for an incomplete trailing UTF-8 sequence.
     utf8: Vec<u8>,
@@ -144,6 +151,20 @@ pub struct PredictionEngine {
     last_quick_confirmation_ms: u64,
     /// Accumulated credited-correct predictions (see [`CONFIDENCE_TRIGGER`]).
     confidence: u32,
+    /// mosh's prediction-epoch gate — the mechanism that keeps speculative echo
+    /// from flashing in a context that doesn't echo keystrokes (e.g. vim normal
+    /// mode, where `j` moves the cursor and is never printed). Every prediction
+    /// is stamped with `prediction_epoch`; it is *tracked and validated* but
+    /// **not displayed** until `confirmed_epoch` reaches its epoch — which only
+    /// happens when a prediction in that epoch (or earlier) is confirmed correct
+    /// by the server. So the very first keystroke in any fresh context is
+    /// withheld until the server proves the context echoes; if it never does
+    /// (vim normal mode), nothing is ever shown. [`Self::become_tentative`] bumps
+    /// `prediction_epoch` on any unpredictable input (control byte, escape
+    /// sequence, CR/LF, line wrap) so entering such a context re-arms the gate.
+    /// Mirrors mosh's `prediction_epoch` / `confirmed_epoch` / `tentative_until_epoch`.
+    prediction_epoch: u64,
+    confirmed_epoch: u64,
     cols: u16,
     rows: u16,
 }
@@ -157,6 +178,7 @@ impl PredictionEngine {
             cursor_col: 0,
             cursor_index: 0,
             cursor_at_ms: 0,
+            cursor_epoch: 0,
             have_cursor: false,
             utf8: Vec::new(),
             suppress: false,
@@ -167,9 +189,24 @@ impl PredictionEngine {
             glitch_trigger: 0,
             last_quick_confirmation_ms: 0,
             confidence: 0,
+            // Start one epoch ahead of "confirmed": the first prediction is
+            // tentative until the server proves this context echoes (mosh's
+            // `prediction_epoch(1)`, `confirmed_epoch(0)`).
+            prediction_epoch: 1,
+            confirmed_epoch: 0,
             cols: 0,
             rows: 0,
         }
+    }
+
+    /// Begin a new prediction epoch (mosh's `become_tentative`): predictions
+    /// made from now on are stamped one epoch higher and stay invisible until a
+    /// confirmation proves this context echoes. Called on any input whose
+    /// on-screen effect we can't safely predict (control byte, escape sequence,
+    /// CR/LF, line wrap), so entering a non-echoing context re-arms the display
+    /// gate even if the previous epoch was confirmed.
+    fn become_tentative(&mut self) {
+        self.prediction_epoch = self.prediction_epoch.saturating_add(1);
     }
 
     /// Update the SRTT estimate used by [`PredictMode::Adaptive`] gating.
@@ -218,6 +255,10 @@ impl PredictionEngine {
         // loop's indices.
         self.cells.clear();
         self.have_cursor = false;
+        // A flush starts a fresh, unconfirmed epoch: whatever we show next must
+        // re-earn a confirmation before it displays (mosh's `reset` →
+        // `become_tentative`).
+        self.become_tentative();
     }
 
     /// Register local keystroke `bytes`, typed at client input index
@@ -299,20 +340,28 @@ impl PredictionEngine {
             return; // inside an unpredictable (escape) sequence
         }
         match ch {
-            // Carriage return: go to column 0.
+            // Carriage return: go to column 0. Unpredictable enough (the shell
+            // may echo a newline, run a command, repaint) that mosh starts a
+            // fresh epoch — so the first keystroke of the next line is withheld
+            // until it's confirmed.
             '\r' => {
+                self.become_tentative();
                 self.cursor_col = 0;
                 self.cursor_index = input_index;
                 self.cursor_at_ms = now_ms;
+                self.cursor_epoch = self.prediction_epoch;
             }
-            // Line feed: next row (predicting scroll is unsafe, so clamp).
+            // Line feed: next row (predicting scroll is unsafe, so clamp). Like
+            // CR, an unpredictable boundary → fresh epoch.
             '\n' => {
+                self.become_tentative();
                 self.cursor_col = 0;
                 if self.cursor_row + 1 < self.rows {
                     self.cursor_row += 1;
                 }
                 self.cursor_index = input_index;
                 self.cursor_at_ms = now_ms;
+                self.cursor_epoch = self.prediction_epoch;
             }
             // Backspace / delete: move left and predict an erased cell.
             '\u{8}' | '\u{7f}' => {
@@ -324,13 +373,17 @@ impl PredictionEngine {
                 self.push_cell(cell, input_index, base, now_ms);
                 self.cursor_index = input_index;
                 self.cursor_at_ms = now_ms;
+                self.cursor_epoch = self.prediction_epoch;
             }
-            // Tab: advance to the next multiple of 8.
+            // Tab: advance to the next multiple of 8. The server may render tab
+            // stops differently, so mosh treats it as unpredictable → fresh epoch.
             '\t' => {
+                self.become_tentative();
                 let next = ((self.cursor_col / 8) + 1) * 8;
                 self.cursor_col = next.min(self.cols - 1);
                 self.cursor_index = input_index;
                 self.cursor_at_ms = now_ms;
+                self.cursor_epoch = self.prediction_epoch;
             }
             // Escape: begin an escape sequence — it may be an arrow key we can
             // predict (handled by `continue_escape`); we only abandon if it turns
@@ -381,6 +434,7 @@ impl PredictionEngine {
                 }
                 self.cursor_index = input_index;
                 self.cursor_at_ms = now_ms;
+                self.cursor_epoch = self.prediction_epoch;
             }
         }
     }
@@ -419,6 +473,7 @@ impl PredictionEngine {
             input_index,
             credit,
             predicted_at_ms: now_ms,
+            epoch: self.prediction_epoch,
         });
     }
 
@@ -505,13 +560,17 @@ impl PredictionEngine {
         }
         self.cursor_index = input_index;
         self.cursor_at_ms = now_ms;
+        self.cursor_epoch = self.prediction_epoch;
     }
 
     fn advance_cursor(&mut self) {
         if self.cursor_col + 1 < self.cols {
             self.cursor_col += 1;
         } else {
-            // Wrap.
+            // Wrap. mosh's "tricky last column": the server may wrap or may
+            // overwrite, so start a fresh epoch and let the wrapped prediction
+            // re-earn display.
+            self.become_tentative();
             self.cursor_col = 0;
             if self.cursor_row + 1 < self.rows {
                 self.cursor_row += 1;
@@ -521,36 +580,85 @@ impl PredictionEngine {
 
     /// Incorporate a freshly received server screen received at `now_ms`:
     /// validate predictions the server has now applied (`input_index <=
-    /// screen.echo_ack`, mosh's `late_ack`) and cull or, on a misprediction,
-    /// flush everything.
+    /// screen.echo_ack`, mosh's `late_ack`), promote the confirmed epoch from
+    /// the ones that came back correct, and cull. A *visible* (confirmed-epoch)
+    /// misprediction flushes the whole overlay; a *tentative* (never-displayed)
+    /// one is killed quietly — nothing was on screen to correct.
     pub fn new_server_screen(&mut self, screen: &Screen, now_ms: u64) {
         if self.mode == PredictMode::Never {
             self.reset();
             return;
         }
         let ack = screen.echo_ack;
+        // `confirmed_epoch` as it stood when these predictions were painted —
+        // used to decide whether a now-confirmed prediction had actually been
+        // displayed (mature, `epoch <= prev_confirmed`) or was still tentative.
+        let prev_confirmed = self.confirmed_epoch;
 
-        // A mispredicted, now-confirmed cell means our speculation diverged from
-        // reality: drop all predictions and resync to the server.
-        let cell_mispredict = self.cells.iter().any(|p| {
-            p.input_index <= ack
-                && screen
-                    .cell(p.row, p.col)
-                    .map(|actual| actual.c != p.cell.c)
-                    .unwrap_or(true)
-        });
-        // Likewise for the cursor: a confirmed cursor prediction that doesn't
-        // match the server's real cursor is a misprediction (mosh's
-        // `ConditionalCursorMove::get_validity` → `IncorrectOrExpired`). Without
-        // this a mispredicted cursor would silently linger until the next move.
-        let cursor_mispredict = self.have_cursor
-            && self.cursor_index <= ack
-            && (screen.cursor_row != self.cursor_row || screen.cursor_col != self.cursor_col);
-        if cell_mispredict || cursor_mispredict {
-            self.reset();
+        // Classify every *confirmed* prediction (the server has applied this
+        // input) as correct or mispredicted; for mispredictions, whether the
+        // prediction was mature enough to have been on screen.
+        let mut visible_mispredict = false;
+        let mut tentative_mispredict = false;
+        let mut max_correct_epoch = prev_confirmed;
+        for p in &self.cells {
+            if p.input_index > ack {
+                continue;
+            }
+            let correct = screen
+                .cell(p.row, p.col)
+                .map(|actual| actual.c == p.cell.c)
+                .unwrap_or(false);
+            if correct {
+                max_correct_epoch = max_correct_epoch.max(p.epoch);
+            } else if p.epoch <= prev_confirmed {
+                visible_mispredict = true;
+            } else {
+                tentative_mispredict = true;
+            }
+        }
+        // The cursor prediction, same treatment (mosh's
+        // `ConditionalCursorMove::get_validity` → `IncorrectOrExpired`).
+        if self.have_cursor && self.cursor_index <= ack {
+            let cursor_correct =
+                screen.cursor_row == self.cursor_row && screen.cursor_col == self.cursor_col;
+            if cursor_correct {
+                max_correct_epoch = max_correct_epoch.max(self.cursor_epoch);
+            } else if self.cursor_epoch <= prev_confirmed {
+                visible_mispredict = true;
+            } else {
+                tentative_mispredict = true;
+            }
+        }
+
+        // A *visible* prediction the server contradicted means the user actually
+        // saw the wrong thing: flush the whole overlay to the truth and start a
+        // fresh (tentative) epoch — mosh's `cull` for a non-tentative
+        // `IncorrectOrExpired`.
+        if visible_mispredict {
+            self.reset(); // clears the overlay AND bumps to a fresh epoch
             self.resync_suppress = true; // suppress overlay until the next clean update
             self.confidence = 0; // track record broken — re-earn confidence
             return;
+        }
+
+        // No visible miss: promote the confirmed epoch from the correct
+        // confirmations, so subsequent predictions in those epochs display.
+        self.confirmed_epoch = max_correct_epoch;
+
+        // A tentative (never-displayed) prediction was wrong — e.g. vim
+        // swallowed the keystroke as a motion instead of echoing it. Nothing was
+        // on screen, so there is nothing to flush: quietly drop every
+        // still-unconfirmed prediction (those in an epoch the server hasn't
+        // confirmed) and bump to a fresh epoch (mosh's `kill_epoch`). The epoch
+        // never advances, so the speculative glyph is never shown — this is what
+        // stops `jjjj` from flashing in vim normal mode.
+        if tentative_mispredict {
+            self.cells.retain(|p| p.epoch <= self.confirmed_epoch);
+            if self.cursor_epoch > self.confirmed_epoch {
+                self.have_cursor = false;
+            }
+            self.become_tentative();
         }
 
         // A clean update clears the post-misprediction suppression.
@@ -633,7 +741,11 @@ impl PredictionEngine {
         }
         let mut s = server.clone();
         for p in &self.cells {
-            if p.input_index > server.echo_ack {
+            // Only paint predictions in a *confirmed* epoch (mosh's
+            // `ConditionalOverlay::tentative` gate): an unconfirmed-epoch
+            // prediction is tracked and validated but never shown, so a glyph
+            // the server won't echo (vim normal-mode `j`) never flashes.
+            if p.input_index > server.echo_ack && p.epoch <= self.confirmed_epoch {
                 if let (true, true) = (p.row < s.rows, p.col < s.cols) {
                     let idx = p.row as usize * s.cols as usize + p.col as usize;
                     let mut cell = p.cell.clone();
@@ -647,6 +759,7 @@ impl PredictionEngine {
         }
         if self.have_cursor
             && self.cursor_index > server.echo_ack
+            && self.cursor_epoch <= self.confirmed_epoch
             && self.cursor_row < s.rows
             && self.cursor_col < s.cols
         {
@@ -654,6 +767,26 @@ impl PredictionEngine {
             s.cursor_col = self.cursor_col;
         }
         s
+    }
+
+    /// The current prediction / confirmed epoch (test/observability). Predictions
+    /// stamped at or below `confirmed_epoch` are displayed; those above it are
+    /// still tentative (see the field docs).
+    #[cfg(test)]
+    fn prediction_epoch(&self) -> u64 {
+        self.prediction_epoch
+    }
+    #[cfg(test)]
+    fn confirmed_epoch(&self) -> u64 {
+        self.confirmed_epoch
+    }
+    /// Test helper: pretend the current epoch is already confirmed, so a freshly
+    /// made prediction in it displays without first round-tripping a server
+    /// confirmation. Used by the display-logic tests that aren't about the
+    /// "earn the first echo" gate itself.
+    #[cfg(test)]
+    fn prime_epoch(&mut self) {
+        self.confirmed_epoch = self.prediction_epoch;
     }
 
     /// Number of currently-active (unconfirmed) cell predictions.
@@ -685,6 +818,7 @@ mod tests {
     #[test]
     fn predicts_typed_char_immediately() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         let base = screen_with_ack(20, 3, 0);
         p.new_user_bytes(b"hi", &base, 2, 0);
         let shown = p.predicted_screen(&base);
@@ -696,6 +830,7 @@ mod tests {
     #[test]
     fn multibyte_utf8_not_split() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         let base = screen_with_ack(20, 3, 0);
         // "ü" = 0xC3 0xBC; feed the bytes in two separate chunks.
         p.new_user_bytes(&[0xC3], &base, 1, 0);
@@ -731,6 +866,7 @@ mod tests {
     #[test]
     fn misprediction_flushes_overlay() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch(); // an established, displaying context, so the miss is visible
         let base = screen_with_ack(20, 3, 0);
         p.new_user_bytes(b"x", &base, 1, 0);
         // Server applied input 1 but the screen shows something else (e.g. the
@@ -749,6 +885,7 @@ mod tests {
     #[test]
     fn cursor_misprediction_triggers_resync() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch(); // an established, displaying context, so the miss is visible
         let base = screen_with_ack(20, 3, 0);
         p.new_user_bytes(b"x", &base, 1, 0);
         assert_eq!(p.active_predictions(), 1);
@@ -789,6 +926,7 @@ mod tests {
     #[test]
     fn prediction_unicode_no_corruption() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         let base = screen_with_ack(40, 2, 0);
         // "glück faĩl": ü = U+00FC (C3 BC), ĩ = U+0129 (C4 A9).
         let input = "glück faĩl".as_bytes().to_vec();
@@ -812,6 +950,7 @@ mod tests {
     #[test]
     fn adaptive_mode_gates_on_srtt() {
         let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        p.prime_epoch();
         let base = screen_with_ack(20, 2, 0);
         p.new_user_bytes(b"x", &base, 1, 0);
         // Fast link: predictions tracked but not displayed.
@@ -825,6 +964,7 @@ mod tests {
     #[test]
     fn tentative_predictions_are_underlined() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         let base = screen_with_ack(20, 2, 0);
         p.new_user_bytes(b"x", &base, 1, 0);
         let shown = p.predicted_screen(&base);
@@ -844,6 +984,7 @@ mod tests {
     #[test]
     fn resync_suppresses_then_clears() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch(); // an established, displaying context, so the miss is visible
         let base = screen_with_ack(20, 2, 0);
         p.new_user_bytes(b"x", &base, 1, 0);
         // Misprediction: the server applied input 1 but shows 'Z'.
@@ -866,6 +1007,7 @@ mod tests {
     #[test]
     fn predicts_wide_char_with_spacer() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         let base = screen_with_ack(20, 2, 0);
         p.new_user_bytes("世".as_bytes(), &base, 1, 0);
         let shown = p.predicted_screen(&base);
@@ -970,6 +1112,7 @@ mod tests {
     #[test]
     fn predicts_arrow_key_cursor_moves() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         let base = screen_with_ack(20, 3, 0);
         p.new_user_bytes(b"abc", &base, 3, 0);
         assert_eq!(p.predicted_screen(&base).cursor_col, 3);
@@ -995,6 +1138,7 @@ mod tests {
     #[test]
     fn predicts_insert_shift_mid_line() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         let mut base = screen_with_ack(20, 2, 0);
         base.cells[0].c = 'X';
         base.cells[1].c = 'Y';
@@ -1015,6 +1159,7 @@ mod tests {
     #[test]
     fn end_of_line_typing_does_not_shift() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         let mut base = screen_with_ack(20, 2, 0);
         base.cells[0].c = 'X';
         base.cells[1].c = 'Y';
@@ -1035,6 +1180,7 @@ mod tests {
     #[test]
     fn long_pending_prediction_forces_display() {
         let mut p = PredictionEngine::new(PredictMode::Adaptive);
+        p.prime_epoch();
         p.set_srtt(5.0); // SRTT gate closed, no confidence yet
         let base = screen_with_ack(20, 2, 0);
         p.new_user_bytes(b"x", &base, 1, 0);
@@ -1059,6 +1205,7 @@ mod tests {
     #[test]
     fn severe_glitch_underlines_even_with_flagging_off() {
         let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch();
         p.set_flagging(false);
         let base = screen_with_ack(20, 2, 0);
         p.new_user_bytes(b"x", &base, 1, 0);
@@ -1119,5 +1266,147 @@ mod tests {
             );
             prev = nc;
         }
+    }
+
+    // ---- mosh's prediction-epoch gate (the vim-normal-mode fix) ----
+
+    /// The core of the fix: a prediction made in an unconfirmed epoch is tracked
+    /// and validated but NOT displayed. On a fresh engine nothing has been
+    /// confirmed, so the first predicted glyph is withheld until the server
+    /// proves this context echoes keystrokes — even in `Always` mode.
+    #[test]
+    fn unconfirmed_epoch_prediction_is_withheld() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 3, 0);
+        p.new_user_bytes(b"j", &base, 1, 0);
+        assert_eq!(p.active_predictions(), 1, "prediction is tracked");
+        assert_eq!(
+            p.predicted_screen(&base).cell(0, 0).unwrap().c,
+            ' ',
+            "but not displayed until its epoch is confirmed"
+        );
+        assert_eq!(p.confirmed_epoch(), 0, "nothing confirmed yet");
+    }
+
+    /// vim normal mode: `hjkl` move the cursor and are never echoed, so the
+    /// epoch never confirms — and the predicted glyphs are never shown, however
+    /// many keys are pressed. This is the `jjjjj`-flashing bug this fix removes.
+    #[test]
+    fn vim_normal_mode_motion_keys_never_flash() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        // A server screen whose first cell holds a `~` (an empty vim line); the
+        // cursor parks at the origin and never tracks our right-moving guess.
+        let mut server = screen_with_ack(20, 5, 0);
+        server.cells[0].c = '~';
+
+        for i in 1..=5u64 {
+            p.new_user_bytes(b"j", &server, i, i * 10);
+            assert_eq!(
+                p.predicted_screen(&server).cell(0, 0).unwrap().c,
+                '~',
+                "motion key must not paint a glyph (iteration {i})"
+            );
+            // The server applies the input but echoes nothing new: the cell is
+            // unchanged and the cursor did not move where we guessed.
+            let mut next = server.clone();
+            next.echo_ack = i;
+            next.cursor_row = 0;
+            next.cursor_col = 0;
+            p.new_server_screen(&next, i * 10 + 5);
+            assert_eq!(
+                p.confirmed_epoch(),
+                0,
+                "epoch never confirms in a non-echoing context (iteration {i})"
+            );
+        }
+    }
+
+    /// Once a prediction is confirmed correct (a context that *does* echo — a
+    /// shell prompt, vim insert mode), the epoch is promoted and subsequent
+    /// predictions in it display immediately. (The first keystroke is still
+    /// withheld; that's the price of learning the context echoes.)
+    #[test]
+    fn confirmed_epoch_enables_subsequent_predictions() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 3, 0);
+
+        // First keystroke: withheld (unconfirmed epoch).
+        p.new_user_bytes(b"a", &base, 1, 0);
+        assert_eq!(p.predicted_screen(&base).cell(0, 0).unwrap().c, ' ');
+
+        // Server echoes it at (0,0) with the cursor advanced → epoch confirmed.
+        let mut confirmed = confirmed_screen(20, 3, 1, 1);
+        confirmed.cells[0].c = 'a';
+        p.new_server_screen(&confirmed, 10);
+        assert_eq!(
+            p.confirmed_epoch(),
+            p.prediction_epoch(),
+            "the correct confirmation promoted the epoch"
+        );
+
+        // The next keystroke in that now-confirmed epoch displays right away.
+        p.new_user_bytes(b"b", &confirmed, 2, 20);
+        assert_eq!(
+            p.predicted_screen(&confirmed).cell(0, 1).unwrap().c,
+            'b',
+            "a prediction in a confirmed epoch shows immediately"
+        );
+    }
+
+    /// An unpredictable byte (here an unhandled escape sequence) starts a fresh
+    /// tentative epoch, so the keystroke after it is withheld again — even
+    /// though the prior epoch was confirmed. This is what re-arms the gate when
+    /// you enter a non-echoing mode mid-session (e.g. launch vim from the shell).
+    #[test]
+    fn unpredictable_input_rearms_the_gate() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        p.prime_epoch(); // already in a confirmed, predicting context
+        let base = screen_with_ack(20, 3, 0);
+        p.new_user_bytes(b"a", &base, 1, 0);
+        assert_eq!(
+            p.predicted_screen(&base).cell(0, 0).unwrap().c,
+            'a',
+            "confirmed-context prediction shows"
+        );
+
+        let before = p.prediction_epoch();
+        // CSI Z (not an arrow we predict) → become_tentative + flush.
+        p.new_user_bytes(b"\x1b[Z", &base, 2, 10);
+        assert!(p.prediction_epoch() > before, "epoch bumped past confirmed");
+
+        // A glyph typed now is in the new, unconfirmed epoch → withheld.
+        p.new_user_bytes(b"b", &base, 3, 20);
+        let shown = p.predicted_screen(&base);
+        assert!(
+            shown.cells.iter().all(|c| c.c != 'b'),
+            "post-escape glyph withheld until the new epoch confirms"
+        );
+    }
+
+    /// A tentative (never-displayed) misprediction is killed quietly: it does
+    /// NOT flush the overlay or set the resync suppression the way a *visible*
+    /// misprediction does — there was nothing on screen to correct.
+    #[test]
+    fn tentative_mispredict_is_quiet() {
+        let mut p = PredictionEngine::new(PredictMode::Always);
+        let base = screen_with_ack(20, 3, 0);
+        // Unconfirmed epoch: this 'x' is tracked but never shown.
+        p.new_user_bytes(b"x", &base, 1, 0);
+        // Server applied input 1 but shows nothing there (cell stays blank) →
+        // tentative misprediction.
+        let mut applied = screen_with_ack(20, 3, 1);
+        applied.cursor_col = 0;
+        p.new_server_screen(&applied, 10);
+
+        assert_eq!(p.active_predictions(), 0, "the bad tentative cell is dropped");
+        assert_eq!(p.confirmed_epoch(), 0, "epoch stays unconfirmed");
+        // A fresh prediction is still immediately representable (not stuck behind
+        // a resync suppression that a visible miss would have set): it's just
+        // withheld by the epoch gate, and the screen shows the truth.
+        assert_eq!(
+            p.predicted_screen(&applied).cell(0, 0).unwrap().c,
+            ' ',
+            "screen shows the server truth, no flicker"
+        );
     }
 }

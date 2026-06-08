@@ -18,6 +18,18 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
 rcgen = "0.13"
+# Zero key material in memory on drop (defence-in-depth: core dumps / swap).
+zeroize = "1"
+turmoil = { version = "0.6", optional = true }
+
+[features]
+# Deterministic QUIC-over-turmoil simulation (the `turmoil_sim` module + the
+# `turmoil_latency` example). Off by default — only pulled in for sim/bench runs.
+turmoil = ["dep:turmoil"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "net"] }
+
+[[example]]
+name = "turmoil_latency"
+required-features = ["turmoil"]

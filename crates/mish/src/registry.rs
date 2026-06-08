@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 pub struct SessionEntry {
     /// PID of the serving daemon (used to check liveness).
     pub pid: i32,
+    /// The daemon's process start-time token (kernel jiffies since boot, from
+    /// `/proc/<pid>/stat`), if it could be read when the entry was written. Pins
+    /// the PID to a *specific* process so a recycled PID isn't mistaken for our
+    /// still-live daemon. `None` when unavailable (non-Linux, or unreadable).
+    pub start_time: Option<u64>,
     /// The verbatim `MISH CONNECT <port> <server> <client> <key>` line to reprint.
     pub connect_line: String,
 }
@@ -61,20 +66,42 @@ fn entry_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{}.session", sanitize(name)))
 }
 
-/// Whether process `pid` is alive. Unix: `kill(pid, 0)` (an `EPERM` means it
-/// exists but we can't signal it — still alive).
+/// Whether process `pid` is alive *and signalable by us*. Unix: `kill(pid, 0)`
+/// returning 0. An `EPERM` (the PID exists but is owned by another user) is
+/// treated as **not** our session — our daemon always runs as the same user, so
+/// a foreign-owned recycled PID can never be it; reporting it "alive" would let
+/// a reattach lock onto an unrelated process.
 pub fn is_alive(pid: i32) -> bool {
     #[cfg(unix)]
     {
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            return true;
-        }
-        io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        unsafe { libc::kill(pid, 0) == 0 }
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
         false
+    }
+}
+
+/// The start-time token for `pid`: field 22 (`starttime`, in clock ticks since
+/// boot) of `/proc/<pid>/stat`. Together with the PID it uniquely identifies a
+/// process instance, so PID reuse can be detected. `None` off Linux or if the
+/// process is gone / unreadable.
+pub fn process_start_time(pid: i32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The `comm` field (2nd) is wrapped in parens and may itself contain
+        // spaces or ')', so parse after the *last* ')': the remaining
+        // whitespace-separated fields begin at field 3 (`state`). `starttime` is
+        // field 22, i.e. index 19 (0-based) of that remainder.
+        let rest = &stat[stat.rfind(')')? + 1..];
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -87,7 +114,12 @@ pub fn store_in(dir: &Path, name: &str, pid: i32, connect_line: &str) -> io::Res
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     let path = entry_path(dir, name);
-    let contents = format!("{pid}\n{connect_line}\n");
+    // Line 1 is `<pid>` or `<pid> <start_time>` (start-time appended when
+    // readable, so older/non-Linux readers still parse the PID).
+    let contents = match process_start_time(pid) {
+        Some(start) => format!("{pid} {start}\n{connect_line}\n"),
+        None => format!("{pid}\n{connect_line}\n"),
+    };
 
     #[cfg(unix)]
     let mut f = {
@@ -110,12 +142,18 @@ pub fn store_in(dir: &Path, name: &str, pid: i32, connect_line: &str) -> io::Res
 pub fn load_in(dir: &Path, name: &str) -> Option<SessionEntry> {
     let s = std::fs::read_to_string(entry_path(dir, name)).ok()?;
     let mut lines = s.lines();
-    let pid: i32 = lines.next()?.trim().parse().ok()?;
+    let mut head = lines.next()?.split_whitespace();
+    let pid: i32 = head.next()?.parse().ok()?;
+    let start_time: Option<u64> = head.next().and_then(|t| t.parse().ok());
     let connect_line = lines.next()?.to_string();
     if !connect_line.starts_with("MISH CONNECT ") {
         return None;
     }
-    Some(SessionEntry { pid, connect_line })
+    Some(SessionEntry {
+        pid,
+        start_time,
+        connect_line,
+    })
 }
 
 /// Remove a session entry (best-effort).
@@ -127,11 +165,22 @@ pub fn remove_in(dir: &Path, name: &str) {
 /// still alive; otherwise cleans up the stale file and returns `None`.
 pub fn find_live_in(dir: &Path, name: &str) -> Option<SessionEntry> {
     let entry = load_in(dir, name)?;
-    if is_alive(entry.pid) {
+    if is_alive(entry.pid) && start_time_matches(&entry) {
         Some(entry)
     } else {
         remove_in(dir, name);
         None
+    }
+}
+
+/// Confirm the live PID is still the *same process* we recorded, defeating PID
+/// reuse. If we recorded a start-time it must match the running process's; if we
+/// have none (non-Linux, or it was unreadable at store time) we can't verify and
+/// fall back to trusting liveness alone.
+fn start_time_matches(entry: &SessionEntry) -> bool {
+    match entry.start_time {
+        Some(recorded) => process_start_time(entry.pid) == Some(recorded),
+        None => true,
     }
 }
 
@@ -253,6 +302,48 @@ mod tests {
         assert!(
             load_in(&dir, "ghost").is_none(),
             "the stale file must be cleaned up"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pid_reuse_with_wrong_start_time_is_reaped() {
+        // Our PID is alive, but a recorded start-time that doesn't match the
+        // running process means the original daemon died and the PID was reused.
+        // `find_live` must reject it (defeats PID-reuse misdirection) and clean up.
+        let dir = tmp("reuse");
+        let pid = std::process::id() as i32;
+        // Hand-write an entry with a deliberately wrong start-time token.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            entry_path(&dir, "s"),
+            format!("{pid} 1\nMISH CONNECT 5 a b c\n"),
+        )
+        .unwrap();
+        assert!(
+            find_live_in(&dir, "s").is_none(),
+            "a reused PID (start-time mismatch) must not be treated as live"
+        );
+        assert!(load_in(&dir, "s").is_none(), "stale entry must be reaped");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_records_and_matches_own_start_time() {
+        // Storing our own live PID records our start-time, and find_live confirms
+        // it matches — the legitimate-reattach path must still succeed.
+        let dir = tmp("startmatch");
+        let pid = std::process::id() as i32;
+        store_in(&dir, "me", pid, "MISH CONNECT 5 a b c").unwrap();
+        let e = load_in(&dir, "me").expect("entry");
+        #[cfg(target_os = "linux")]
+        assert!(
+            e.start_time.is_some(),
+            "start-time should be recorded on Linux"
+        );
+        assert!(
+            find_live_in(&dir, "me").is_some(),
+            "our own live session must verify"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

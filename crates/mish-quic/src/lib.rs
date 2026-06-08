@@ -21,6 +21,8 @@
 pub mod config;
 pub mod lossy;
 pub mod transport;
+#[cfg(feature = "turmoil")]
+pub mod turmoil_sim;
 
 pub use transport::{
     accept, client_endpoint, connect, insecure_client_endpoint, loopback_client, loopback_server,

@@ -49,6 +49,7 @@ use russh::client::{self, KeyboardInteractiveAuthResponse};
 use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use russh::{ChannelMsg, Disconnect};
 use tokio::process::{Child, Command};
+use zeroize::Zeroizing;
 
 /// A bootstrapped session target: where to connect, the cert to trust, and the
 /// handle keeping the server reachable.
@@ -59,7 +60,8 @@ pub struct Bootstrap {
     /// Client certificate (DER) the client presents for mutual auth.
     pub client_cert_der: Vec<u8>,
     /// Client private key (PKCS#8 DER) the client presents for mutual auth.
-    pub client_key_der: Vec<u8>,
+    /// Zeroized on drop ([`Zeroizing`] derefs to `&[u8]`, so callers are unchanged).
+    pub client_key_der: Zeroizing<Vec<u8>>,
     /// The transport that started the server, held open for the session and torn
     /// down on drop.
     _guard: Guard,
@@ -333,6 +335,7 @@ pub async fn builtin(
         let handler = BuiltinHandler {
             host: target.hostname.clone(),
             port: target.port,
+            known_hosts_path: None,
         };
         let h = client::connect(
             rconfig.clone(),
@@ -347,6 +350,7 @@ pub async fn builtin(
         let handler = BuiltinHandler {
             host: target.hostname.clone(),
             port: target.port,
+            known_hosts_path: None,
         };
         let h = client::connect_stream(rconfig.clone(), stream, handler)
             .await
@@ -448,8 +452,9 @@ fn shell_quote(arg: &str) -> String {
 enum HostKeyVerdict {
     /// The host is in `known_hosts` and the key matches — accept.
     Trusted,
-    /// The host is not in `known_hosts` — accept on a trust-on-first-use basis
-    /// (logged, not persisted).
+    /// The host is not in `known_hosts` — first contact. The caller prompts the
+    /// user (see [`confirm_and_record_new_host`]) and, on acceptance, **records**
+    /// the key so a later key change is detected as a possible MITM.
     FirstUse,
     /// The host is known but the key **differs** (possible MITM), or
     /// `known_hosts` is unreadable — refuse.
@@ -484,32 +489,139 @@ fn classify_host_key(host: &str, port: u16, key: &PublicKey, path: Option<&Path>
 struct BuiltinHandler {
     host: String,
     port: u16,
+    /// `known_hosts` file to consult and update. `None` = russh's default
+    /// (`~/.ssh/known_hosts`); set to an explicit path in tests.
+    known_hosts_path: Option<PathBuf>,
 }
 
 impl client::Handler for BuiltinHandler {
     type Error = russh::Error;
 
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
-        match classify_host_key(&self.host, self.port, server_public_key, None) {
+        let path = self.known_hosts_path.clone();
+        match classify_host_key(&self.host, self.port, server_public_key, path.as_deref()) {
             HostKeyVerdict::Trusted => Ok(true),
-            HostKeyVerdict::FirstUse => {
-                eprintln!(
-                    "[mish-client] warning: {}:{} is not in known_hosts; \
-                     accepting its key on first use (not saved)",
-                    self.host, self.port
-                );
-                Ok(true)
-            }
+            HostKeyVerdict::FirstUse => Ok(confirm_and_record_new_host(
+                &self.host,
+                self.port,
+                server_public_key,
+                path.as_deref(),
+            )
+            .await),
             HostKeyVerdict::Rejected => {
                 eprintln!(
-                    "[mish-client] host key verification FAILED for {}:{} \
-                     (known host key changed, or known_hosts unreadable) — refusing",
+                    "[mish-client] HOST KEY VERIFICATION FAILED for {}:{} — the host's key \
+                     does not match the one pinned in known_hosts (possible man-in-the-middle), \
+                     or known_hosts could not be read. Refusing to connect.",
                     self.host, self.port
                 );
                 Ok(false)
             }
         }
     }
+}
+
+/// How to treat a host whose key is not yet in `known_hosts`. Mirrors OpenSSH's
+/// `StrictHostKeyChecking`, selectable via `$MISH_STRICT_HOST_KEYS`:
+///
+/// - `ask` (default) — prompt on the controlling terminal; **refuse** if there is
+///   no terminal to ask on (so non-interactive runs fail closed rather than
+///   silently trusting an unverified host).
+/// - `accept-new` (or `no`/`off`) — accept and record the key without prompting
+///   (for automation that can't show a prompt).
+/// - `yes` (or `strict`) — refuse any host not already in `known_hosts`.
+enum NewHostPolicy {
+    Ask,
+    AcceptNew,
+    Refuse,
+}
+
+fn new_host_policy() -> NewHostPolicy {
+    match std::env::var("MISH_STRICT_HOST_KEYS").as_deref() {
+        Ok("accept-new") | Ok("no") | Ok("off") => NewHostPolicy::AcceptNew,
+        Ok("yes") | Ok("strict") => NewHostPolicy::Refuse,
+        _ => NewHostPolicy::Ask,
+    }
+}
+
+/// Decide whether to trust a host not yet in `known_hosts`, and — if so —
+/// **persist** its key so a *future* connection whose key differs is detected as
+/// a possible MITM (the gap this closes: TOFU acceptance was previously never
+/// saved, so a changed key was never noticed). Returns whether to proceed.
+async fn confirm_and_record_new_host(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    known_hosts_path: Option<&Path>,
+) -> bool {
+    let algo = key.algorithm().to_string();
+    let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+
+    let accept = match new_host_policy() {
+        NewHostPolicy::AcceptNew => true,
+        NewHostPolicy::Refuse => {
+            eprintln!(
+                "[mish-client] {host}:{port} is not in known_hosts and \
+                 MISH_STRICT_HOST_KEYS=yes — refusing."
+            );
+            false
+        }
+        NewHostPolicy::Ask => {
+            let (h, a, f) = (host.to_string(), algo.clone(), fingerprint.clone());
+            // The prompt does blocking TTY I/O; keep it off the async runtime.
+            tokio::task::spawn_blocking(move || prompt_accept_new_host(&h, port, &a, &f))
+                .await
+                .unwrap_or(false)
+        }
+    };
+
+    if !accept {
+        return false;
+    }
+
+    let recorded = match known_hosts_path {
+        Some(p) => russh::keys::known_hosts::learn_known_hosts_path(host, port, key, p),
+        None => russh::keys::known_hosts::learn_known_hosts(host, port, key),
+    };
+    match recorded {
+        Ok(()) => eprintln!(
+            "[mish-client] permanently added '{host}:{port}' ({algo}) to known_hosts."
+        ),
+        Err(e) => eprintln!(
+            "[mish-client] warning: trusted {host}:{port} for this session but could not \
+             save it to known_hosts ({e}); you will be asked again next time."
+        ),
+    }
+    true
+}
+
+/// Ask the user, on the **controlling terminal** (`/dev/tty`, not stdin — which
+/// may be redirected), whether to trust a previously-unseen host key. Returns
+/// `true` only for an explicit `yes`/`y`. Returns `false` (refuse) when there is
+/// no controlling terminal to prompt on.
+fn prompt_accept_new_host(host: &str, port: u16, algo: &str, fingerprint: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+
+    // Prompt on the controlling terminal directly; if there is none (daemon, CI,
+    // piped run), we can't get consent, so fail closed.
+    let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut out = &tty;
+    let _ = write!(
+        out,
+        "The authenticity of host '{host}:{port}' can't be established.\n\
+         {algo} key fingerprint is {fingerprint}.\n\
+         Are you sure you want to continue connecting (yes/no)? "
+    );
+    let _ = out.flush();
+
+    let mut line = String::new();
+    if BufReader::new(&tty).read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "yes" | "y")
 }
 
 // ---- host / config resolution -------------------------------------------------
@@ -634,6 +746,7 @@ async fn open_proxy_chain(
         let handler = BuiltinHandler {
             host: hop.hostname.clone(),
             port: hop.port,
+            known_hosts_path: None,
         };
         let mut h = if i == 0 {
             // First hop: a real TCP connection.
@@ -878,7 +991,8 @@ struct ConnectInfo {
     port: u16,
     server_cert: Vec<u8>,
     client_cert: Vec<u8>,
-    client_key: Vec<u8>,
+    /// The transmitted client private key; zeroized on drop.
+    client_key: Zeroizing<Vec<u8>>,
 }
 
 /// Cap on bytes buffered while scanning for the `MISH CONNECT` line. The real
@@ -989,7 +1103,7 @@ fn parse_connect(line: &str) -> Option<ConnectInfo> {
     let port: u16 = it.next()?.parse().ok()?;
     let server_cert = from_hex(it.next()?)?;
     let client_cert = from_hex(it.next()?)?;
-    let client_key = from_hex(it.next()?)?;
+    let client_key = Zeroizing::new(from_hex(it.next()?)?);
     Some(ConnectInfo {
         port,
         server_cert,
@@ -1210,7 +1324,7 @@ mod tests {
         assert_eq!(info.port, 51234);
         assert_eq!(info.server_cert, vec![0xde, 0xad]);
         assert_eq!(info.client_cert, vec![0xbe, 0xef]);
-        assert_eq!(info.client_key, vec![0x01, 0x02]);
+        assert_eq!(*info.client_key, vec![0x01, 0x02]);
 
         assert!(parse_connect("garbage").is_none());
         assert!(parse_connect("MISH CONNECT notaport ff ee dd").is_none());
@@ -1369,6 +1483,42 @@ mod tests {
         );
     }
 
+    /// Recording a first-seen host key (what accept-on-first-use now does, via
+    /// `learn_known_hosts_path` in `confirm_and_record_new_host`) must persist it
+    /// so that (a) the same key is trusted next time and (b) a *changed* key is
+    /// later caught as a possible MITM. The previous TOFU path never saved the
+    /// key, so a changed key was silently re-accepted every run — this is the gap
+    /// the write-back closes.
+    #[test]
+    fn learned_host_key_is_trusted_and_a_later_change_is_rejected() {
+        let kh = write_tmp("kh-learn", ""); // start from an empty known_hosts
+        let host = "newhost";
+
+        // Unknown at first contact.
+        assert_eq!(
+            classify_host_key(host, 22, &pubkey(K1), Some(&kh.0)),
+            HostKeyVerdict::FirstUse
+        );
+
+        // Persist the accepted key.
+        russh::keys::known_hosts::learn_known_hosts_path(host, 22, &pubkey(K1), &kh.0)
+            .expect("record host key");
+
+        // The same key is now trusted without re-prompting.
+        assert_eq!(
+            classify_host_key(host, 22, &pubkey(K1), Some(&kh.0)),
+            HostKeyVerdict::Trusted
+        );
+
+        // A different key for that host is now rejected as a possible MITM —
+        // detection that plain (non-persisted) TOFU could never provide.
+        assert_eq!(
+            classify_host_key(host, 22, &pubkey(K2), Some(&kh.0)),
+            HostKeyVerdict::Rejected,
+            "a host key that changed after first use must be rejected"
+        );
+    }
+
     // ---- Robustness: the bounded MISH CONNECT scanner ----
 
     fn valid_connect_line() -> String {
@@ -1390,7 +1540,7 @@ mod tests {
         buf.extend_from_slice(b.as_bytes());
         let info = scan_connect(&mut buf).unwrap().expect("line completed");
         assert_eq!(info.port, 51234);
-        assert_eq!(info.client_key, vec![0x01, 0x02]);
+        assert_eq!(*info.client_key, vec![0x01, 0x02]);
     }
 
     #[test]

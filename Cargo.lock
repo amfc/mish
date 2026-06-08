@@ -1530,6 +1530,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vt100",
+ "zeroize",
 ]
 
 [[package]]
@@ -1556,6 +1557,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "turmoil",
+ "zeroize",
 ]
 
 [[package]]

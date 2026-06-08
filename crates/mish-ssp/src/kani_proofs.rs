@@ -61,6 +61,7 @@ fn symbolic_datagram(buf: &mut [u8; MAX_DATAGRAM]) -> usize {
 /// byte arithmetic all stay panic- and overflow-free.
 #[kani::proof]
 #[kani::unwind(16)]
+#[kani::solver(kissat)]
 fn push_single_datagram_never_panics() {
     let mut buf = [0u8; MAX_DATAGRAM];
     let len = symbolic_datagram(&mut buf);
@@ -80,6 +81,7 @@ fn push_single_datagram_never_panics() {
 /// accounting stays non-negative for every interleaving of three datagrams.
 #[kani::proof]
 #[kani::unwind(16)]
+#[kani::solver(kissat)]
 fn push_sequence_never_panics() {
     let mut defrag = Defragmenter::new();
     // Three datagrams is enough to open a reassembly, hit a duplicate/mismatch,
@@ -99,6 +101,7 @@ fn push_sequence_never_panics() {
 /// [`MAX_BODY`] bytes, MTUs spanning the single- and multi-fragment regimes).
 #[kani::proof]
 #[kani::unwind(16)]
+#[kani::solver(kissat)]
 fn fragment_roundtrip_is_lossless() {
     let mut payload = [0u8; MAX_BODY];
     for b in payload.iter_mut() {

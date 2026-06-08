@@ -26,6 +26,11 @@ pub mod render;
 pub mod screen;
 pub mod user;
 
+/// Kani bounded-proof harnesses for the screen path's structural core (run with
+/// `cargo kani -p mish-terminal`). Gated out of every normal build/test.
+#[cfg(kani)]
+mod kani_proofs;
+
 pub use display::new_frame;
 pub use emulator::Emulator;
 pub use predict::{PredictMode, PredictionEngine};

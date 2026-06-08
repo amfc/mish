@@ -215,6 +215,60 @@ fn userstream_apply_hostile_start_does_not_overflow() {
     s2.apply_diff(hostile); // must not panic
 }
 
+// A hostile/relentless peer that streams input while pinning `throwaway_num`
+// must not grow the receiver's reconstructed stream without bound. `apply_diff`
+// caps retained event bodies (front-trim), keeping memory bounded while leaving
+// `total()` — and therefore the diff chain and the most recent unread suffix —
+// intact. Defends the post-auth memory-amplification DoS in core::recv.
+#[test]
+fn userstream_apply_bounds_retained_events() {
+    use bincode::serialize;
+
+    // Encode a StreamDiff the way `diff_from` does, but by hand so we can drive
+    // far more events than any proptest would.
+    fn diff_bytes(start: u64, n: usize) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Wire {
+            start: u64,
+            suffix: Vec<UserEvent>,
+        }
+        let suffix = (0..n)
+            .map(|i| UserEvent::Keystroke(vec![(start + i as u64) as u8]))
+            .collect();
+        serialize(&Wire { start, suffix }).unwrap()
+    }
+
+    let mut s = UserStream::new();
+    // Stream 300k events in chunks — well past the 64k retention cap.
+    let chunk = 10_000;
+    let total = 300_000u64;
+    let mut sent = 0u64;
+    while sent < total {
+        s.apply_diff(&diff_bytes(sent, chunk));
+        sent += chunk as u64;
+        // Retention stays bounded throughout, never unbounded.
+        assert!(
+            s.retained_len() <= 1 << 16,
+            "retained events must stay bounded (got {})",
+            s.retained_len()
+        );
+    }
+    // The logical cursor still reflects every event ever applied (so the diff
+    // chain / acks keep working), even though old bodies were trimmed.
+    assert_eq!(s.total(), total);
+    // The most recent events — the only ones a live receiver hasn't processed —
+    // are still present and correct.
+    let last = s.events_since(total - 3).cloned().collect::<Vec<_>>();
+    assert_eq!(
+        last,
+        vec![
+            UserEvent::Keystroke(vec![(total - 3) as u8]),
+            UserEvent::Keystroke(vec![(total - 2) as u8]),
+            UserEvent::Keystroke(vec![(total - 1) as u8]),
+        ]
+    );
+}
+
 // ---------- End-to-end client/server convergence over the simulator ----------
 
 // Node A = client: sends UserStream, receives Screen.

@@ -131,7 +131,7 @@ pub async fn run_client<T: Transport>(
     output: mpsc::UnboundedSender<Vec<u8>>,
 ) {
     let (driver, handle) =
-        Driver::<T, UserStream, Screen>::with(transport, clock.clone(), SspConfig::default());
+        Driver::<T, UserStream, Screen>::with(transport, clock.clone(), SspConfig::default().with_env_overrides());
     let driver_task = driver.spawn();
 
     // Accumulate the user-input log. We keep the full prefix so diffs against
