@@ -39,6 +39,7 @@ proptest! {
     ) {
         let inst = Instruction {
             protocol_version: 1,
+            seq: 5,
             old_num: 1, new_num: 2, ack_num: 0, throwaway_num: 0,
             diff: vec![1, 2, 3, 4, 5],
             timestamp: 7, timestamp_reply: Some(3),

@@ -206,8 +206,20 @@ where
         // wait for its own shutdown to be acked (see the completion check below).
         let mut peer_initiated = false;
         let mut shutdown_deadline = crate::clock::NEVER;
+        // RTT source for the core's cadence/RTO. Default: the core's own
+        // (seq-guarded, reorder-robust) timestamp estimator — mosh's approach, and
+        // the only one the deterministic sim can exercise. `MISH_SSP_RTT_SRC=quinn`
+        // instead feeds the transport's RTT (kept for A/B; see `PERFORMANCE.md`).
+        let use_transport_rtt =
+            std::env::var("MISH_SSP_RTT_SRC").as_deref() == Ok("quinn");
         loop {
             let now = self.clock.now_ms();
+
+            // 0. Optionally feed the transport's RTT estimate to the core.
+            if use_transport_rtt {
+                self.core
+                    .set_transport_rtt(self.transport.rtt().map(|d| d.as_secs_f64() * 1000.0));
+            }
 
             // 1. Run the protocol and flush any instructions to the wire.
             for inst in self.core.tick(now) {

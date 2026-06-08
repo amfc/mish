@@ -159,8 +159,10 @@ upstream mosh never could — primarily **Windows**, which has no external `ssh`
   is expanded. `$MISH_SSH_CONFIG` overrides the config path.
 - **ProxyJump.** A jump chain is tunnelled with chained direct-tcpip channels;
   each hop authenticates independently and its handle is held for the session.
-- **Host keys.** Checked against `~/.ssh/known_hosts`: mismatch rejected, unknown
-  accepted trust-on-first-use.
+- **Host keys.** Checked against `~/.ssh/known_hosts`: mismatch rejected; an
+  unknown host is **prompted for on the TTY (fingerprint shown) and, on
+  acceptance, written back** so a later key change is caught (fail-closed with no
+  TTY; `$MISH_STRICT_HOST_KEYS` overrides). Mirrors OpenSSH `ask`.
 
 Remaining, in rough effort order:
 
@@ -171,9 +173,8 @@ Remaining, in rough effort order:
   (On Windows the builtin client also needs the named-pipe ssh-agent; the Unix
   socket agent is `#[cfg(unix)]`.)
 - **Auth polish.** No passphrase **caching** (re-prompts per key), no
-  `IdentitiesOnly`/`AddKeysToAgent`, no PKCS#11. `known_hosts` trust-on-first-use
-  is **not written back** (re-warns each run); persisting accepted keys + an
-  interactive accept/reject prompt is future work.
+  `IdentitiesOnly`/`AddKeysToAgent`, no PKCS#11. (`known_hosts` write-back + an
+  interactive accept/reject prompt are now done — see **Host keys** above.)
 - **ssh_config gaps.** `russh-config` handles `Host` wildcards but **not `Match`
   or `Include`**, and we read `ProxyJump` but not `ProxyCommand`. (`ssh2-config`
   is more complete but drags in a `git2` build-dependency → libgit2/openssl/

@@ -439,11 +439,22 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
         frame.push(&format!("\x1b[{n} q"));
     }
 
-    // Terminal bell: emit one BEL (^G) per beep that happened since `old`. The
-    // count is monotonic and the receiver's emulator re-counts these, so the diff
-    // round-trips exactly. (A full repaint re-rings any accumulated bells, which
-    // is bounded and rare.) BEL doesn't move the cursor, so emitting it here is safe.
-    let beeps = new.bell_count.saturating_sub(old.bell_count);
+    // Terminal bell: emit one BEL (^G) per beep that happened since `old`, capped
+    // at MAX_BELLS_PER_FRAME. `bell_count` is a monotonic, uncapped u64, and on a
+    // full repaint `old` is the blank screen (bell_count 0), so an uncapped delta
+    // would re-ring the *entire* accumulated count — a peer-influenced amount (a
+    // log full of `\a`, arbitrary shared-session output) that can reach hundreds
+    // of millions and would materialize a multi-hundred-MB frame into the client's
+    // TTY (and into the throwaway buffer `Screen::apply_diff` builds on every diff).
+    // A human can't distinguish more than a couple of coalesced bells, and the
+    // count is cosmetic: the receiver re-counts BELs to track its own bell_count,
+    // which is never compared across the wire, so a capped delta round-trips
+    // harmlessly. BEL doesn't move the cursor, so emitting it here is safe.
+    const MAX_BELLS_PER_FRAME: u64 = 3;
+    let beeps = new
+        .bell_count
+        .saturating_sub(old.bell_count)
+        .min(MAX_BELLS_PER_FRAME);
     for _ in 0..beeps {
         frame.out.push(0x07);
     }

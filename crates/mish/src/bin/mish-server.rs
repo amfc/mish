@@ -205,12 +205,36 @@ fn bind_in_range(ports: &[u16], bind_ip: &str) -> Result<std::net::UdpSocket> {
     let mut last_err = None;
     for &p in ports {
         match std::net::UdpSocket::bind((bind_ip, p)) {
-            Ok(s) => return Ok(s),
+            Ok(s) => {
+                set_cloexec(&s);
+                return Ok(s);
+            }
             Err(e) => last_err = Some(e),
         }
     }
     Err(last_err.unwrap().into())
 }
+
+/// Mark the authenticated session socket close-on-exec so it is never inherited
+/// by the login shell we later spawn (where a child program could read or inject
+/// session datagrams). Rust's `std::net` sockets are already created `CLOEXEC` on
+/// Linux, but nothing else guarantees it, so we assert it explicitly — and it
+/// re-arms the flag should the fd ever be `dup()`'d (dup clears `FD_CLOEXEC`).
+#[cfg(unix)]
+fn set_cloexec(sock: &std::net::UdpSocket) {
+    use std::os::unix::io::AsRawFd;
+    let fd = sock.as_raw_fd();
+    // SAFETY: `fd` is a valid socket fd owned by `sock` for the duration of this
+    // call; `F_GETFD`/`F_SETFD` only read/modify the descriptor flags.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+#[cfg(not(unix))]
+fn set_cloexec(_sock: &std::net::UdpSocket) {}
 
 /// Disable core dumps: a core file could contain the per-session client private
 /// key (and terminal contents). Best-effort; done before any secret is minted.
@@ -331,6 +355,36 @@ fn main() -> Result<()> {
     result
 }
 
+/// Accept the next client that **completes the mutual-TLS handshake**, logging
+/// and skipping any peer whose handshake fails.
+///
+/// `transport::accept` resolves as soon as a QUIC Initial arrives and then drives
+/// the handshake, so it returns `Err` for any stranger who reaches the UDP port
+/// without the pinned client certificate (the check that authenticates a client).
+/// Propagating that error out of a session loop would let *any* QUIC speaker —
+/// with no mish credentials — remotely tear down a live `--persist`/`--shared`
+/// session: an unauthenticated DoS against the legitimate user. Instead we treat a
+/// failed handshake as a non-event and wait for the next connection; only a closed
+/// endpoint (`NoConnection`) is fatal.
+async fn accept_authenticated(
+    endpoint: &mish_quic::Endpoint,
+) -> Result<mish_quic::transport::QuicTransport> {
+    loop {
+        match mish_quic::transport::accept(endpoint).await {
+            Ok(t) => return Ok(t),
+            Err(mish_quic::QuicError::NoConnection) => bail!("QUIC endpoint closed"),
+            Err(e) => {
+                tracing::debug!(
+                    target: "mish::server",
+                    error = %e,
+                    "ignoring failed/unauthenticated QUIC handshake while accepting",
+                );
+                continue;
+            }
+        }
+    }
+}
+
 async fn serve(
     socket: std::net::UdpSocket,
     server_config: mish_quic::ServerConfig,
@@ -347,7 +401,7 @@ async fn serve(
     // Signal timeout: give up if no client connects within the window.
     let signal_timeout = env_secs("MOSH_SERVER_SIGNAL_TMOUT", 60);
     let t =
-        match tokio::time::timeout(signal_timeout, mish_quic::transport::accept(&endpoint)).await {
+        match tokio::time::timeout(signal_timeout, accept_authenticated(&endpoint)).await {
             Ok(conn) => conn.context("accepting QUIC connection")?,
             Err(_) => {
                 eprintln!("no client connected within the signal timeout; exiting");
@@ -457,9 +511,12 @@ async fn serve_persistent(
 
         let end = tokio::select! {
             end = &mut attaching => end,
-            incoming = mish_quic::transport::accept(&endpoint) => {
-                // A new client arrived while we were still attached → preempt the
-                // current one and switch to the newcomer.
+            incoming = accept_authenticated(&endpoint) => {
+                // A new *authenticated* client arrived while we were still
+                // attached → preempt the current one and switch to the newcomer.
+                // (`accept_authenticated` stays pending on unauthenticated
+                // handshakes, so a stranger can't trip this arm and preempt the
+                // live client.)
                 let next = incoming.context("accepting reattach (preempt)")?;
                 let _ = preempt_tx.send(());
                 let _ = (&mut attaching).await; // let `attach` abort its driver
@@ -484,7 +541,7 @@ async fn serve_persistent(
                 eprintln!("client detached; awaiting reattach…");
                 conn = match tokio::time::timeout(
                     reattach_timeout,
-                    mish_quic::transport::accept(&endpoint),
+                    accept_authenticated(&endpoint),
                 )
                 .await
                 {
@@ -551,7 +608,7 @@ async fn serve_shared(
         tokio::select! {
             // A new client joins the shared session (owner if the writer slot is
             // free, else a read-only viewer).
-            incoming = mish_quic::transport::accept(&endpoint) => {
+            incoming = accept_authenticated(&endpoint) => {
                 let conn = incoming.context("accepting a shared-session client")?;
                 let remote = conn.remote_address();
                 let role = spawn_attachment(

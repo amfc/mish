@@ -121,6 +121,63 @@ prediction overlay). Clean — no UB. Can't run the tokio/PTY layers (that's TSa
 - `mosh/tests/key_hygiene.rs`: the client key never appears in server stderr.
 - `instruction.rs`: compression-bomb cap (`inflate_rejects_a_bomb`).
 
+### 14. Exhaustive bounded model checking — `mish-ssp/src/stateright_model.rs` (Stateright)
+Where the sim (#2) drives the two real `SspCore`s through *one* random schedule
+per seed, this drives them through **every** schedule interleaving up to a bounded
+scenario length, via a [Stateright](https://www.stateright.rs/) `Model` whose
+nondeterminism *is* the schedule (which datagram to deliver next, drop, duplicate;
+when each side mutates its state). Runs as a plain `cargo test -p mish-ssp`
+(`stateright_model::tests::*`), so it's covered by CI's `cargo test --workspace`.
+- **Two link models:** an *adversarial* link (drop/dup/reorder) checks **safety** —
+  `no_divergence` (a receiver never holds a value the sender never sent),
+  `bounded_received`/`bounded_sent` (queue caps hold under sustained faults), and a
+  `sometimes can_converge` non-vacuity guard; a *fair* link (reorder but eventual
+  delivery, baked into the action policy) checks **liveness** — `eventually
+  converge`. Last run: ~134k unique adversarial states, ~1.6k fair states.
+- **Bounded, but a real theorem.** The real core has unbounded counters
+  (`next_seq`, state `num`s, ms timers) and `f64` RTT, so there's no finite closed
+  space. We bound the *scenario length* with a strictly-decreasing `steps_left`
+  budget (which also keeps the graph acyclic — required for sound `eventually`) and
+  exhaust all interleavings within it. The fingerprint (`Hash`/`Eq` on `SspCore`,
+  `cfg(test)` in `core.rs`) is faithful — every behavior-affecting field including
+  the `f64`s by bit pattern — so dedup never silently merges distinct cores.
+- **Found:** `add_sent_state` computed its eviction index as `len - 16`, assuming
+  `max_sent_states ≥ 16` (true for the default 32, so production never hit it). For
+  any smaller cap it underflowed — a debug panic, and in release a wrap to a no-op
+  `VecDeque::remove` that *leaks the memory bound*. Fixed to
+  `len.saturating_sub(16).max(1)` (identical for the production cap; never evicts
+  the acked front).
+
+### 15. Mutation testing — `cargo mutants` (tests the tests)
+Mutates the source (flip `<`→`<=`, delete a `?`, replace a fn body) and checks
+whether any test fails; a *surviving* mutant is a line we execute but don't
+assert on. Pointed at the parsers + SSP core (`core.rs`, `instruction.rs`,
+`frag.rs`, `states.rs` — 292 mutants). Not in CI (slow, and needs the binary);
+reproduce with the scratch dir off-`/tmp` (see learnings):
+
+```
+TMPDIR=$HOME/.cache/mutants-tmp cargo mutants -p mish-ssp \
+  -f crates/mish-ssp/src/{core,instruction,frag,states}.rs -j 8 \
+  -C --lib -C --test -C core_unit -C --test -C fuzz_decode -C --test -C fuzz_hostile \
+  -C --test -C integration -C --test -C proptest_ssp -C --test -C sim_convergence
+```
+(The randomized `fuzz_driver_live` is excluded: nondeterministic tests are unsound
+mutation oracles.)
+- **Found + closed:** the latency-critical **RTT estimator math** (`Rtt::sample`/
+  `rto`, ~32 mutants) had *no* assertions — convergence/model-check tests assert
+  *that* it syncs and stays bounded but ignore timing, so any change to the
+  Jacobson/Karels arithmetic survived. Added exact-value unit tests
+  (`core::rtt_tests`). Also `BytesState::diff_from` was only round-trip-tested, so
+  degrading `common_prefix_len` to `0` (reship the whole state) survived — added
+  `diff_compresses_shared_prefix`.
+- **Accepted survivors (triaged, not bugs):** the rest are (a) *timing/cadence
+  internals* (`calculate_timers`, `send_interval`, `timestamp_reply`, `recv`'s RTT
+  reorder-guard) that convergence legitimately doesn't depend on; (b) *perf knobs*
+  (`attempt_prospective_resend` — a documented A/B optimization; `process_throwaway_until`
+  GC, recovered by redundant resends); (c) *equivalent mutants* (`new_initial`
+  ↔ `Default::default()` — `BytesState`'s default *is* the empty state, unkillable).
+  Chasing these would pin perf/timing internals at high cost and low safety value.
+
 ## Learnings / tricky bits
 
 - **Corruption on an authenticated wire = a drop, not garbage.** A bit-flip that
@@ -160,6 +217,11 @@ prediction overlay). Clean — no UB. Can't run the tokio/PTY layers (that's TSa
   (program `/bin/bash`, argv[0] `-bash`) isn't expressible; we use `$SHELL -l`.
 - **Disk:** `-Zbuild-std` (TSan/Miri) roughly doubles the `target/` tree — it hit
   100% disk once; `cargo clean` reclaims it. CI uses a fresh runner so it's fine.
+- **`cargo mutants` copies the tree per parallel worker** into `$TMPDIR`. On this
+  box `/tmp` is a small rootfs and the copy pulls in the multi-GB `fuzz/target/`
+  (its nested `.gitignore` isn't honored), so it fills instantly — point `TMPDIR`
+  at a roomy `/home` path. Each test run is ~50s (the suite), so use `-j` and
+  exclude the long randomized `fuzz_driver_live`.
 - **Adding a `Screen` field means touching every `Screen { … }` literal in tests**
   (`state_sync.rs`, `display_roundtrip.rs`). Substring-edit the field block and let
   `cargo fmt` fix indentation.

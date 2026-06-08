@@ -19,6 +19,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DistinguishedName, SignatureScheme};
+use zeroize::Zeroizing;
 
 /// Datagram receive buffer (bytes): holds datagrams that have arrived but not yet
 /// been read. Modest — the driver drains promptly and the SSP layer keeps
@@ -113,8 +114,10 @@ pub struct SessionAuth {
     /// Client certificate (DER) — the server pins it to authenticate the client.
     pub client_cert_der: Vec<u8>,
     /// Client private key (PKCS#8 DER) — transmitted over SSH; the client
-    /// presents it during the QUIC/TLS handshake.
-    pub client_key_der: Vec<u8>,
+    /// presents it during the QUIC/TLS handshake. Wrapped in [`Zeroizing`] so the
+    /// secret is wiped from memory on drop (it derefs to `&[u8]`, so callers are
+    /// unaffected).
+    pub client_key_der: Zeroizing<Vec<u8>>,
 }
 
 /// A QUIC server config that **requires and pins a specific client certificate**
@@ -165,7 +168,7 @@ fn authenticated_rustls_server() -> (rustls::ServerConfig, SessionAuth) {
     let auth = SessionAuth {
         server_cert_der: server_cert_der.to_vec(),
         client_cert_der: client_cert_der.to_vec(),
-        client_key_der: client.key_pair.serialize_der(),
+        client_key_der: Zeroizing::new(client.key_pair.serialize_der()),
     };
     (rustls_server, auth)
 }

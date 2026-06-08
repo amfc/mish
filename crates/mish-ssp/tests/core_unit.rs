@@ -45,6 +45,7 @@ fn unknown_old_num_is_dropped() {
     let mut b = Core::new(0);
     let bogus = Instruction {
         protocol_version: PROTOCOL_VERSION,
+        seq: 0,
         old_num: 999, // b has no such reference state
         new_num: 1000,
         ack_num: 0,
@@ -67,6 +68,7 @@ fn wrong_protocol_version_ignored() {
     let mut b = Core::new(0);
     let inst = Instruction {
         protocol_version: PROTOCOL_VERSION + 1,
+        seq: 0,
         old_num: 0,
         new_num: 1,
         ack_num: 0,
@@ -200,6 +202,7 @@ fn malformed_diff_does_not_panic() {
     let mut b = Core::new(0);
     let inst = Instruction {
         protocol_version: PROTOCOL_VERSION,
+        seq: 0,
         old_num: 0,
         new_num: 1,
         ack_num: 0,

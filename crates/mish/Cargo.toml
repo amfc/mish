@@ -48,6 +48,8 @@ russh-config = "0.58"
 # No-echo passphrase/password prompt for the builtin bootstrap; unix + windows,
 # no C libraries (libc / windows-sys FFI only).
 rpassword = "7.5"
+# Zero the transmitted client key in memory on drop (defence-in-depth).
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

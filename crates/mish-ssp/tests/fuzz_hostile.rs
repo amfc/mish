@@ -29,6 +29,7 @@ fn arb_num() -> impl Strategy<Value = u64> {
 fn arb_instruction() -> impl Strategy<Value = Instruction> {
     (
         prop_oneof![Just(PROTOCOL_VERSION), any::<u32>()],
+        any::<u64>(),
         arb_num(),
         arb_num(),
         arb_num(),
@@ -40,6 +41,7 @@ fn arb_instruction() -> impl Strategy<Value = Instruction> {
         .prop_map(
             |(
                 protocol_version,
+                seq,
                 old_num,
                 new_num,
                 ack_num,
@@ -50,6 +52,7 @@ fn arb_instruction() -> impl Strategy<Value = Instruction> {
             )| {
                 Instruction {
                     protocol_version,
+                    seq,
                     old_num,
                     new_num,
                     ack_num,

@@ -18,3 +18,8 @@ base64 = "0.22"
 [dev-dependencies]
 proptest = { workspace = true }
 vt100 = "0.16.2"
+
+# `cargo kani` builds with `--cfg kani`; register it so the `#[cfg(kani)]` proof
+# module doesn't trip `unexpected_cfgs` under the workspace's `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

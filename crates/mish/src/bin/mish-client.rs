@@ -505,7 +505,8 @@ async fn attach_session(
     };
     let server_cert = next_der("server cert")?;
     let client_cert = next_der("client cert")?;
-    let client_key = next_der("client key")?;
+    // The private key from $MISH_CONNECT — zeroized on drop.
+    let client_key = zeroize::Zeroizing::new(next_der("client key")?);
 
     let addr: std::net::SocketAddr = format!("{ip}:{port}")
         .parse()

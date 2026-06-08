@@ -34,6 +34,18 @@ pub mod state;
 pub mod states;
 pub mod transport;
 
+/// Kani bounded-proof harnesses (run with `cargo kani`). Gated out of every
+/// normal build/test — see the module docs for what is and isn't provable here.
+#[cfg(kani)]
+mod kani_proofs;
+
+/// Exhaustive bounded model checking of SSP convergence (run with
+/// `cargo test -p mish-ssp`). Drives the real [`core::SspCore`] transition
+/// functions through every schedule interleaving up to a bounded scenario length
+/// — see the module docs for the safety/liveness properties and the bound.
+#[cfg(test)]
+mod stateright_model;
+
 pub use clock::{Clock, Millis, SystemClock, TokioClock};
 pub use core::{SspConfig, SspCore};
 pub use instruction::Instruction;

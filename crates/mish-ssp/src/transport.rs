@@ -12,6 +12,7 @@
 
 use bytes::Bytes;
 use std::fmt::Debug;
+use std::time::Duration;
 
 /// Errors a transport can surface. The protocol treats most send errors as a
 /// dropped datagram; [`TransportError::Closed`] ends the session.
@@ -44,5 +45,17 @@ pub trait Transport: Send + Sync + 'static {
     /// no practical limit return [`usize::MAX`]).
     fn max_datagram_size(&self) -> usize {
         usize::MAX
+    }
+
+    /// The transport's own smoothed round-trip-time estimate, if it keeps one.
+    /// QUIC does, and unlike our app-layer timestamp sampler it is robust to
+    /// reordering and retransmit ambiguity (RFC 9002: packet numbers strictly
+    /// increase and are never reused, and reordered acks don't pollute the
+    /// estimate). The SSP core prefers this over its internal estimator to derive
+    /// its send cadence and RTO — which keeps the RTO from ballooning under burst
+    /// reordering, the BRUTAL keyboard-tail fix (see `PERFORMANCE.md`). `None`
+    /// (the default) ⇒ no transport estimate; the core falls back to its own.
+    fn rtt(&self) -> Option<Duration> {
+        None
     }
 }

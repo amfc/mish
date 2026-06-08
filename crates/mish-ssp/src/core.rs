@@ -51,10 +51,17 @@ pub struct SspConfig {
     pub active_retry_timeout: Millis,
     /// Time to collect local input before sending (mosh `SEND_MINDELAY`).
     pub send_mindelay: Millis,
-    /// Retransmission timeout estimate. Mosh derives this from RTT; until the
-    /// datagram-layer RTT estimator lands we use a fixed value. Governs how long
-    /// an unacked state retains "benefit of the doubt".
+    /// Upper bound (and pre-RTT fallback) for the retransmission timeout. The RTO
+    /// is derived from the RTT estimate (see [`SspCore::set_transport_rtt`]) and
+    /// clamped to `[RTO_FLOOR, rto]`. Governs how long an unacked state retains
+    /// "benefit of the doubt".
     pub rto: Millis,
+    /// When driving the RTO from the transport's base (minimum) RTT,
+    /// `RTO = rto_srtt_factor · base_rtt` (clamped to `[RTO_FLOOR, rto]`). 1.5×
+    /// gives loss-detection margin over the path RTT without the reorder-inflated
+    /// blowup of `srtt + 4·rttvar`. Unused for the internal Jacobson path (no
+    /// transport RTT), which keeps `srtt + 4·rttvar`.
+    pub rto_srtt_factor: f64,
     /// Cap on retained sent states before middle entries are dropped.
     pub max_sent_states: usize,
     /// Cap on retained received states.
@@ -63,6 +70,35 @@ pub struct SspConfig {
     /// `attempt_prospective_resend_optimization`). On by default; exposed mainly
     /// so benchmarks can A/B its effect.
     pub prospective_resend: bool,
+    /// How fast to retransmit data that has been sent but not yet acked. See
+    /// [`ResendMode`]. Default [`ResendMode::FrameRateOnLoss`].
+    pub resend_mode: ResendMode,
+}
+
+/// Retransmit cadence for sent-but-unacked data (the BRUTAL keyboard-tail lever).
+///
+/// When a keystroke is sent, the sender gives it benefit-of-the-doubt for one
+/// RTO. If no ack arrives, that RTO has been *spent detecting the loss*; the
+/// question is how fast to retry afterwards. Retrying at the full RTO each time
+/// (`Rto`) is what fattens the BRUTAL p90 tail — a keystroke caught in a deep
+/// burst eats several whole RTOs, and BRUTAL's reorder inflates the RTO on top.
+/// See `PERFORMANCE.md`'s residual section and `examples/tail_probe.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResendMode {
+    /// Wait a full `timeout()` (RTO) + `ack_delay` between every retransmit.
+    /// Lowest bandwidth, fattest recovery tail under burst loss.
+    Rto,
+    /// Always re-poke at the data-frame interval. Thins the tail but over-sends
+    /// in the common *no-loss* case, which raises the median (more packets ⇒ more
+    /// burst exposure). Diagnostic only — see the probe.
+    FrameRate,
+    /// Loss-gated: behave like [`Rto`] until the first RTO elapses without an ack
+    /// (loss confirmed), then retry at the frame interval until the data is acked,
+    /// reverting to optimistic once back in sync. Thins the tail in the *sim*'s deep
+    /// synthetic bursts, but **did not** move the live-bench BRUTAL tail (whose
+    /// keystrokes mostly need a single retransmit) — kept as an A/B knob, not the
+    /// default. See `PERFORMANCE.md`.
+    FrameRateOnLoss,
 }
 
 impl Default for SspConfig {
@@ -75,10 +111,44 @@ impl Default for SspConfig {
             active_retry_timeout: 10_000,
             send_mindelay: 8,
             rto: 1000,
+            rto_srtt_factor: 1.5,
             max_sent_states: 32,
             max_received_states: 1024,
             prospective_resend: true,
+            // Stays `Rto`: the `FrameRateOnLoss` experiment thinned the *sim* tail
+            // but not the live-bench tail (real BRUTAL keystrokes mostly need one
+            // retransmit, so faster *subsequent* retries don't help — the win is in
+            // the first-detection RTO instead). See `PERFORMANCE.md`'s residual.
+            resend_mode: ResendMode::Rto,
         }
+    }
+}
+
+impl SspConfig {
+    /// Apply optional experimental overrides from the environment. No-op unless
+    /// the vars are set, so default behavior is unchanged. Used to A/B recovery
+    /// timing on the live bench stack (see `examples/tail_probe.rs` and
+    /// `PERFORMANCE.md`'s residual section): `MISH_SSP_RTO` caps the
+    /// retransmission timeout (ms), `MISH_SSP_SENDMAX` the data-frame interval.
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Some(v) = std::env::var("MISH_SSP_RTO").ok().and_then(|s| s.parse().ok()) {
+            self.rto = v;
+        }
+        if let Some(v) = std::env::var("MISH_SSP_SENDMAX").ok().and_then(|s| s.parse().ok()) {
+            self.send_interval_max = v;
+        }
+        if let Some(v) = std::env::var("MISH_SSP_RTO_FACTOR").ok().and_then(|s| s.parse().ok()) {
+            self.rto_srtt_factor = v;
+        }
+        if let Ok(v) = std::env::var("MISH_SSP_RESEND") {
+            self.resend_mode = match v.as_str() {
+                "rto" => ResendMode::Rto,
+                "frame" => ResendMode::FrameRate,
+                "frame_on_loss" => ResendMode::FrameRateOnLoss,
+                _ => self.resend_mode,
+            };
+        }
+        self
     }
 }
 
@@ -131,6 +201,11 @@ impl Rtt {
 /// `L` is the local state we send to the peer; `R` is the remote state we
 /// receive. (In mosh, a client is `SspCore<UserStream, Complete>` and the server
 /// is the mirror image `SspCore<Complete, UserStream>`.)
+///
+/// `Clone` is provided only under `cfg(test)` — the bounded model checker
+/// (`crate::stateright_model`) snapshots whole cores to fork the schedule; normal
+/// builds don't clone a live core.
+#[cfg_attr(test, derive(Clone))]
 pub struct SspCore<L: SyncState, R: SyncState> {
     cfg: SspConfig,
 
@@ -150,13 +225,44 @@ pub struct SspCore<L: SyncState, R: SyncState> {
     last_heard: Millis,
     /// Time of first pending change to `current_state`; `None` when in sync.
     mindelay_clock: Option<Millis>,
+    /// Monotonic per-packet sequence stamped on every emitted instruction (mosh's
+    /// `Packet::seq`). Used by the *peer's* receiver as a reorder guard for RTT.
+    next_seq: u64,
+    /// True once an RTO has elapsed without the latest data being acked (loss
+    /// confirmed for the current outstanding state). Gates `FrameRateOnLoss`'s
+    /// switch to frame-rate retries; cleared when everything we sent is acked.
+    in_loss_recovery: bool,
+    /// The transport's smoothed RTT (ms), injected via
+    /// [`set_transport_rtt`](SspCore::set_transport_rtt). When `Some`, it drives
+    /// the send cadence in place of the internal timestamp estimator.
+    transport_srtt_ms: Option<f64>,
+    /// Running minimum of the injected transport RTT (ms) — an estimate of the
+    /// link's *base* RTT. The RTO is derived from this rather than the smoothed
+    /// RTT, because under burst loss/reorder even QUIC's smoothed RTT inflates
+    /// (loss + ack-delay), whereas the minimum stays near the true path RTT. That
+    /// keeps loss detection fast under BRUTAL yet still scales on a genuinely slow
+    /// link (where the minimum is itself large). The fix for the keyboard tail.
+    transport_min_rtt_ms: Option<f64>,
 
     // ---- Receiver half (incoming `R`) ----
     /// Sorted ascending by num; front = oldest retained, back = newest.
     received_states: VecDeque<Timestamped<R>>,
+    /// Highest peer `seq` seen + 1 (mosh's `expected_receiver_seq`). A received
+    /// instruction with `seq` below this is reordered/late and is excluded from
+    /// RTT sampling (its echoed timestamp is stale), though its state is still
+    /// applied. This keeps reordered acks from inflating the RTO. See [`recv`].
+    expected_recv_seq: u64,
 
     // ---- RTT estimation ----
     rtt: Rtt,
+    /// Running minimum of the (seq-guarded) internal RTT *samples* — our own
+    /// `min_rtt`, an estimate of the base path RTT. Loss/reorder/jitter only ever
+    /// *add* to a sample, so they never lower the minimum; it tracks the true RTT.
+    /// The RTO is derived from this (× [`SspConfig::rto_srtt_factor`]) rather than
+    /// `srtt + 4·rttvar`, which inflates under burst loss and fattens the keyboard
+    /// tail. This is the self-contained (no-transport) form of the tail fix, and
+    /// the one the deterministic sim exercises.
+    internal_min_rtt_ms: Option<f64>,
     /// Most recent timestamp received from the peer, and when we received it, so
     /// we can echo it adjusted for the time we held it.
     saved_timestamp: Option<u16>,
@@ -201,8 +307,14 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             pending_data_ack: false,
             last_heard: 0,
             mindelay_clock: None,
+            next_seq: 0,
+            in_loss_recovery: false,
+            transport_srtt_ms: None,
+            transport_min_rtt_ms: None,
             received_states,
+            expected_recv_seq: 0,
             rtt: Rtt::new(),
+            internal_min_rtt_ms: None,
             saved_timestamp: None,
             saved_timestamp_received_at: 0,
             shutdown_in_progress: false,
@@ -239,12 +351,38 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
 
     /// Smoothed round-trip time estimate in milliseconds (the configured RTO
     /// until the first RTT sample arrives). Drives adaptive predictive echo.
+    /// Prefers the transport's estimate when one has been injected.
     pub fn srtt_ms(&self) -> f64 {
-        if self.rtt.initialized {
+        if let Some(s) = self.transport_srtt_ms {
+            s
+        } else if self.rtt.initialized {
             self.rtt.srtt
         } else {
             self.cfg.rto as f64
         }
+    }
+
+    /// Inject the transport's smoothed RTT (ms), which then drives the send
+    /// cadence and RTO instead of the internal timestamp sampler. QUIC's estimate
+    /// is robust to the reordering that inflates our own `rttvar` (and thus the
+    /// RTO and the BRUTAL keyboard tail — see `PERFORMANCE.md`). `None` reverts to
+    /// the internal estimator (the path the sim/tests exercise). The driver calls
+    /// this each loop with `transport.rtt()`.
+    pub fn set_transport_rtt(&mut self, srtt_ms: Option<f64>) {
+        self.transport_srtt_ms = srtt_ms;
+        if let Some(s) = srtt_ms {
+            self.transport_min_rtt_ms = Some(match self.transport_min_rtt_ms {
+                Some(m) => m.min(s),
+                None => s,
+            });
+        }
+    }
+
+    /// The smoothed RTT used for timing decisions: the transport's if injected,
+    /// else the internal sample, else `None` (no estimate yet).
+    fn effective_srtt(&self) -> Option<f64> {
+        self.transport_srtt_ms
+            .or(self.rtt.initialized.then_some(self.rtt.srtt))
     }
 
     /// Begin a clean shutdown: subsequent ticks send `SHUTDOWN_NUM` instructions
@@ -274,6 +412,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         let front = self.sent_states.front().expect("never empty").num;
         out.push(Instruction {
             protocol_version: PROTOCOL_VERSION,
+            seq: self.next_seq,
             old_num: self.assumed().num,
             new_num: crate::instruction::SHUTDOWN_NUM,
             ack_num: self.ack_num,
@@ -282,12 +421,19 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             timestamp: (now & 0xFFFF) as u16,
             timestamp_reply: self.timestamp_reply(now),
         });
+        self.next_seq += 1;
     }
 
     /// Number of retained received states (for tests/observability: must stay
     /// bounded by the configured cap even under hostile input).
     pub fn received_state_count(&self) -> usize {
         self.received_states.len()
+    }
+
+    /// Number of retained sent states (for tests/observability: must stay bounded
+    /// by [`SspConfig::max_sent_states`]).
+    pub fn sent_state_count(&self) -> usize {
+        self.sent_states.len()
     }
 
     /// Whether everything we've produced has been acknowledged by the peer.
@@ -307,10 +453,9 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         // backing off only adds interactive latency. QUIC's own congestion control
         // already protects the network.)
         let lo = self.cfg.send_interval_min.min(self.cfg.send_interval_max);
-        if self.rtt.initialized {
-            (self.rtt.srtt / 2.0).ceil() as Millis
-        } else {
-            self.cfg.send_interval_min
+        match self.effective_srtt() {
+            Some(srtt) => (srtt / 2.0).ceil() as Millis,
+            None => self.cfg.send_interval_min,
         }
         .clamp(lo, self.cfg.send_interval_max)
     }
@@ -324,8 +469,15 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         // conservative upper bound; the floor keeps us from over-eager resends.
         // If a caller configures `rto` *below* the floor (unusual), honor their
         // smaller bound rather than panicking on an inverted clamp range.
-        if self.rtt.initialized {
-            let floor = Self::RTO_FLOOR.min(self.cfg.rto);
+        let floor = Self::RTO_FLOOR.min(self.cfg.rto);
+        // Prefer a *base* (minimum) RTT — transport's if injected, else our own
+        // seq-guarded min sample. Under burst loss/reorder the smoothed RTT inflates
+        // (loss + ack-delay) and would balloon the RTO; the base RTT does not.
+        // `factor · base_rtt` gives margin while keeping loss detection fast.
+        if let Some(base) = self.transport_min_rtt_ms.or(self.internal_min_rtt_ms) {
+            ((base * self.cfg.rto_srtt_factor).ceil() as Millis).clamp(floor, self.cfg.rto)
+        } else if self.rtt.initialized {
+            // No min sample yet (very first round trips): fall back to Jacobson.
             (self.rtt.rto().ceil() as Millis).clamp(floor, self.cfg.rto)
         } else {
             self.cfg.rto
@@ -377,14 +529,25 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             self.next_ack_time = now.saturating_add(self.cfg.ack_delay);
         }
 
-        let back = self.sent_states.back().expect("never empty");
-        let front = self.sent_states.front().expect("never empty");
+        let back_ts = self.sent_states.back().expect("never empty").timestamp;
+        let has_new_data =
+            !self.current_state.equals(&self.sent_states.back().expect("never empty").state);
+        let unacked =
+            !self.current_state.equals(&self.sent_states.front().expect("never empty").state);
+        let assumed_delivered = self.current_state.equals(&self.assumed().state);
         let active = self
             .last_heard
             .saturating_add(self.cfg.active_retry_timeout)
             > now;
 
-        if !self.current_state.equals(&back.state) {
+        // Once everything we've produced is acked, leave loss-recovery so the next
+        // keystroke starts optimistic again (this is what preserves the no-loss
+        // median under `FrameRateOnLoss`).
+        if !unacked {
+            self.in_loss_recovery = false;
+        }
+
+        if has_new_data {
             // We have new local data not yet sent.
             if self.mindelay_clock.is_none() {
                 self.mindelay_clock = Some(now);
@@ -393,28 +556,44 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
                 .mindelay_clock
                 .unwrap()
                 .saturating_add(self.cfg.send_mindelay);
-            self.next_send_time = mindelay.max(back.timestamp.saturating_add(self.send_interval()));
-        } else if !self.current_state.equals(&self.assumed().state) && active {
-            // Sent, but not yet (assumed) delivered — retransmit at frame rate.
-            self.next_send_time = back.timestamp.saturating_add(self.send_interval());
+            self.next_send_time = mindelay.max(back_ts.saturating_add(self.send_interval()));
+        } else if !assumed_delivered && active {
+            // The assumed-receiver state has reverted below our latest send: a full
+            // RTO elapsed with no ack, so that datagram was lost. Confirm loss
+            // recovery (gating `FrameRateOnLoss`) and retransmit at frame rate.
+            self.in_loss_recovery = true;
+            self.next_send_time = back_ts.saturating_add(self.send_interval());
             if let Some(mc) = self.mindelay_clock {
                 self.next_send_time = self
                     .next_send_time
                     .max(mc.saturating_add(self.cfg.send_mindelay));
             }
-        } else if !self.current_state.equals(&front.state) && active {
-            // Unacked but assumed-delivered: wait a full timeout before re-poking.
-            self.next_send_time = back
-                .timestamp
-                .saturating_add(self.timeout())
-                .saturating_add(self.cfg.ack_delay);
+        } else if unacked && active {
+            // Sent and still *assumed* delivered, but not yet acked. Normally wait a
+            // full RTO before re-poking (prospective-resend re-anchors the diff to
+            // the acked front, so the re-poke is a real retransmit). The resend mode
+            // can instead retry at the frame interval — always (`FrameRate`) or only
+            // after loss is confirmed (`FrameRateOnLoss`), which thins the burst tail
+            // while keeping the common no-loss case at one send. See `ResendMode`.
+            let fast = match self.cfg.resend_mode {
+                ResendMode::FrameRate => true,
+                ResendMode::FrameRateOnLoss => self.in_loss_recovery,
+                ResendMode::Rto => false,
+            };
+            self.next_send_time = if fast {
+                back_ts.saturating_add(self.send_interval())
+            } else {
+                back_ts
+                    .saturating_add(self.timeout())
+                    .saturating_add(self.cfg.ack_delay)
+            };
         } else {
             self.next_send_time = NEVER;
         }
 
         if self.ack_num == u64::MAX {
             // shutdown special-case (reserved)
-            self.next_ack_time = back.timestamp.saturating_add(self.send_interval());
+            self.next_ack_time = back_ts.saturating_add(self.send_interval());
         }
     }
 
@@ -583,8 +762,12 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         });
         if self.sent_states.len() > self.cfg.max_sent_states {
             // Drop a state from the middle (keep the acked front and recent tail),
-            // mirroring mosh's add_sent_state.
-            let remove = self.sent_states.len() - 16;
+            // mirroring mosh's add_sent_state. Clamp the index: `len - 16` matches
+            // mosh for the production cap (32), but a `max_sent_states < 16` would
+            // otherwise underflow (and in release wrap to a no-op `remove`, leaking
+            // the bound). `.max(1)` also guarantees we never evict the front (the
+            // acked anchor `emit`/`process_throwaway_until` rely on).
+            let remove = self.sent_states.len().saturating_sub(16).max(1);
             self.sent_states.remove(remove);
         }
     }
@@ -594,6 +777,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         // layer up (the session Driver fragments by transport MTU).
         out.push(Instruction {
             protocol_version: PROTOCOL_VERSION,
+            seq: self.next_seq,
             old_num: self.assumed().num,
             new_num,
             ack_num: self.ack_num,
@@ -602,6 +786,7 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             timestamp: (now & 0xFFFF) as u16,
             timestamp_reply: self.timestamp_reply(now),
         });
+        self.next_seq += 1;
         self.pending_data_ack = false;
     }
 
@@ -614,17 +799,29 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
             return;
         }
 
-        // 0. RTT bookkeeping: take a round-trip sample from our echoed timestamp,
-        //    and remember the peer's timestamp so we can echo it back.
-        if let Some(reply) = inst.timestamp_reply {
-            let sample = (now as u16).wrapping_sub(reply) as Millis;
-            // Guard against absurd samples from clock skew / wraparound.
-            if sample < 60_000 {
-                self.rtt.sample(sample);
+        // 0. RTT bookkeeping — *only for in-order packets* (mosh's reorder guard:
+        //    `if p.seq < expected_receiver_seq { return p.payload; }`). A reordered
+        //    / late datagram carries a stale echoed timestamp; sampling RTT from it
+        //    (or echoing its timestamp back) would inflate the estimate and balloon
+        //    the RTO — the BRUTAL keyboard-tail bug. Out-of-order packets still flow
+        //    through to state application below; they just don't touch timing.
+        if inst.seq >= self.expected_recv_seq {
+            self.expected_recv_seq = inst.seq.wrapping_add(1);
+            // Take a round-trip sample from our echoed timestamp, and remember the
+            // peer's timestamp so we can echo it back.
+            if let Some(reply) = inst.timestamp_reply {
+                let sample = (now as u16).wrapping_sub(reply) as Millis;
+                // Guard against absurd samples from clock skew / wraparound.
+                if sample < 60_000 {
+                    self.rtt.sample(sample);
+                    let s = sample as f64;
+                    self.internal_min_rtt_ms =
+                        Some(self.internal_min_rtt_ms.map_or(s, |m| m.min(s)));
+                }
             }
+            self.saved_timestamp = Some(inst.timestamp);
+            self.saved_timestamp_received_at = now;
         }
-        self.saved_timestamp = Some(inst.timestamp);
-        self.saved_timestamp_received_at = now;
 
         // Shutdown handshake.
         if inst.ack_num == crate::instruction::SHUTDOWN_NUM {
@@ -708,5 +905,197 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         {
             self.received_states.pop_front();
         }
+    }
+}
+
+/// Faithful `Hash` / `Eq` / `Debug` for the bounded model checker
+/// (`crate::stateright_model`). Stateright fingerprints every reachable state, so
+/// `SspCore` must hash and compare *all* behavior-affecting fields — including the
+/// `f64` RTT estimators, which we fold in by their exact bit pattern so two cores
+/// compare equal iff they are byte-identical (a sound, non-merging abstraction:
+/// distinct cores never collide). `SspConfig` is deliberately excluded — it is
+/// constant for the lifetime of a run, so it can't distinguish two reachable
+/// states. These live under `cfg(test)` so they impose nothing on normal builds,
+/// and inside the defining module so they can read the private fields.
+#[cfg(test)]
+mod model_check_traits {
+    use super::{Rtt, SspCore, Timestamped};
+    use crate::state::SyncState;
+    use std::fmt;
+    use std::hash::{Hash, Hasher};
+
+    fn hash_opt_f64<H: Hasher>(x: &Option<f64>, h: &mut H) {
+        match x {
+            Some(v) => {
+                1u8.hash(h);
+                v.to_bits().hash(h);
+            }
+            None => 0u8.hash(h),
+        }
+    }
+
+    fn opt_f64_eq(a: &Option<f64>, b: &Option<f64>) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => x.to_bits() == y.to_bits(),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn ts_eq<S: PartialEq>(a: &Timestamped<S>, b: &Timestamped<S>) -> bool {
+        a.timestamp == b.timestamp && a.num == b.num && a.state == b.state
+    }
+
+    fn hash_ts<S: Hash, H: Hasher>(t: &Timestamped<S>, h: &mut H) {
+        t.timestamp.hash(h);
+        t.num.hash(h);
+        t.state.hash(h);
+    }
+
+    impl<L: SyncState + Hash, R: SyncState + Hash> Hash for SspCore<L, R> {
+        fn hash<H: Hasher>(&self, h: &mut H) {
+            self.current_state.hash(h);
+            self.sent_states.len().hash(h);
+            for t in &self.sent_states {
+                hash_ts(t, h);
+            }
+            self.assumed_receiver_idx.hash(h);
+            self.next_ack_time.hash(h);
+            self.next_send_time.hash(h);
+            self.ack_num.hash(h);
+            self.pending_data_ack.hash(h);
+            self.last_heard.hash(h);
+            self.mindelay_clock.hash(h);
+            self.next_seq.hash(h);
+            self.in_loss_recovery.hash(h);
+            hash_opt_f64(&self.transport_srtt_ms, h);
+            hash_opt_f64(&self.transport_min_rtt_ms, h);
+            self.received_states.len().hash(h);
+            for t in &self.received_states {
+                hash_ts(t, h);
+            }
+            self.expected_recv_seq.hash(h);
+            let Rtt {
+                srtt,
+                rttvar,
+                initialized,
+            } = self.rtt;
+            srtt.to_bits().hash(h);
+            rttvar.to_bits().hash(h);
+            initialized.hash(h);
+            hash_opt_f64(&self.internal_min_rtt_ms, h);
+            self.saved_timestamp.hash(h);
+            self.saved_timestamp_received_at.hash(h);
+            self.shutdown_in_progress.hash(h);
+            self.shutdown_acked.hash(h);
+            self.peer_shutdown.hash(h);
+        }
+    }
+
+    impl<L: SyncState + PartialEq, R: SyncState + PartialEq> PartialEq for SspCore<L, R> {
+        fn eq(&self, o: &Self) -> bool {
+            self.current_state == o.current_state
+                && self.sent_states.len() == o.sent_states.len()
+                && self
+                    .sent_states
+                    .iter()
+                    .zip(&o.sent_states)
+                    .all(|(a, b)| ts_eq(a, b))
+                && self.assumed_receiver_idx == o.assumed_receiver_idx
+                && self.next_ack_time == o.next_ack_time
+                && self.next_send_time == o.next_send_time
+                && self.ack_num == o.ack_num
+                && self.pending_data_ack == o.pending_data_ack
+                && self.last_heard == o.last_heard
+                && self.mindelay_clock == o.mindelay_clock
+                && self.next_seq == o.next_seq
+                && self.in_loss_recovery == o.in_loss_recovery
+                && opt_f64_eq(&self.transport_srtt_ms, &o.transport_srtt_ms)
+                && opt_f64_eq(&self.transport_min_rtt_ms, &o.transport_min_rtt_ms)
+                && self.received_states.len() == o.received_states.len()
+                && self
+                    .received_states
+                    .iter()
+                    .zip(&o.received_states)
+                    .all(|(a, b)| ts_eq(a, b))
+                && self.expected_recv_seq == o.expected_recv_seq
+                && self.rtt.srtt.to_bits() == o.rtt.srtt.to_bits()
+                && self.rtt.rttvar.to_bits() == o.rtt.rttvar.to_bits()
+                && self.rtt.initialized == o.rtt.initialized
+                && opt_f64_eq(&self.internal_min_rtt_ms, &o.internal_min_rtt_ms)
+                && self.saved_timestamp == o.saved_timestamp
+                && self.saved_timestamp_received_at == o.saved_timestamp_received_at
+                && self.shutdown_in_progress == o.shutdown_in_progress
+                && self.shutdown_acked == o.shutdown_acked
+                && self.peer_shutdown == o.peer_shutdown
+        }
+    }
+
+    impl<L: SyncState + PartialEq, R: SyncState + PartialEq> Eq for SspCore<L, R> {}
+
+    impl<L: SyncState + fmt::Debug, R: SyncState + fmt::Debug> fmt::Debug for SspCore<L, R> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let sent: Vec<u64> = self.sent_states.iter().map(|t| t.num).collect();
+            let recv: Vec<u64> = self.received_states.iter().map(|t| t.num).collect();
+            f.debug_struct("SspCore")
+                .field("current", &self.current_state)
+                .field("remote", &self.received_states.back().map(|t| &t.state))
+                .field("sent_nums", &sent)
+                .field("recv_nums", &recv)
+                .field("ack_num", &self.ack_num)
+                .field("next_seq", &self.next_seq)
+                .finish()
+        }
+    }
+}
+
+/// Unit tests for the RTT estimator. The convergence/model-check tests assert
+/// *that* the protocol syncs and stays bounded, but deliberately ignore timing —
+/// so the latency-critical Jacobson/Karels arithmetic (mosh's keyboard-tail
+/// math) was otherwise unpinned. These pin it to exact values; the inputs are
+/// chosen so every intermediate is dyadic (exactly representable in `f64`), so
+/// any arithmetic change (operator swap, dropped `.abs()`, skipped seeding) moves
+/// a result and is caught. (Surfaced by `cargo mutants`.)
+#[cfg(test)]
+mod rtt_tests {
+    use super::Rtt;
+
+    #[test]
+    fn first_sample_seeds_srtt_and_rttvar() {
+        let mut rtt = Rtt::new();
+        rtt.sample(120);
+        assert!(rtt.initialized);
+        assert_eq!(rtt.srtt, 120.0); // srtt = r
+        assert_eq!(rtt.rttvar, 60.0); // rttvar = r / 2
+        assert_eq!(rtt.rto(), 120.0 + 4.0 * 60.0); // rto = srtt + 4*rttvar
+    }
+
+    #[test]
+    fn second_sample_applies_jacobson_ewma() {
+        let mut rtt = Rtt::new();
+        rtt.sample(100); // seeds srtt=100, rttvar=50
+        rtt.sample(200);
+        // rttvar = 3/4*50 + 1/4*|100-200| = 37.5 + 25 = 62.5
+        // srtt   = 7/8*100 + 1/8*200      = 87.5 + 25 = 112.5
+        assert_eq!(rtt.rttvar, 62.5);
+        assert_eq!(rtt.srtt, 112.5);
+        assert_eq!(rtt.rto(), 112.5 + 4.0 * 62.5);
+    }
+
+    #[test]
+    fn rttvar_uses_absolute_deviation() {
+        // A sample below srtt must move rttvar exactly like one equally above it:
+        // pins the `.abs()` (a `srtt - r` -> `srtt + r` mutation breaks this).
+        let mut below = Rtt::new();
+        below.sample(100);
+        below.sample(40); // |100-40| = 60
+        let mut above = Rtt::new();
+        above.sample(100);
+        above.sample(160); // |100-160| = 60
+        assert_eq!(below.rttvar, above.rttvar);
+        assert_eq!(below.rttvar, 52.5); // 3/4*50 + 1/4*60
+        // srtt is directional, though:
+        assert_eq!(below.srtt, 92.5); // 7/8*100 + 1/8*40
+        assert_eq!(above.srtt, 107.5); // 7/8*100 + 1/8*160
     }
 }
