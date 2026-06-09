@@ -67,7 +67,30 @@ async fn ctrl_c_interrupts_yes_flood() {
 
     // Send Ctrl-C: SIGINT should kill `yes` and return to the shell prompt.
     cin_tx.send(ClientInput::Keys(vec![0x03])).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Wait for the flood to actually stop before typing the next command. A fixed
+    // sleep is too fragile on a slow/loaded CI runner: if SIGINT hasn't killed
+    // `yes` yet, the echo keystrokes are typed into the still-running flood and
+    // lost. Instead poll until the render output goes quiet (no new bytes for
+    // ~250ms). If Ctrl-C failed to interrupt, `yes` keeps flooding, this never
+    // settles, and the sentinel check below still fails as intended.
+    {
+        let mut last = 0usize;
+        let mut quiet = 0;
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let len = seen.lock().unwrap().len();
+            if len == last {
+                quiet += 1;
+                if quiet >= 5 {
+                    break;
+                }
+            } else {
+                quiet = 0;
+                last = len;
+            }
+        }
+    }
 
     // Now run a command only the *shell* (not `yes`) would execute.
     cin_tx
@@ -75,7 +98,7 @@ async fn ctrl_c_interrupts_yes_flood() {
         .await
         .unwrap();
 
-    let ok = tokio::time::timeout(Duration::from_secs(5), async {
+    let ok = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             {
                 let buf = seen.lock().unwrap();
