@@ -10,7 +10,7 @@ async fn read_connect_port(child: &mut tokio::process::Child) -> u16 {
     let mut lines = BufReader::new(stdout).lines();
     while let Some(line) = lines.next_line().await.unwrap() {
         let mut it = line.split_whitespace();
-        if it.next() == Some("MOSH") && it.next() == Some("CONNECT") {
+        if it.next() == Some("MISH") && it.next() == Some("CONNECT") {
             return it.next().unwrap().parse().unwrap();
         }
     }

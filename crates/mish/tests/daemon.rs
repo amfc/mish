@@ -39,7 +39,7 @@ async fn detach_survives_parent_exit() {
     let mut conn = None;
     while let Some(line) = lines.next_line().await.unwrap() {
         let mut it = line.split_whitespace();
-        if it.next() == Some("MOSH") && it.next() == Some("CONNECT") {
+        if it.next() == Some("MISH") && it.next() == Some("CONNECT") {
             let port: u16 = it.next().unwrap().parse().unwrap();
             let server_cert = from_hex(it.next().unwrap()).unwrap();
             let client_cert = from_hex(it.next().unwrap()).unwrap();

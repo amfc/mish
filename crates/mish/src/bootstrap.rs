@@ -1097,7 +1097,7 @@ async fn read_connect(child: &mut Child) -> Result<ConnectInfo> {
 /// stale server can't silently downgrade to no client auth.
 fn parse_connect(line: &str) -> Option<ConnectInfo> {
     let mut it = line.split_whitespace();
-    if it.next()? != "MOSH" || it.next()? != "CONNECT" {
+    if it.next()? != "MISH" || it.next()? != "CONNECT" {
         return None;
     }
     let port: u16 = it.next()?.parse().ok()?;
