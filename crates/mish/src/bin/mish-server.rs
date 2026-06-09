@@ -260,7 +260,10 @@ fn main() -> Result<()> {
     // forked child, so logging keeps working after we detach.
     if let Some(path) = &opts.log_file {
         if let Err(e) = mish::trace::init_file_logging(path, "server", opts.log_level) {
-            eprintln!("mish: warning: could not open log file {}: {e}", path.display());
+            eprintln!(
+                "mish: warning: could not open log file {}: {e}",
+                path.display()
+            );
         }
     }
     tracing::info!(target: "mish::server", detach = opts.detach, persist = opts.persist, "server starting");
@@ -400,15 +403,14 @@ async fn serve(
 
     // Signal timeout: give up if no client connects within the window.
     let signal_timeout = env_secs("MOSH_SERVER_SIGNAL_TMOUT", 60);
-    let t =
-        match tokio::time::timeout(signal_timeout, accept_authenticated(&endpoint)).await {
-            Ok(conn) => conn.context("accepting QUIC connection")?,
-            Err(_) => {
-                eprintln!("no client connected within the signal timeout; exiting");
-                tracing::info!(target: "mish::server", "no client within signal timeout; exiting");
-                return Ok(());
-            }
-        };
+    let t = match tokio::time::timeout(signal_timeout, accept_authenticated(&endpoint)).await {
+        Ok(conn) => conn.context("accepting QUIC connection")?,
+        Err(_) => {
+            eprintln!("no client connected within the signal timeout; exiting");
+            tracing::info!(target: "mish::server", "no client within signal timeout; exiting");
+            return Ok(());
+        }
+    };
     eprintln!("client connected from {}", t.remote_address());
     tracing::info!(target: "mish::server", remote = %t.remote_address(), persist, "client connected");
 
@@ -497,16 +499,14 @@ async fn serve_persistent(
         // time. We race the attachment against `accept()`; whichever fires first
         // wins, and a newcomer cancels the attachment cleanly.
         let (preempt_tx, preempt_rx) = tokio::sync::oneshot::channel::<()>();
-        let attaching = session
-            .clone()
-            .attach(
-                transport,
-                network_timeout,
-                async move {
-                    let _ = preempt_rx.await;
-                },
-                Role::Owner,
-            );
+        let attaching = session.clone().attach(
+            transport,
+            network_timeout,
+            async move {
+                let _ = preempt_rx.await;
+            },
+            Role::Owner,
+        );
         tokio::pin!(attaching);
 
         let end = tokio::select! {
@@ -539,11 +539,8 @@ async fn serve_persistent(
                 // within the window. A hard drop is handled by the preempt arm
                 // above, so this path is the graceful case.
                 eprintln!("client detached; awaiting reattach…");
-                conn = match tokio::time::timeout(
-                    reattach_timeout,
-                    accept_authenticated(&endpoint),
-                )
-                .await
+                conn = match tokio::time::timeout(reattach_timeout, accept_authenticated(&endpoint))
+                    .await
                 {
                     Ok(c) => c.context("accepting reattach")?,
                     Err(_) => {
@@ -684,7 +681,12 @@ fn spawn_attachment(
             allow_forward,
         ));
         let end = session
-            .attach(transport, network_timeout, std::future::pending::<()>(), role)
+            .attach(
+                transport,
+                network_timeout,
+                std::future::pending::<()>(),
+                role,
+            )
             .await;
         hist.abort();
         // Free the writer slot so a later client can become owner.

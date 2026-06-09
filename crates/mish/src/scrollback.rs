@@ -61,7 +61,9 @@ pub async fn fetch_history(
     let (mut send, mut recv) = transport.open_side_channel().await.ok()?;
     // Tag the stream as a history request so the server's dispatcher routes it
     // here, then send the request itself.
-    write_message(&mut send, &StreamHello::History.encode()).await.ok()?;
+    write_message(&mut send, &StreamHello::History.encode())
+        .await
+        .ok()?;
     write_message(&mut send, &req.encode()).await.ok()?;
     send.finish().ok()?;
     let bytes = read_message(&mut recv, MAX_MESSAGE_LEN).await.ok()??;

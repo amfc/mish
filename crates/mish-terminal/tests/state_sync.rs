@@ -71,7 +71,19 @@ fn arb_screen() -> impl Strategy<Value = Screen> {
             any::<bool>(), // alt_screen
         )
             .prop_map(
-                |(cols, rows, cells, cr, cc, cv, title, echo_ack, focus, alt_scroll, alt_screen)| {
+                |(
+                    cols,
+                    rows,
+                    cells,
+                    cr,
+                    cc,
+                    cv,
+                    title,
+                    echo_ack,
+                    focus,
+                    alt_scroll,
+                    alt_screen,
+                )| {
                     Screen {
                         cols,
                         rows,

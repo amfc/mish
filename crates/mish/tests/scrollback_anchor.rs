@@ -73,7 +73,11 @@ async fn scroll_window_stays_anchored_when_output_arrives() {
     });
 
     let client_ep = transport::loopback_client().unwrap();
-    let t = Arc::new(transport::connect(&client_ep, addr, "localhost").await.unwrap());
+    let t = Arc::new(
+        transport::connect(&client_ep, addr, "localhost")
+            .await
+            .unwrap(),
+    );
     let (cin_tx, cin_rx) = mpsc::channel::<ClientInput>(64);
     let (cout_tx, mut cout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let hist: Arc<dyn HistoryFetcher> = Arc::new(QuicHistory(t.clone()));
@@ -104,7 +108,10 @@ async fn scroll_window_stays_anchored_when_output_arrives() {
     // Build 200 lines of history.
     tokio::time::sleep(Duration::from_millis(400)).await;
     for i in 1..=200u32 {
-        pty_out_tx.send(format!("MARK{i} END\r\n").into_bytes()).await.unwrap();
+        pty_out_tx
+            .send(format!("MARK{i} END\r\n").into_bytes())
+            .await
+            .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     while cout_rx.try_recv().is_ok() {} // discard the live frames
@@ -119,7 +126,10 @@ async fn scroll_window_stays_anchored_when_output_arrives() {
     // Output arrives while we sit scrolled: 60 new lines grow the buffer at the
     // bottom (more than two pages above us would be if anchored to the live edge).
     for k in 1..=60u32 {
-        pty_out_tx.send(format!("FILL{k}\r\n").into_bytes()).await.unwrap();
+        pty_out_tx
+            .send(format!("FILL{k}\r\n").into_bytes())
+            .await
+            .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     while cout_rx.try_recv().is_ok() {}
@@ -129,7 +139,10 @@ async fn scroll_window_stays_anchored_when_output_arrives() {
     // overlap or sit *newer* than W1 (scrolling up appeared to go nowhere / back).
     cin_tx.send(ClientInput::ScrollUp).await.unwrap();
     let w2 = window(&mut cout_rx, Duration::from_millis(300)).await;
-    assert!(!w2.is_empty(), "scroll-up after output should still render history");
+    assert!(
+        !w2.is_empty(),
+        "scroll-up after output should still render history"
+    );
 
     let w1_min = *w1.iter().min().unwrap();
     let w2_max = *w2.iter().max().unwrap();

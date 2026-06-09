@@ -355,7 +355,10 @@ pub async fn builtin(
         let h = client::connect_stream(rconfig.clone(), stream, handler)
             .await
             .with_context(|| {
-                format!("connecting to {}:{} via ProxyJump", target.hostname, target.port)
+                format!(
+                    "connecting to {}:{} via ProxyJump",
+                    target.hostname, target.port
+                )
             })?;
         (h, jumps)
     };
@@ -472,7 +475,12 @@ enum HostKeyVerdict {
 /// `Rejected` is fail-closed: a known host whose key changed is the
 /// security-critical case, so anything that isn't a clean match-or-absent is a
 /// refusal.
-fn classify_host_key(host: &str, port: u16, key: &PublicKey, path: Option<&Path>) -> HostKeyVerdict {
+fn classify_host_key(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: Option<&Path>,
+) -> HostKeyVerdict {
     let checked = match path {
         Some(p) => russh::keys::check_known_hosts_path(host, port, key, p),
         None => russh::keys::check_known_hosts(host, port, key),
@@ -497,7 +505,10 @@ struct BuiltinHandler {
 impl client::Handler for BuiltinHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
         let path = self.known_hosts_path.clone();
         match classify_host_key(&self.host, self.port, server_public_key, path.as_deref()) {
             HostKeyVerdict::Trusted => Ok(true),
@@ -584,9 +595,9 @@ async fn confirm_and_record_new_host(
         None => russh::keys::known_hosts::learn_known_hosts(host, port, key),
     };
     match recorded {
-        Ok(()) => eprintln!(
-            "[mish-client] permanently added '{host}:{port}' ({algo}) to known_hosts."
-        ),
+        Ok(()) => {
+            eprintln!("[mish-client] permanently added '{host}:{port}' ({algo}) to known_hosts.")
+        }
         Err(e) => eprintln!(
             "[mish-client] warning: trusted {host}:{port} for this session but could not \
              save it to known_hosts ({e}); you will be asked again next time."
@@ -604,7 +615,11 @@ fn prompt_accept_new_host(host: &str, port: u16, algo: &str, fingerprint: &str) 
 
     // Prompt on the controlling terminal directly; if there is none (daemon, CI,
     // piped run), we can't get consent, so fail closed.
-    let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+    let tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
         Ok(f) => f,
         Err(_) => return false,
     };
@@ -666,7 +681,11 @@ fn resolve_host(alias: &str, cli_user: Option<&str>, cli_port: Option<u16>) -> R
 
 /// The precedence + field-mapping core of [`resolve_host`], split out so it can be
 /// unit-tested against a parsed config without touching the filesystem.
-fn resolve_from(c: russh_config::Config, cli_user: Option<&str>, cli_port: Option<u16>) -> ResolvedHost {
+fn resolve_from(
+    c: russh_config::Config,
+    cli_user: Option<&str>,
+    cli_port: Option<u16>,
+) -> ResolvedHost {
     ResolvedHost {
         // `host()` is the resolved HostName (falling back to the alias).
         hostname: c.host().to_string(),
@@ -758,14 +777,18 @@ async fn open_proxy_chain(
             let chan = handles[i - 1]
                 .channel_open_direct_tcpip(hop.hostname.clone(), hop.port as u32, "127.0.0.1", 0)
                 .await
-                .with_context(|| format!("tunnelling to jump host {}:{}", hop.hostname, hop.port))?;
+                .with_context(|| {
+                    format!("tunnelling to jump host {}:{}", hop.hostname, hop.port)
+                })?;
             client::connect_stream(rconfig.clone(), chan.into_stream(), handler)
                 .await
                 .with_context(|| format!("connecting to jump host {} via tunnel", hop.hostname))?
         };
         authenticate(&mut h, &hop.user, &hop.identities)
             .await
-            .with_context(|| format!("authenticating to jump host {}@{}", hop.user, hop.hostname))?;
+            .with_context(|| {
+                format!("authenticating to jump host {}@{}", hop.user, hop.hostname)
+            })?;
         handles.push(h);
     }
     // Final tunnel from the last jump to the real target.
@@ -794,7 +817,11 @@ async fn authenticate(
         Ok(r) if r.success() => return Ok(()),
         Ok(r) => allowed_methods(&r),
         // Couldn't probe: assume the common set and let the attempts sort it out.
-        Err(_) => vec!["publickey".into(), "keyboard-interactive".into(), "password".into()],
+        Err(_) => vec![
+            "publickey".into(),
+            "keyboard-interactive".into(),
+            "password".into(),
+        ],
     };
     let pubkey_ok = |a: &[String]| a.iter().any(|m| m == "publickey");
 
@@ -823,7 +850,12 @@ async fn authenticate(
     // 2. Identity files: the config's `IdentityFile`s first, then the defaults.
     if pubkey_ok(&allowed) {
         // Negotiate the RSA signature hash once (None for ed25519/ecdsa keys).
-        let rsa_hash = handle.best_supported_rsa_hash().await.ok().flatten().flatten();
+        let rsa_hash = handle
+            .best_supported_rsa_hash()
+            .await
+            .ok()
+            .flatten()
+            .flatten();
         let interactive = std::io::stdin().is_terminal();
         let mut tried = std::collections::HashSet::new();
         for path in identities.iter().cloned().chain(default_identity_files()) {
@@ -1655,7 +1687,11 @@ mod tests {
 
     #[test]
     fn resolve_unknown_host_falls_back_to_defaults() {
-        let r = resolve_from(parse_cfg("Host other\n  HostName 1.2.3.4\n", "myhost"), None, None);
+        let r = resolve_from(
+            parse_cfg("Host other\n  HostName 1.2.3.4\n", "myhost"),
+            None,
+            None,
+        );
         assert_eq!(r.hostname, "myhost"); // no matching block → literal alias
         assert_eq!(r.port, 22);
         assert!(r.proxy_jump.is_empty());
@@ -1664,10 +1700,7 @@ mod tests {
     #[test]
     fn proxy_jump_value_splits_into_hops() {
         assert_eq!(split_proxy_jump("a"), vec!["a"]);
-        assert_eq!(
-            split_proxy_jump("a, b@h:22 ,c"),
-            vec!["a", "b@h:22", "c"]
-        );
+        assert_eq!(split_proxy_jump("a, b@h:22 ,c"), vec!["a", "b@h:22", "c"]);
         assert!(split_proxy_jump("").is_empty());
         assert!(split_proxy_jump(" , ").is_empty());
     }

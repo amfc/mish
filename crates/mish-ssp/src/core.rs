@@ -131,13 +131,22 @@ impl SspConfig {
     /// `PERFORMANCE.md`'s residual section): `MISH_SSP_RTO` caps the
     /// retransmission timeout (ms), `MISH_SSP_SENDMAX` the data-frame interval.
     pub fn with_env_overrides(mut self) -> Self {
-        if let Some(v) = std::env::var("MISH_SSP_RTO").ok().and_then(|s| s.parse().ok()) {
+        if let Some(v) = std::env::var("MISH_SSP_RTO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             self.rto = v;
         }
-        if let Some(v) = std::env::var("MISH_SSP_SENDMAX").ok().and_then(|s| s.parse().ok()) {
+        if let Some(v) = std::env::var("MISH_SSP_SENDMAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             self.send_interval_max = v;
         }
-        if let Some(v) = std::env::var("MISH_SSP_RTO_FACTOR").ok().and_then(|s| s.parse().ok()) {
+        if let Some(v) = std::env::var("MISH_SSP_RTO_FACTOR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             self.rto_srtt_factor = v;
         }
         if let Ok(v) = std::env::var("MISH_SSP_RESEND") {
@@ -530,10 +539,12 @@ impl<L: SyncState, R: SyncState> SspCore<L, R> {
         }
 
         let back_ts = self.sent_states.back().expect("never empty").timestamp;
-        let has_new_data =
-            !self.current_state.equals(&self.sent_states.back().expect("never empty").state);
-        let unacked =
-            !self.current_state.equals(&self.sent_states.front().expect("never empty").state);
+        let has_new_data = !self
+            .current_state
+            .equals(&self.sent_states.back().expect("never empty").state);
+        let unacked = !self
+            .current_state
+            .equals(&self.sent_states.front().expect("never empty").state);
         let assumed_delivered = self.current_state.equals(&self.assumed().state);
         let active = self
             .last_heard
@@ -1094,7 +1105,7 @@ mod rtt_tests {
         above.sample(160); // |100-160| = 60
         assert_eq!(below.rttvar, above.rttvar);
         assert_eq!(below.rttvar, 52.5); // 3/4*50 + 1/4*60
-        // srtt is directional, though:
+                                        // srtt is directional, though:
         assert_eq!(below.srtt, 92.5); // 7/8*100 + 1/8*40
         assert_eq!(above.srtt, 107.5); // 7/8*100 + 1/8*160
     }

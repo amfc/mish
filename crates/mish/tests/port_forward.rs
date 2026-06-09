@@ -73,8 +73,8 @@ async fn local_forward_relays_bytes() {
     tokio::spawn(serve_side_channels(server_t, emu, true));
 
     // Client: a -L forward from an ephemeral local port to the echo server.
-    let spec = ForwardSpec::parse(&format!("127.0.0.1:0:127.0.0.1:{target_port}"), "127.0.0.1")
-        .unwrap();
+    let spec =
+        ForwardSpec::parse(&format!("127.0.0.1:0:127.0.0.1:{target_port}"), "127.0.0.1").unwrap();
     let local = run_local_forward(client_t, spec).await.unwrap();
 
     // Drive bytes through the tunnel and expect them echoed back.
@@ -99,8 +99,8 @@ async fn remote_forward_relays_bytes() {
     tokio::spawn(serve_side_channels(server_t, emu, true));
 
     // Client: request a -R forward (server binds ephemeral) to the local echo.
-    let spec = ForwardSpec::parse(&format!("127.0.0.1:0:127.0.0.1:{target_port}"), "127.0.0.1")
-        .unwrap();
+    let spec =
+        ForwardSpec::parse(&format!("127.0.0.1:0:127.0.0.1:{target_port}"), "127.0.0.1").unwrap();
     let targets = remote_targets(std::slice::from_ref(&spec));
     let rf = request_remote_forward(&client_t, &spec).await.unwrap();
     assert!(rf.bound_port != 0, "server reported its bound port");
@@ -108,7 +108,9 @@ async fn remote_forward_relays_bytes() {
 
     // Connect to the *server-side* listener and expect the bytes echoed by the
     // client-local target through the reverse tunnel.
-    let mut conn = TcpStream::connect(("127.0.0.1", rf.bound_port)).await.unwrap();
+    let mut conn = TcpStream::connect(("127.0.0.1", rf.bound_port))
+        .await
+        .unwrap();
     conn.write_all(b"reverse!").await.unwrap();
     let mut buf = [0u8; 8];
     tokio::time::timeout(TIMEOUT, conn.read_exact(&mut buf))
@@ -133,8 +135,8 @@ async fn disabled_forwarding_is_refused() {
 
     // -L: the listener still binds locally, but the server refuses the stream,
     // so a connection through it gets EOF with no echo.
-    let spec = ForwardSpec::parse(&format!("127.0.0.1:0:127.0.0.1:{target_port}"), "127.0.0.1")
-        .unwrap();
+    let spec =
+        ForwardSpec::parse(&format!("127.0.0.1:0:127.0.0.1:{target_port}"), "127.0.0.1").unwrap();
     let local = run_local_forward(client_t.clone(), spec).await.unwrap();
     let mut conn = TcpStream::connect(local).await.unwrap();
     let _ = conn.write_all(b"nope").await;
@@ -143,7 +145,10 @@ async fn disabled_forwarding_is_refused() {
         .await
         .expect("the refused tunnel closes promptly")
         .unwrap_or(0);
-    assert_eq!(n, 0, "no bytes should be echoed when forwarding is disabled");
+    assert_eq!(
+        n, 0,
+        "no bytes should be echoed when forwarding is disabled"
+    );
 
     // -R: the request is refused with an error ack.
     let rspec = ForwardSpec::parse("127.0.0.1:0:127.0.0.1:1", "127.0.0.1").unwrap();
@@ -162,7 +167,10 @@ async fn client_refuses_unconfigured_forwarded_connection() {
     let (client_t, server_t) = quic_pair().await;
 
     // Client accept loop with an EMPTY target map: nothing is configured.
-    tokio::spawn(serve_forwarded_connections(client_t, forward::RemoteTargets::new()));
+    tokio::spawn(serve_forwarded_connections(
+        client_t,
+        forward::RemoteTargets::new(),
+    ));
 
     // "Hostile server": open a stream claiming a forwarded connection for a bind
     // the client never asked for, pointing at the echo server.

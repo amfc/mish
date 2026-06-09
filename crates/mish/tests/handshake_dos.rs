@@ -38,9 +38,15 @@ use tokio::sync::watch;
 /// return its connection info.
 async fn spawn_shared_server() -> bootstrap::Bootstrap {
     let server = env!("CARGO_BIN_EXE_mish-server");
-    bootstrap::local(server, /* shared = */ true, /* forward = */ false, None, Some("/bin/sh"))
-        .await
-        .expect("bootstrap should start the shared server and print MISH CONNECT")
+    bootstrap::local(
+        server,
+        /* shared = */ true,
+        /* forward = */ false,
+        None,
+        Some("/bin/sh"),
+    )
+    .await
+    .expect("bootstrap should start the shared server and print MISH CONNECT")
 }
 
 /// A minimal real client: an SSP `Driver` over the QUIC transport that can type
@@ -125,8 +131,7 @@ async fn unauthenticated_handshake_does_not_kill_live_session() {
     // first such error propagated out of `serve_shared` via `?` and ended the whole
     // session (the server process exits); post-fix it is logged and skipped.
     for _ in 0..5 {
-        let junk_ep =
-            transport::insecure_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
+        let junk_ep = transport::insecure_client_endpoint("0.0.0.0:0".parse().unwrap()).unwrap();
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
             transport::connect(&junk_ep, boot.addr, "localhost"),

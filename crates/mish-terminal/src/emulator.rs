@@ -243,8 +243,7 @@ impl Emulator {
                 // reconstructible (same spirit as the control-char normalization in
                 // `convert_cell`). Found by the `diff_roundtrip` fuzzer.
                 if aterm_cell.flags.contains(Flags::WIDE_CHAR)
-                    && !(c + 1 < cols
-                        && row[Column(c + 1)].flags.contains(Flags::WIDE_CHAR_SPACER))
+                    && !(c + 1 < cols && row[Column(c + 1)].flags.contains(Flags::WIDE_CHAR_SPACER))
                 {
                     cell.c = ' ';
                     cell.combining.clear();

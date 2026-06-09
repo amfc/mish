@@ -30,8 +30,11 @@ struct Client {
 
 impl Client {
     fn spawn(t: MemoryTransport, clock: Arc<dyn Clock>) -> Self {
-        let (driver, handle) =
-            Driver::<MemoryTransport, UserStream, Screen>::with(Arc::new(t), clock, SspConfig::default());
+        let (driver, handle) = Driver::<MemoryTransport, UserStream, Screen>::with(
+            Arc::new(t),
+            clock,
+            SspConfig::default(),
+        );
         let task = driver.spawn();
         // Report initial geometry so the server has a remote state to process.
         let mut s = UserStream::new();

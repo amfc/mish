@@ -154,7 +154,12 @@ mod tests {
 
     #[test]
     fn missing_data_renders_dashes() {
-        let s = LinkStats { rtt_ms: 0.0, loss: None, prediction: None, ..LinkStats::default() };
+        let s = LinkStats {
+            rtt_ms: 0.0,
+            loss: None,
+            prediction: None,
+            ..LinkStats::default()
+        };
         let t = status_text(&s);
         assert!(t.contains("rtt —"), "{t}");
         assert!(t.contains("loss —"), "{t}");
@@ -189,7 +194,11 @@ mod tests {
         let row: String = (0..80).map(|c| over.cell(0, c).unwrap().c).collect();
         assert!(row.starts_with("mish · work · rtt 42ms"), "{row}");
         for c in 0..80 {
-            assert_ne!(over.cell(0, c).unwrap().flags & F_INVERSE, 0, "col {c} not reverse");
+            assert_ne!(
+                over.cell(0, c).unwrap().flags & F_INVERSE,
+                0,
+                "col {c} not reverse"
+            );
         }
         // Rows below are untouched.
         assert_eq!(over.cells[80..], screen.cells[80..]);

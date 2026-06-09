@@ -179,6 +179,9 @@ fn main() {
     println!("\nDatagrams sent per change (RTT 150ms):");
     for &loss in &[0.0, 0.10, 0.30, 0.50] {
         let (_, _, sent) = percentiles(75, loss, true);
-        println!("  loss {:>3}:  {sent:>4.1}", format!("{:.0}%", loss * 100.0));
+        println!(
+            "  loss {:>3}:  {sent:>4.1}",
+            format!("{:.0}%", loss * 100.0)
+        );
     }
 }

@@ -105,11 +105,20 @@ async fn mouse_forwarded_when_app_reads_mouse() {
     let (pty_out_tx, mut pty_in_rx, cin_tx, mut cout_rx) = harness();
 
     // App enables SGR mouse reporting, then prints a marker.
-    sync_state(&pty_out_tx, &mut cout_rx, b"\x1b[?1000h\x1b[?1006hMOUSEON", b"MOUSEON").await;
+    sync_state(
+        &pty_out_tx,
+        &mut cout_rx,
+        b"\x1b[?1000h\x1b[?1006hMOUSEON",
+        b"MOUSEON",
+    )
+    .await;
 
     // A left-click report should reach the PTY unchanged.
     let click = b"\x1b[<0;5;5M";
-    cin_tx.send(ClientInput::Mouse(click.to_vec())).await.unwrap();
+    cin_tx
+        .send(ClientInput::Mouse(click.to_vec()))
+        .await
+        .unwrap();
     expect_pty_input(&mut pty_in_rx, click).await;
 }
 

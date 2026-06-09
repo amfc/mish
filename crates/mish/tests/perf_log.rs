@@ -35,7 +35,10 @@ async fn perf_log_records_keystroke_latency() {
     let path = std::env::temp_dir().join(format!("mish-perf-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&path);
     mish::perf::init(&path).expect("install perf recorder");
-    assert!(mish::perf::enabled(), "recorder should be active after init");
+    assert!(
+        mish::perf::enabled(),
+        "recorder should be active after init"
+    );
 
     let (ta, tb) = memory::pair();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
@@ -108,17 +111,27 @@ async fn perf_log_records_keystroke_latency() {
     let _ = tokio::time::timeout(Duration::from_secs(5), client).await;
 
     let records: Vec<&str> = lines.lines().filter(|l| !l.is_empty()).collect();
-    assert!(records.len() >= 3, "one record per keystroke, got {}", records.len());
+    assert!(
+        records.len() >= 3,
+        "one record per keystroke, got {}",
+        records.len()
+    );
     for line in &records {
         // Each was locally echoed under ALWAYS mode → predicted, response ≈ 0.
         assert_eq!(field(line, "predicted"), "true", "line: {line}");
         let press: u64 = field(line, "press_ms").parse().unwrap();
         let display: u64 = field(line, "display_ms").parse().unwrap();
-        assert_eq!(display, press, "predicted key displays at press time: {line}");
+        assert_eq!(
+            display, press,
+            "predicted key displays at press time: {line}"
+        );
         // Confirmed keys carry a numeric confirm_ms >= press_ms.
         let confirm = field(line, "confirm_ms");
         if confirm != "null" {
-            assert!(confirm.parse::<u64>().unwrap() >= press, "confirm after press: {line}");
+            assert!(
+                confirm.parse::<u64>().unwrap() >= press,
+                "confirm after press: {line}"
+            );
         }
         // nbytes is the single typed byte.
         assert_eq!(field(line, "nbytes"), "1", "line: {line}");

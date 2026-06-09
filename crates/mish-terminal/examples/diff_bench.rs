@@ -80,7 +80,10 @@ fn bench(name: &str, screens: &[Screen], rounds: usize) {
         "  new_frame : {diffs_per_sec:>10.0} diffs/s   {cells_per_sec:>12.0} cells/s   \
          avg {avg_bytes:>6.1} B/diff"
     );
-    println!("  apply     : {applies_per_sec:>10.0} applies/s  round-trip {}", if ok { "OK" } else { "MISMATCH" });
+    println!(
+        "  apply     : {applies_per_sec:>10.0} applies/s  round-trip {}",
+        if ok { "OK" } else { "MISMATCH" }
+    );
     assert!(ok, "diff round-trip must reconstruct the screen exactly");
 }
 
@@ -108,7 +111,10 @@ fn main() {
         let fill = if i % 2 == 0 { '#' } else { '.' };
         let mut s = String::from("\x1b[2J\x1b[H");
         for r in 1..=ROWS {
-            s.push_str(&format!("\x1b[{r};1H{}", fill.to_string().repeat(COLS as usize)));
+            s.push_str(&format!(
+                "\x1b[{r};1H{}",
+                fill.to_string().repeat(COLS as usize)
+            ));
         }
         s.into_bytes()
     });

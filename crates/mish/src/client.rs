@@ -526,7 +526,7 @@ mod tests {
     fn sgr_wheel_decodes_vertical_notches() {
         assert_eq!(sgr_wheel(b"\x1b[<64;5;5M"), Some(true)); // wheel up
         assert_eq!(sgr_wheel(b"\x1b[<65;5;5M"), Some(false)); // wheel down
-        // Modifier bits (here ctrl = +16) don't change the direction.
+                                                              // Modifier bits (here ctrl = +16) don't change the direction.
         assert_eq!(sgr_wheel(b"\x1b[<80;5;5M"), Some(true));
         assert_eq!(sgr_wheel(b"\x1b[<81;5;5M"), Some(false));
     }

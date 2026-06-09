@@ -442,7 +442,11 @@ fn malicious_osc_fields_cannot_break_out() {
 
     // The grid the user actually sees is untouched by the OSC field content.
     let glyphs = |s: &Screen| s.cells.iter().map(|c| c.c).collect::<Vec<_>>();
-    assert_eq!(glyphs(&seen), glyphs(&screen), "OSC field injected into the grid");
+    assert_eq!(
+        glyphs(&seen),
+        glyphs(&screen),
+        "OSC field injected into the grid"
+    );
     assert_eq!(
         (seen.cursor_row, seen.cursor_col),
         (screen.cursor_row, screen.cursor_col),

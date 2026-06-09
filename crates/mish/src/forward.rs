@@ -132,7 +132,8 @@ impl ForwardSpec {
     pub fn parse(spec: &str, default_bind: &str) -> Result<Self, String> {
         let parts: Vec<&str> = spec.split(':').collect();
         let parse_port = |s: &str| -> Result<u16, String> {
-            s.parse::<u16>().map_err(|_| format!("invalid port {s:?} in forward spec {spec:?}"))
+            s.parse::<u16>()
+                .map_err(|_| format!("invalid port {s:?} in forward spec {spec:?}"))
         };
         let (bind_host, bind_port, target_host, target_port) = match parts.as_slice() {
             [bind, port, host, hostport] => (
@@ -515,7 +516,9 @@ async fn handle_forwarded_connection(
             tracing::info!(target: "mish::forward", %target, "-R connection established");
             relay(tcp, send, recv).await;
         }
-        Err(e) => tracing::warn!(target: "mish::forward", %target, error = %e, "-R target dial failed"),
+        Err(e) => {
+            tracing::warn!(target: "mish::forward", %target, error = %e, "-R target dial failed")
+        }
     }
 }
 
@@ -628,9 +631,6 @@ mod tests {
             map.get(&("127.0.0.1".into(), 9000)),
             Some(&("localhost".into(), 3000))
         );
-        assert_eq!(
-            map.get(&("0.0.0.0".into(), 0)),
-            Some(&("db".into(), 5432))
-        );
+        assert_eq!(map.get(&("0.0.0.0".into(), 0)), Some(&("db".into(), 5432)));
     }
 }

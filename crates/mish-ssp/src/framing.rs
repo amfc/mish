@@ -71,8 +71,8 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(64 * 1024);
         let msgs: Vec<Vec<u8>> = vec![
             b"hello".to_vec(),
-            Vec::new(),                 // empty message is legal
-            vec![0xABu8; 50_000],       // multi-chunk
+            Vec::new(),           // empty message is legal
+            vec![0xABu8; 50_000], // multi-chunk
             b"\x00\x01\x02binary".to_vec(),
         ];
 

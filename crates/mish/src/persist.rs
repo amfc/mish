@@ -155,8 +155,11 @@ impl PersistentSession {
         cancel: impl std::future::Future<Output = ()> + Send,
         role: Role,
     ) -> AttachEnd {
-        let (driver, handle) =
-            Driver::<T, Screen, UserStream>::with(transport, self.clock.clone(), SspConfig::default().with_env_overrides());
+        let (driver, handle) = Driver::<T, Screen, UserStream>::with(
+            transport,
+            self.clock.clone(),
+            SspConfig::default().with_env_overrides(),
+        );
         let driver_task = driver.spawn();
 
         // How many of *this* client's input events we've applied (its echo ack).

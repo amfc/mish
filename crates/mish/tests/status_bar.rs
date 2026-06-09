@@ -99,7 +99,10 @@ async fn toggle_shows_and_hides_status_bar() {
     cin_tx.send(ClientInput::ToggleStats).await.unwrap();
     // Toggling off forces a full repaint; a fresh marker proves the top row is
     // back to real content with no bar text. Drain to that frame and check it.
-    pty_out_tx.send(b"\x1b[2J\x1b[HDONE".to_vec()).await.unwrap();
+    pty_out_tx
+        .send(b"\x1b[2J\x1b[HDONE".to_vec())
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(frame) = cout_rx.recv().await {
             if contains(&frame, b"DONE") {

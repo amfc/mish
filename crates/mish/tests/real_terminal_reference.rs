@@ -38,7 +38,10 @@ fn vt100_lines(parser: &vt100::Parser) -> Vec<String> {
         .map(|r| {
             let mut s = String::new();
             for c in 0..COLS {
-                let contents = screen.cell(r, c).map(|cell| cell.contents()).unwrap_or_default();
+                let contents = screen
+                    .cell(r, c)
+                    .map(|cell| cell.contents())
+                    .unwrap_or_default();
                 // An empty cell renders as a space, matching `Screen::to_lines`.
                 s.push_str(if contents.is_empty() { " " } else { contents });
             }

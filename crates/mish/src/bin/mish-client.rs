@@ -265,7 +265,8 @@ fn parse_args() -> Result<Options> {
                 opts.log_file = Some(args.next().context("--log-file needs a PATH")?.into());
             }
             "--log-level" => {
-                opts.log_level = mish::trace::parse_level(&args.next().context("--log-level needs a LEVEL")?);
+                opts.log_level =
+                    mish::trace::parse_level(&args.next().context("--log-level needs a LEVEL")?);
             }
             "--perf-log" => {
                 opts.perf_log = Some(args.next().context("--perf-log needs a PATH")?.into());
@@ -343,7 +344,10 @@ async fn main() -> Result<()> {
     // session — bootstrap, connect, run, disconnect — is captured.
     if let Some(path) = &opts.log_file {
         if let Err(e) = mish::trace::init_file_logging(path, "client", opts.log_level) {
-            eprintln!("[mish-client] warning: could not open log file {}: {e}", path.display());
+            eprintln!(
+                "[mish-client] warning: could not open log file {}: {e}",
+                path.display()
+            );
         }
     }
     tracing::info!(target: "mish::client", local = opts.local, "client starting");
@@ -353,7 +357,10 @@ async fn main() -> Result<()> {
     // captured. See `perf/` for turning the log into the Mosh-paper CDF.
     if let Some(path) = &opts.perf_log {
         if let Err(e) = mish::perf::init(path) {
-            eprintln!("[mish-client] warning: could not open perf log {}: {e}", path.display());
+            eprintln!(
+                "[mish-client] warning: could not open perf log {}: {e}",
+                path.display()
+            );
         }
     }
 
@@ -508,7 +515,9 @@ async fn attach_session(
     )?;
     let mut it = creds.split_whitespace();
     let mut next_der = |what: &str| -> Result<Vec<u8>> {
-        let tok = it.next().with_context(|| format!("MISH_CONNECT: missing {what}"))?;
+        let tok = it
+            .next()
+            .with_context(|| format!("MISH_CONNECT: missing {what}"))?;
         bootstrap::from_hex(tok).with_context(|| format!("MISH_CONNECT: bad {what} hex"))
     };
     let server_cert = next_der("server cert")?;
@@ -530,7 +539,15 @@ async fn attach_session(
     let t = transport::connect(&endpoint, addr, "localhost")
         .await
         .context("connecting to server")?;
-    run_terminal(t, predict, no_init, local_forwards, remote_forwards, session).await;
+    run_terminal(
+        t,
+        predict,
+        no_init,
+        local_forwards,
+        remote_forwards,
+        session,
+    )
+    .await;
     Ok(())
 }
 
@@ -610,13 +627,19 @@ async fn run_terminal(
                 // `run_client` passes these through to full-screen apps instead.
                 b"\x1b[1;2A" => {
                     let _ = key_tx
-                        .send(ClientInput::ScrollKey { up: true, passthrough: chunk.to_vec() })
+                        .send(ClientInput::ScrollKey {
+                            up: true,
+                            passthrough: chunk.to_vec(),
+                        })
                         .await;
                     continue;
                 }
                 b"\x1b[1;2B" => {
                     let _ = key_tx
-                        .send(ClientInput::ScrollKey { up: false, passthrough: chunk.to_vec() })
+                        .send(ClientInput::ScrollKey {
+                            up: false,
+                            passthrough: chunk.to_vec(),
+                        })
                         .await;
                     continue;
                 }
@@ -633,7 +656,7 @@ async fn run_terminal(
                 if !escaping && chunk[i] == 0x1b && chunk[i + 1..].starts_with(b"[<") {
                     if let Some(rel) = chunk[i + 3..].iter().position(|&b| b == b'M' || b == b'm') {
                         let end = i + 3 + rel; // index of the M/m terminator
-                        // Flush keystrokes that preceded the report, in order.
+                                               // Flush keystrokes that preceded the report, in order.
                         if !batch.is_empty()
                             && key_tx
                                 .send(ClientInput::Keys(std::mem::take(&mut batch)))
@@ -774,8 +797,7 @@ async fn run_terminal(
     // Share the transport with a scrollback fetcher (Shift-PgUp/PgDn pull history
     // over a reliable side-channel).
     let transport = Arc::new(t);
-    let history: Arc<dyn mish::client::HistoryFetcher> =
-        Arc::new(QuicHistory(transport.clone()));
+    let history: Arc<dyn mish::client::HistoryFetcher> = Arc::new(QuicHistory(transport.clone()));
 
     // Port forwarding (`-L`/`-R`): set up before the session runs, sharing the
     // same authenticated connection. These run as independent tasks; the held

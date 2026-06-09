@@ -50,8 +50,11 @@ pub async fn run_server<T: Transport>(
     mut pty_output: mpsc::Receiver<Vec<u8>>,
     pty_input: mpsc::UnboundedSender<PtyControl>,
 ) {
-    let (driver, handle) =
-        Driver::<T, Screen, UserStream>::with(transport, clock, SspConfig::default().with_env_overrides());
+    let (driver, handle) = Driver::<T, Screen, UserStream>::with(
+        transport,
+        clock,
+        SspConfig::default().with_env_overrides(),
+    );
     let driver_task = driver.spawn();
     tracing::info!(target: "mish::server", "server session loop started");
 

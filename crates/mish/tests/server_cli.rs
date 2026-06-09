@@ -47,8 +47,7 @@ fn version_flag_prints_version_and_exits() {
     assert!(out.status.success(), "--version should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.starts_with("mish-server ")
-            && stdout.trim().contains(env!("CARGO_PKG_VERSION")),
+        stdout.starts_with("mish-server ") && stdout.trim().contains(env!("CARGO_PKG_VERSION")),
         "got {stdout:?}"
     );
 }

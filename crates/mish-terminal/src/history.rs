@@ -122,7 +122,13 @@ mod tests {
         let text: Vec<String> = resp
             .rows
             .iter()
-            .map(|r| r.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .map(|r| {
+                r.iter()
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
             .collect();
         assert!(
             text.iter().any(|l| l.starts_with("line")),

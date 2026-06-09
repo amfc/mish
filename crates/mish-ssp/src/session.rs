@@ -210,8 +210,7 @@ where
         // (seq-guarded, reorder-robust) timestamp estimator — mosh's approach, and
         // the only one the deterministic sim can exercise. `MISH_SSP_RTT_SRC=quinn`
         // instead feeds the transport's RTT (kept for A/B; see `PERFORMANCE.md`).
-        let use_transport_rtt =
-            std::env::var("MISH_SSP_RTT_SRC").as_deref() == Ok("quinn");
+        let use_transport_rtt = std::env::var("MISH_SSP_RTT_SRC").as_deref() == Ok("quinn");
         loop {
             let now = self.clock.now_ms();
 

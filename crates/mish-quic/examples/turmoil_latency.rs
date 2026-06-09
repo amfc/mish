@@ -37,12 +37,32 @@ struct Cond {
 
 fn cond(name: &str) -> Cond {
     match name {
-        "LAN" => Cond { lat_min: 1, lat_max: 2, loss: 0.0 },
-        "WAN" => Cond { lat_min: 38, lat_max: 45, loss: 0.05 },
-        "LOSSY" => Cond { lat_min: 55, lat_max: 70, loss: 0.15 },
-        "BURSTY" => Cond { lat_min: 35, lat_max: 50, loss: 0.14 },
+        "LAN" => Cond {
+            lat_min: 1,
+            lat_max: 2,
+            loss: 0.0,
+        },
+        "WAN" => Cond {
+            lat_min: 38,
+            lat_max: 45,
+            loss: 0.05,
+        },
+        "LOSSY" => Cond {
+            lat_min: 55,
+            lat_max: 70,
+            loss: 0.15,
+        },
+        "BURSTY" => Cond {
+            lat_min: 35,
+            lat_max: 50,
+            loss: 0.14,
+        },
         // BRUTAL: high RTT + heavy loss + wide jitter (⇒ reordering).
-        _ => Cond { lat_min: 60, lat_max: 150, loss: 0.20 },
+        _ => Cond {
+            lat_min: 60,
+            lat_max: 150,
+            loss: 0.20,
+        },
     }
 }
 
@@ -94,7 +114,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let name = args.get(1).cloned().unwrap_or_else(|| "BRUTAL".into());
     let c = cond(&name);
-    let keys: usize = std::env::var("KEYS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let keys: usize = std::env::var("KEYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
 
     // Latencies collected by the client host, read back after the sim ends.
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -142,7 +165,9 @@ fn main() {
             .unwrap_or(false);
 
             if got {
-                out.lock().unwrap().push(t0.elapsed().as_secs_f64() * 1000.0);
+                out.lock()
+                    .unwrap()
+                    .push(t0.elapsed().as_secs_f64() * 1000.0);
             }
             tokio::time::sleep(Duration::from_millis(40)).await; // inter-keystroke gap
         }

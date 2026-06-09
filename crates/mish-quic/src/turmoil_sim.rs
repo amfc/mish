@@ -55,7 +55,9 @@ struct TurmoilUdpSocket {
 
 impl fmt::Debug for TurmoilUdpSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TurmoilUdpSocket").field("local", &self.local).finish()
+        f.debug_struct("TurmoilUdpSocket")
+            .field("local", &self.local)
+            .finish()
     }
 }
 
@@ -107,7 +109,10 @@ impl AsyncUdpSocket for TurmoilUdpSocket {
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         // One datagram per transmit (we report a single segment), so no GSO split.
-        match self.socket.try_send_to(transmit.contents, transmit.destination) {
+        match self
+            .socket
+            .try_send_to(transmit.contents, transmit.destination)
+        {
             Ok(_) => Ok(()),
             // turmoil shouldn't block, but treat it as a drop if it ever does —
             // the SSP layer heals via the next re-diff, exactly as on a real link.

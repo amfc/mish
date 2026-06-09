@@ -737,7 +737,10 @@ impl PredictionEngine {
     /// classify the `ESC [ n ~` family.
     fn esc_leading_param(&self) -> u32 {
         let s = std::str::from_utf8(&self.esc_params).unwrap_or("");
-        s.split(';').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0)
+        s.split(';')
+            .next()
+            .and_then(|m| m.parse::<u32>().ok())
+            .unwrap_or(0)
     }
 
     /// Predict a one-column cursor move (right if `right`, else left), clamped to
@@ -921,13 +924,13 @@ impl PredictionEngine {
         // Quick confirmations slowly cure the glitch trigger: if any prediction
         // was confirmed well within GLITCH_THRESHOLD, the link is keeping up, so
         // step the trigger down (rate-limited, mosh's GLITCH_REPAIR_MININTERVAL).
-        let quick_confirm = self
-            .cells
-            .iter()
-            .any(|p| p.input_index <= ack && now_ms.saturating_sub(p.predicted_at_ms) < GLITCH_THRESHOLD_MS);
+        let quick_confirm = self.cells.iter().any(|p| {
+            p.input_index <= ack && now_ms.saturating_sub(p.predicted_at_ms) < GLITCH_THRESHOLD_MS
+        });
         if quick_confirm
             && self.glitch_trigger > 0
-            && now_ms.saturating_sub(GLITCH_REPAIR_MININTERVAL_MS) >= self.last_quick_confirmation_ms
+            && now_ms.saturating_sub(GLITCH_REPAIR_MININTERVAL_MS)
+                >= self.last_quick_confirmation_ms
         {
             self.glitch_trigger -= 1;
             self.last_quick_confirmation_ms = now_ms;
@@ -1094,7 +1097,11 @@ mod tests {
         assert_eq!(p.accuracy(30), Some((2, 0.5)), "one of two correct → 50%");
 
         // Both samples age out of the one-minute window.
-        assert_eq!(p.accuracy(30 + 60_001), None, "old outcomes drop from the window");
+        assert_eq!(
+            p.accuracy(30 + 60_001),
+            None,
+            "old outcomes drop from the window"
+        );
     }
 
     #[test]
@@ -1103,8 +1110,14 @@ mod tests {
         let mut p = PredictionEngine::new(PredictMode::Always);
         let base = screen_with_ack(20, 3, 0);
         p.new_user_bytes(b"hi", &base, 2, 0);
-        assert!(p.displaying_input(2), "the typed keystroke is locally echoed");
-        assert!(!p.displaying_input(99), "an unrelated index is not displayed");
+        assert!(
+            p.displaying_input(2),
+            "the typed keystroke is locally echoed"
+        );
+        assert!(
+            !p.displaying_input(99),
+            "an unrelated index is not displayed"
+        );
 
         // Adaptive mode below the SRTT trigger: predictions tracked but not shown,
         // so the keystroke is *not* counted as locally displayed.
@@ -1447,7 +1460,11 @@ mod tests {
         p.new_user_bytes(b"\x1b[D", &base, 4, 0);
         let shown = p.predicted_screen(&base);
         assert_eq!(shown.cursor_col, 2, "left arrow moved the cursor");
-        assert_eq!(shown.cell(0, 0).unwrap().c, 'a', "typed glyphs survive the arrow");
+        assert_eq!(
+            shown.cell(0, 0).unwrap().c,
+            'a',
+            "typed glyphs survive the arrow"
+        );
 
         // Right arrow (SS3 / application-cursor-keys form): back to col 3.
         p.new_user_bytes(b"\x1bOC", &base, 5, 0);
@@ -1497,19 +1514,35 @@ mod tests {
 
         // M-b: back to the start of "bar".
         p.new_user_bytes(b"\x1bb", &base, 8, 0);
-        assert_eq!(p.predicted_screen(&base).cursor_col, 4, "M-b → start of bar");
+        assert_eq!(
+            p.predicted_screen(&base).cursor_col,
+            4,
+            "M-b → start of bar"
+        );
         // M-b again: back to the start of "foo".
         p.new_user_bytes(b"\x1bb", &base, 9, 0);
-        assert_eq!(p.predicted_screen(&base).cursor_col, 0, "M-b → start of foo");
+        assert_eq!(
+            p.predicted_screen(&base).cursor_col,
+            0,
+            "M-b → start of foo"
+        );
         // M-f: forward to the end of "foo".
         p.new_user_bytes(b"\x1bf", &base, 10, 0);
         assert_eq!(p.predicted_screen(&base).cursor_col, 3, "M-f → end of foo");
         // Ctrl-Right (ESC[1;5C): forward to the end of "bar".
         p.new_user_bytes(b"\x1b[1;5C", &base, 11, 0);
-        assert_eq!(p.predicted_screen(&base).cursor_col, 7, "Ctrl-Right → end of bar");
+        assert_eq!(
+            p.predicted_screen(&base).cursor_col,
+            7,
+            "Ctrl-Right → end of bar"
+        );
         // Ctrl-Left (ESC[1;5D): back to the start of "bar".
         p.new_user_bytes(b"\x1b[1;5D", &base, 12, 0);
-        assert_eq!(p.predicted_screen(&base).cursor_col, 4, "Ctrl-Left → start of bar");
+        assert_eq!(
+            p.predicted_screen(&base).cursor_col,
+            4,
+            "Ctrl-Left → start of bar"
+        );
     }
 
     /// A motion the server contradicts is dropped by the epoch gate without
@@ -1531,7 +1564,11 @@ mod tests {
         p.new_server_screen(&confirmed, 0);
         let shown = p.predicted_screen(&confirmed);
         assert_eq!(shown.cursor_col, 3, "cursor resyncs to the server");
-        assert_eq!(shown.cell(0, 0).unwrap().c, 'a', "glyphs untouched by the bad motion");
+        assert_eq!(
+            shown.cell(0, 0).unwrap().c,
+            'a',
+            "glyphs untouched by the bad motion"
+        );
     }
 
     /// Typing in the *middle* of a line is predicted as an insert that shifts the
@@ -1549,9 +1586,21 @@ mod tests {
 
         p.new_user_bytes(b"a", &base, 1, 0);
         let shown = p.predicted_screen(&base);
-        assert_eq!(shown.cell(0, 0).unwrap().c, 'X', "before the cursor: unchanged");
-        assert_eq!(shown.cell(0, 1).unwrap().c, 'a', "glyph inserted at the cursor");
-        assert_eq!(shown.cell(0, 2).unwrap().c, 'Y', "rest of the line shifted right");
+        assert_eq!(
+            shown.cell(0, 0).unwrap().c,
+            'X',
+            "before the cursor: unchanged"
+        );
+        assert_eq!(
+            shown.cell(0, 1).unwrap().c,
+            'a',
+            "glyph inserted at the cursor"
+        );
+        assert_eq!(
+            shown.cell(0, 2).unwrap().c,
+            'Y',
+            "rest of the line shifted right"
+        );
         assert_eq!(shown.cell(0, 3).unwrap().c, 'Z', "…and Z too");
         assert_eq!(shown.cursor_col, 2, "cursor advanced past the insert");
     }
@@ -1800,7 +1849,11 @@ mod tests {
         applied.cursor_col = 0;
         p.new_server_screen(&applied, 10);
 
-        assert_eq!(p.active_predictions(), 0, "the bad tentative cell is dropped");
+        assert_eq!(
+            p.active_predictions(),
+            0,
+            "the bad tentative cell is dropped"
+        );
         assert_eq!(p.confirmed_epoch(), 0, "epoch stays unconfirmed");
         // A fresh prediction is still immediately representable (not stuck behind
         // a resync suppression that a visible miss would have set): it's just

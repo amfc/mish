@@ -63,7 +63,11 @@ async fn deep_scrollback_reaches_every_line_and_the_command() {
     });
 
     let client_ep = transport::loopback_client().unwrap();
-    let t = Arc::new(transport::connect(&client_ep, addr, "localhost").await.unwrap());
+    let t = Arc::new(
+        transport::connect(&client_ep, addr, "localhost")
+            .await
+            .unwrap(),
+    );
     let (cin_tx, cin_rx) = mpsc::channel::<ClientInput>(64);
     let (cout_tx, mut cout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let hist: Arc<dyn HistoryFetcher> = Arc::new(QuicHistory(t.clone()));
@@ -98,7 +102,10 @@ async fn deep_scrollback_reaches_every_line_and_the_command() {
         .await
         .unwrap();
     for i in 1..=N {
-        pty_out_tx.send(format!("MARK{i} END\r\n").into_bytes()).await.unwrap();
+        pty_out_tx
+            .send(format!("MARK{i} END\r\n").into_bytes())
+            .await
+            .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 

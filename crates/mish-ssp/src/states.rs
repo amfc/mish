@@ -103,7 +103,11 @@ mod tests {
         bytes.extend_from_slice(b"tail");
         let next = BytesState::new(bytes);
         let diff = next.diff_from(&prev);
-        assert_eq!(diff.len(), 4 + b"tail".len(), "diff must not reship the prefix");
+        assert_eq!(
+            diff.len(),
+            4 + b"tail".len(),
+            "diff must not reship the prefix"
+        );
         let mut applied = prev.clone();
         applied.apply_diff(&diff);
         assert_eq!(applied, next);

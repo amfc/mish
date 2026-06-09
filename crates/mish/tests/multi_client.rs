@@ -30,8 +30,11 @@ struct Client {
 
 impl Client {
     fn spawn(t: MemoryTransport, clock: Arc<dyn Clock>, cols: u16, rows: u16) -> Self {
-        let (driver, handle) =
-            Driver::<MemoryTransport, UserStream, Screen>::with(Arc::new(t), clock, SspConfig::default());
+        let (driver, handle) = Driver::<MemoryTransport, UserStream, Screen>::with(
+            Arc::new(t),
+            clock,
+            SspConfig::default(),
+        );
         let task = driver.spawn();
         let mut stream = UserStream::new();
         stream.push_resize(cols, rows); // report our geometry up front
@@ -130,7 +133,10 @@ async fn owner_writes_viewer_is_read_only() {
     let mut viewer = Client::spawn(c_viewer, clock.clone(), 80, 24);
 
     // Shell output fans out to *both* clients (one-to-many state sync).
-    pty_out_tx.send(b"SHARED_OUTPUT\r\n".to_vec()).await.unwrap();
+    pty_out_tx
+        .send(b"SHARED_OUTPUT\r\n".to_vec())
+        .await
+        .unwrap();
     owner.expect_contains("SHARED_OUTPUT").await;
     viewer.expect_contains("SHARED_OUTPUT").await;
 
@@ -177,7 +183,10 @@ async fn owner_writes_viewer_is_read_only() {
     })
     .await
     .unwrap_or(false);
-    assert!(!leaked, "viewer keystrokes leaked to the PTY after the owner's");
+    assert!(
+        !leaked,
+        "viewer keystrokes leaked to the PTY after the owner's"
+    );
 
     owner.disconnect();
     viewer.disconnect();
