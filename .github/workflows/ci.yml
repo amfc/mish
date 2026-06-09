@@ -42,6 +42,10 @@ jobs:
     name: miri (UB / aliasing on the sans-IO core)
     runs-on: ubuntu-latest
     env:
+      # The repo's rust-toolchain.toml pins stable, which overrides the nightly
+      # installed below — so `cargo miri` would run on stable (where the miri
+      # component doesn't exist). RUSTUP_TOOLCHAIN outranks rust-toolchain.toml.
+      RUSTUP_TOOLCHAIN: nightly
       # Miri can't perform real I/O; the pure tests we run don't need it, but
       # disabling isolation keeps any incidental clock/getrandom calls happy.
       MIRIFLAGS: "-Zmiri-disable-isolation"
@@ -63,6 +67,9 @@ jobs:
     name: tsan (data races in the tokio Driver)
     runs-on: ubuntu-latest
     env:
+      # rust-toolchain.toml pins stable, which would shadow the nightly installed
+      # below — but -Zbuild-std/-Zsanitizer need nightly. RUSTUP_TOOLCHAIN wins.
+      RUSTUP_TOOLCHAIN: nightly
       RUSTFLAGS: "-Zsanitizer=thread"
     steps:
       - uses: actions/checkout@v4
@@ -102,12 +109,20 @@ jobs:
   fuzz:
     name: fuzz smoke (libFuzzer + ASan)
     runs-on: ubuntu-latest
+    env:
+      # rust-toolchain.toml pins stable, but cargo-fuzz needs nightly.
+      # RUSTUP_TOOLCHAIN outranks the toml so `cargo fuzz` runs on nightly.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+      # Explicit `tool:` form — the `@cargo-fuzz` ref shorthand installed nothing
+      # ("no tool specified" / `no such command: fuzz` on the first run).
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       # Coverage-guided smoke run of each target: a bounded fresh-corpus pass that
       # gates regressions (a reintroduced panic surfaces within seconds — this is
       # how the screen_apply zero-dimension crash was caught). Not a substitute
