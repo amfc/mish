@@ -15,6 +15,10 @@ tracing = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+# Pure-Rust deflate backend used *only* under `cfg(miri)` (see `instruction.rs`):
+# zlib-rs's hand-rolled allocator isn't Miri-clean. Unused in normal builds (and
+# dead-code-eliminated from release binaries); Cargo can't gate a dep on cfg(miri).
+miniz_oxide = "0.8"
 
 [dev-dependencies]
 stateright = "0.31"

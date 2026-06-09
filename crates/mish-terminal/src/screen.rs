@@ -360,6 +360,8 @@ impl SyncState for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the (miri-excluded) proptest block below uses this.
+    #[cfg(not(miri))]
     use proptest::prelude::*;
 
     /// Regression (found by the `screen_apply` cargo-fuzz target): a diff header
@@ -414,8 +416,7 @@ mod tests {
         let mut s = Screen::blank(4, 3);
         for r in 0..3u16 {
             for c in 0..4u16 {
-                s.cells[r as usize * 4 + c as usize].c =
-                    char::from(b'a' + (r * 4 + c) as u8);
+                s.cells[r as usize * 4 + c as usize].c = char::from(b'a' + (r * 4 + c) as u8);
             }
         }
         s.cursor_row = 2;
@@ -449,7 +450,13 @@ mod tests {
     /// able to OOM the shared server (the analogue of `apply_diff`'s
     /// `MAX_SCREEN_CELLS` guard). The worst case (`65535×65535` ≈ 4.3 billion
     /// cells) must not panic and must stay within the cell budget.
+    ///
+    /// Skipped under Miri: it allocates the full clamped grid (~4M cells), far too
+    /// much for Miri's interpreter. The clamp is a size-bound property, not a
+    /// memory-safety one — `resized_view`'s UB-freedom is proved by the Kani
+    /// harness, and the small resize tests above cover it under Miri.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn resized_view_bounds_hostile_dimensions() {
         let s = Screen::blank(80, 24);
         let big = s.resized_view(u16::MAX, u16::MAX);
@@ -462,6 +469,10 @@ mod tests {
         assert_eq!(big.cells.len(), big.cols as usize * big.rows as usize);
     }
 
+    // Excluded under Miri: each case allocates up to a clamped 2000×2000 grid and
+    // proptest runs dozens of them — orders of magnitude too slow for Miri. Kani
+    // proves `resized_view` panic-free over the bounded domain instead.
+    #[cfg(not(miri))]
     proptest! {
         // Each case can allocate up to a clamped 2000×2000 grid, so keep the case
         // count modest — the hostile-dimension space is small and well-covered.

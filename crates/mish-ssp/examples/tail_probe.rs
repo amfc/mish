@@ -10,6 +10,7 @@
 //!   - if this core-only sim already shows a ~640 ms tail → the tail is the
 //!     protocol's resend cadence, and quinn adds ~nothing;
 //!   - if it shows a ~320 ms (mosh-like) tail → the extra in mish-real is quinn.
+//!
 //! And the `--send-max` knob clamps the resend cadence, so we can see *in the
 //! protocol* whether a tighter cadence shrinks the tail (the Exp-B hypothesis).
 //!
@@ -279,9 +280,25 @@ fn session(faults: Faults, cfg: SspConfig, seed: u64, keys: usize, patience: Mil
             b.set_current_state(seen);
 
             let a_out = a.tick(now);
-            fwd_sends += schedule(now, Dest::A, a_out, &mut in_flight, &mut fwd_loss, &mut fwd_rng, &mut delay_rng);
+            fwd_sends += schedule(
+                now,
+                Dest::A,
+                a_out,
+                &mut in_flight,
+                &mut fwd_loss,
+                &mut fwd_rng,
+                &mut delay_rng,
+            );
             let b_out = b.tick(now);
-            schedule(now, Dest::B, b_out, &mut in_flight, &mut ret_loss, &mut ret_rng, &mut delay_rng);
+            schedule(
+                now,
+                Dest::B,
+                b_out,
+                &mut in_flight,
+                &mut ret_loss,
+                &mut ret_rng,
+                &mut delay_rng,
+            );
         }
         now += 40; // inter-keystroke gap, like measure_keyboard
     }
@@ -315,7 +332,10 @@ fn main() {
     if let Some(v) = std::env::var("RTO").ok().and_then(|s| s.parse().ok()) {
         cfg.rto = v;
     }
-    if let Some(v) = std::env::var("PROSPECTIVE").ok().and_then(|s| s.parse::<u8>().ok()) {
+    if let Some(v) = std::env::var("PROSPECTIVE")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+    {
         cfg.prospective_resend = v != 0;
     }
     // RESEND=rto|frame|frame_on_loss selects the retransmit cadence under loss.
@@ -326,8 +346,14 @@ fn main() {
             _ => ResendMode::Rto,
         };
     }
-    let seeds: u64 = std::env::var("SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
-    let keys: usize = std::env::var("KEYS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let seeds: u64 = std::env::var("SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let keys: usize = std::env::var("KEYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
 
     let mut all = Vec::new();
     let mut seed_medians = Vec::new();
@@ -353,7 +379,10 @@ fn main() {
     let var = all.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
     let sd = var.sqrt();
     let sm_mean = seed_medians.iter().sum::<f64>() / seed_medians.len() as f64;
-    let sm_var = seed_medians.iter().map(|x| (x - sm_mean).powi(2)).sum::<f64>()
+    let sm_var = seed_medians
+        .iter()
+        .map(|x| (x - sm_mean).powi(2))
+        .sum::<f64>()
         / seed_medians.len() as f64;
 
     println!(

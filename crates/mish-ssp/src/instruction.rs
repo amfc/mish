@@ -117,6 +117,13 @@ impl Instruction {
 
 /// Raw-deflate compress (no zlib header/checksum — fewest bytes for small
 /// messages). Backed by zlib-rs via flate2.
+///
+/// Under Miri we route through miniz_oxide's pure-Rust raw deflate instead:
+/// zlib-rs's hand-rolled allocator isn't Miri-clean (the UB Miri flags lives
+/// entirely in `zlib_rs::allocate`, not here), and a pure-Rust backend lets the
+/// Miri job keep covering the codec and SSP-core paths that compress. Production
+/// always uses zlib-rs; this swap is invisible outside `cargo miri`.
+#[cfg(not(miri))]
 fn deflate(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
@@ -125,8 +132,17 @@ fn deflate(data: &[u8]) -> Vec<u8> {
         .expect("in-memory deflate is infallible")
 }
 
+#[cfg(miri)]
+fn deflate(data: &[u8]) -> Vec<u8> {
+    // Level 6 mirrors flate2's `Compression::default()`. Raw deflate (no wrapper).
+    miniz_oxide::deflate::compress_to_vec(data, 6)
+}
+
 /// Inflate a raw-deflate stream, refusing to produce more than `max` bytes (a
 /// compression-bomb guard) and returning `None` on any malformed input.
+///
+/// See [`deflate`] for why Miri uses the miniz_oxide backend.
+#[cfg(not(miri))]
 fn inflate(data: &[u8], max: usize) -> Option<Vec<u8>> {
     use std::io::Read;
     let dec = flate2::read::DeflateDecoder::new(data);
@@ -134,6 +150,18 @@ fn inflate(data: &[u8], max: usize) -> Option<Vec<u8>> {
     // Read at most max+1 bytes: if we hit max+1 the stream is over-budget (bomb),
     // otherwise we got the complete, in-bounds output.
     dec.take(max as u64 + 1).read_to_end(&mut out).ok()?;
+    if out.len() > max {
+        return None;
+    }
+    Some(out)
+}
+
+#[cfg(miri)]
+fn inflate(data: &[u8], max: usize) -> Option<Vec<u8>> {
+    // Cap the decode at max+1 so an over-budget stream is refused rather than
+    // fully allocated — same bomb guard as the flate2 path above.
+    let out =
+        miniz_oxide::inflate::decompress_to_vec_with_limit(data, max.saturating_add(1)).ok()?;
     if out.len() > max {
         return None;
     }
@@ -185,7 +213,12 @@ mod tests {
         }
     }
 
+    // Compresses a few KB of redundant data — UB-free under the miri miniz_oxide
+    // backend, but too slow to interpret. The compression *ratio* it asserts isn't
+    // a memory-safety property, so skip it under miri (the small round-trip tests
+    // above still exercise the codec there).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn redundant_diff_is_compressed() {
         // A realistic, highly-redundant terminal diff (repeated SGR runs).
         let diff = b"\x1b[0m\x1b[1;32mhello \x1b[0m".repeat(200);
@@ -249,7 +282,10 @@ mod tests {
         );
     }
 
+    // Deflates 256 KiB — far too slow under miri's interpreter. The bomb guard is
+    // size-limit logic, not a memory-safety property, so skip it under miri.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn inflate_rejects_a_bomb() {
         // 256 KiB of zeros deflates to a few hundred bytes; inflating with a tiny
         // budget must refuse rather than allocate the full output.

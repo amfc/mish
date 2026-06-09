@@ -148,7 +148,12 @@ fn shutdown_handshake_both_sides_close() {
 /// lost: the core resends SHUTDOWN_NUM at the frame rate until acked, so both
 /// sides still reach a clean close (mosh's SHUTDOWN_RETRIES robustness). Run
 /// across several drop patterns for confidence.
+///
+/// Skipped under Miri: 5 seeds × up to 2000 tick cycles, each encoding through
+/// deflate — far too slow for Miri. `shutdown_handshake_both_sides_close` gives
+/// Miri its UB coverage of the shutdown path at a tractable iteration count.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn shutdown_converges_under_loss() {
     for seed in [1u64, 7, 42, 1234, 99999] {
         let mut a = Core::new(0);

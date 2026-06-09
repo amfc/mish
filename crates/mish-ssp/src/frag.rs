@@ -184,7 +184,8 @@ impl Defragmenter {
         // byte cap matters because `count` is peer-controlled (up to 65535), so a
         // hostile peer could open many ids each pre-allocating a huge chunk table;
         // capping only the entry count leaves total memory unbounded.
-        while self.in_progress.len() > self.max_in_progress || self.buffered > MAX_REASSEMBLY_BYTES {
+        while self.in_progress.len() > self.max_in_progress || self.buffered > MAX_REASSEMBLY_BYTES
+        {
             let Some(&oldest) = self.in_progress.keys().min() else {
                 break;
             };
@@ -204,7 +205,13 @@ mod tests {
     /// reassemblies, each declaring the max fragment `count` (so a huge chunk table
     /// is pre-allocated) with a single tiny body, and never completes them. Total
     /// buffered memory must stay bounded, not grow to ~count×entries.
+    ///
+    /// Skipped under Miri: it allocates ~500×65535 chunk-table slots, which Miri's
+    /// interpreter is far too slow to churn through. This is a memory-*bound*
+    /// property, not a memory-safety one — the `frag_memory_bounds` fuzz target
+    /// covers it, and the smaller frag tests give Miri its UB coverage here.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reassembly_memory_is_bounded_against_hostile_count() {
         let mut d = Defragmenter::new();
         for id in 0..500u32 {

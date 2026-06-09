@@ -350,7 +350,12 @@ mod tests {
     /// Exhaustive safety check over an adversarial (lossy / reordering /
     /// duplicating) link: no divergence, bounded memory, and convergence
     /// reachable — across every schedule of length ≤ `budget`.
+    ///
+    /// Skipped under Miri: exhaustive BFS over thousands of protocol states is a
+    /// CPU-bound correctness check, not a memory-safety one, and is orders of
+    /// magnitude too slow to interpret. It runs in the normal test/madsim jobs.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn safety_under_adversarial_link() {
         let checker = SspModel::adversarial().checker().spawn_bfs().join();
         eprintln!(
@@ -364,7 +369,10 @@ mod tests {
 
     /// Exhaustive liveness check over a fair (reordering but lossless) link:
     /// every reachable state converges, across every delivery order.
+    ///
+    /// Skipped under Miri for the same reason as the safety check above.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn liveness_under_fair_link() {
         let checker = SspModel::fair().checker().spawn_bfs().join();
         eprintln!(

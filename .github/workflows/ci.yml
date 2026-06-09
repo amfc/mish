@@ -92,11 +92,12 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       # Print the per-file table and fail if line coverage regresses below the
-      # floor. The uncovered remainder is binary `main`s, the SSH bootstrap, and
-      # the real-time SystemClock — I/O glue exercised by the e2e tests rather
-      # than unit-coverable.
+      # floor. The binary `main`s and the bench-harness tool are excluded: they're
+      # CLI/entry-point glue exercised by the e2e tests, not unit-coverable, and
+      # measuring them would gate the library on argv parsing. The remaining
+      # uncovered surface (the SSH bootstrap, the real-time SystemClock) stays in.
       - name: Coverage
-        run: cargo llvm-cov --workspace --fail-under-lines 85
+        run: cargo llvm-cov --workspace --fail-under-lines 85 --ignore-filename-regex 'bench-harness|/bin/'
 
   fuzz:
     name: fuzz smoke (libFuzzer + ASan)
