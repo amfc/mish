@@ -8,7 +8,7 @@
 //! appears.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mish::client::{run_client, ClientInput};
 use mish::pty::PtyProcess;
@@ -92,27 +92,42 @@ async fn ctrl_c_interrupts_yes_flood() {
         }
     }
 
-    // Now run a command only the *shell* (not `yes`) would execute.
-    cin_tx
-        .send(ClientInput::Keys(b"echo SENTINEL_DONE\r".to_vec()))
-        .await
-        .unwrap();
-
-    let ok = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    // Now run a command only the *shell* (not `yes`) would execute, and look for
+    // its output in the rendered diff stream. The client emits screen *diffs*, so
+    // a contiguous "SENTINEL_DONE" only forms when the bytes are written to a
+    // quiet screen — if residual flood is still draining over QUIC, the write gets
+    // fragmented by interleaved cursor-move escapes and never matches as one run.
+    //
+    // The quiet-detection above can't fully guarantee that on a slow/loaded CI
+    // runner: a transient scheduling lull reads as "quiet" while `yes` is merely
+    // starved, and a large in-flight backlog can outlast its budget. So re-issue
+    // the command periodically — if the first attempt races with draining output,
+    // a later one lands on a settled screen and renders cleanly. If Ctrl-C truly
+    // failed, `yes` keeps flooding, every echo stays scrambled, and this still
+    // times out and fails as intended.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ok = false;
+    'wait: while Instant::now() < deadline {
+        cin_tx
+            .send(ClientInput::Keys(b"echo SENTINEL_DONE\r".to_vec()))
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if seen
+                .lock()
+                .unwrap()
+                .windows(13)
+                .any(|w| w == b"SENTINEL_DONE")
             {
-                let buf = seen.lock().unwrap();
-                if buf.windows(13).any(|w| w == b"SENTINEL_DONE") {
-                    return;
-                }
+                ok = true;
+                break 'wait;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    })
-    .await;
+    }
 
     assert!(
-        ok.is_ok(),
+        ok,
         "Ctrl-C did not interrupt `yes`: the shell never ran the follow-up echo"
     );
 

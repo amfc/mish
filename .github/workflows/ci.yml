@@ -135,6 +135,15 @@ jobs:
       # Both are caught deterministically by their seeds; re-add each target here
       # once its bug is fixed (the seeds stay checked in as the regression gate).
       - name: Fuzz targets
+        # Pin the build to the GNU triple. `taiki-e/install-action` ships a
+        # musl-static `cargo-fuzz`, and cargo-fuzz defaults the fuzz build to its
+        # OWN target triple — i.e. x86_64-unknown-linux-musl. ASan + libFuzzer
+        # can't link against a statically-linked libc ("sanitizer is incompatible
+        # with statically linked libc"), and the musl std isn't installed
+        # ("can't find crate for `core`"). The GNU target is dynamically linked,
+        # ASan-compatible, and is the runner's own host (std already present).
+        env:
+          TARGET: x86_64-unknown-linux-gnu
         run: |
           for t in instruction_decode frag_reassemble userstream_decode differential_emulator answerback_safety tty_emission_safety frag_memory_bounds client_render_safety resized_view; do
             # Replay checked-in regression seeds first (deterministic gate), then a
@@ -142,9 +151,9 @@ jobs:
             # corpus once and exit — without it, handing libFuzzer a directory means
             # "fuzz this corpus indefinitely", which never returns (hits the job cap).
             if [ -d "fuzz/regressions/$t" ] && [ -n "$(ls -A fuzz/regressions/$t)" ]; then
-              cargo fuzz run "$t" fuzz/regressions/"$t"/ -- -runs=0
+              cargo fuzz run --target "$TARGET" "$t" fuzz/regressions/"$t"/ -- -runs=0
             fi
-            cargo fuzz run "$t" -- -max_total_time=40 -print_final_stats=1
+            cargo fuzz run --target "$TARGET" "$t" -- -max_total_time=40 -print_final_stats=1
           done
 
   kani:
