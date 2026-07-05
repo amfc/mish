@@ -19,6 +19,8 @@
 //! ```text
 //! mish-client [user@]host [-- command]    # SSH bootstrap (like `mosh host`)
 //! mish-client --local [-- command]        # run the server locally (testing)
+//! mish-client --connect host:port         # ssh-less direct connect (see enroll)
+//! mish-client enroll [user@]host          # exchange certs for direct connect
 //!
 //! Options:
 //!   --local            start mish-server as a local child (no SSH)
@@ -130,6 +132,10 @@ struct Options {
     /// (the hex `<server-cert> <client-cert> <client-key>` from its MISH CONNECT
     /// line). Mirrors `mosh-client IP PORT` + `$MOSH_KEY`; used by test harnesses.
     attach: Option<(String, u16)>,
+    /// Direct connect (`--connect HOST:PORT`): dial an `mish-server --listen`
+    /// with no SSH, using the enrolled client identity and the pinned server cert
+    /// for HOST (established by `mish enroll HOST`). The ssh-less fast path.
+    connect: Option<(String, u16)>,
     /// `-L [bind:]port:host:hostport` local forwards: listen locally, the server
     /// dials the target. Repeatable.
     local_forwards: Vec<mish::forward::ForwardSpec>,
@@ -186,6 +192,7 @@ fn parse_args() -> Result<Options> {
         session: None,
         shared: false,
         attach: None,
+        connect: None,
         local_forwards: Vec::new(),
         remote_forwards: Vec::new(),
         host: None,
@@ -261,6 +268,10 @@ fn parse_args() -> Result<Options> {
                     .context("--attach PORT must be a number")?;
                 opts.attach = Some((ip, port));
             }
+            "--connect" => {
+                let spec = args.next().context("--connect needs HOST:PORT")?;
+                opts.connect = Some(parse_hostport(&spec)?);
+            }
             "--log-file" => {
                 opts.log_file = Some(args.next().context("--log-file needs a PATH")?.into());
             }
@@ -289,11 +300,33 @@ fn parse_args() -> Result<Options> {
             other => opts.host = Some(other.to_string()),
         }
     }
-    if !opts.local && opts.host.is_none() && opts.attach.is_none() {
+    if !opts.local && opts.host.is_none() && opts.attach.is_none() && opts.connect.is_none() {
         print_usage();
-        bail!("a host is required (or use --local / --attach)");
+        bail!("a host is required (or use --local / --attach / --connect)");
     }
     Ok(opts)
+}
+
+/// Parse a `HOST:PORT` value into `(host, port)`. HOST may be a hostname, IPv4,
+/// or a bracketed IPv6 `[addr]:port` (brackets required for IPv6). HOST is kept
+/// verbatim (it keys the pinned server cert); resolution happens at dial time.
+fn parse_hostport(spec: &str) -> Result<(String, u16)> {
+    if let Some(rest) = spec.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:")
+            .context("--connect [IPv6]:PORT needs a closing `]:PORT`")?;
+        return Ok((
+            host.to_string(),
+            port.parse().context("bad --connect port")?,
+        ));
+    }
+    let (host, port) = spec
+        .rsplit_once(':')
+        .context("--connect expects HOST:PORT (bracket IPv6 as [addr]:port)")?;
+    Ok((
+        host.to_string(),
+        port.parse().context("bad --connect port")?,
+    ))
 }
 
 fn print_usage() {
@@ -315,6 +348,8 @@ fn print_usage() {
          \x20 --session <name>     reattachable persistent session (never lose your shell)\n\
          \x20 --shared             shared session: you own it, others can attach read-only\n\
          \x20 --attach IP PORT     attach to a running server ($MISH_CONNECT creds; for testing)\n\
+         \x20 --connect HOST:PORT  ssh-less direct connect to `mish-server --listen` (see enroll)\n\
+         \x20 enroll [user@]host   one-shot: exchange certs with a direct-mode server over SSH\n\
          \x20 --log-file <path>    write a JSON event log (for debugging)\n\
          \x20 --log-level <lvl>    log verbosity: error|warn|info|debug|trace (default debug)\n\
          \x20 --perf-log <path>    record per-keystroke keypress->display latency (JSON lines)\n\
@@ -338,6 +373,14 @@ fn default_local_server() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `mish enroll [user@]host [options]`: a one-shot subcommand (no session), so
+    // it's handled before the normal option parser. It SSHes once to exchange
+    // certificates, then exits — see `run_enroll`.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("enroll") {
+        return run_enroll(&argv[2..]);
+    }
+
     let opts = parse_args()?;
 
     // Optional event log (--log-file): install before anything else so the whole
@@ -370,6 +413,22 @@ async fn main() -> Result<()> {
     if let Some((ip, port)) = opts.attach.clone() {
         attach_session(
             &ip,
+            port,
+            opts.predict,
+            opts.no_init,
+            opts.local_forwards,
+            opts.remote_forwards,
+            opts.session.clone(),
+        )
+        .await?;
+        exit_now();
+    }
+
+    // Direct connect (--connect HOST:PORT): dial an `mish-server --listen` with no
+    // SSH, using the enrolled client identity and the pinned server cert for HOST.
+    if let Some((host, port)) = opts.connect.clone() {
+        connect_session(
+            &host,
             port,
             opts.predict,
             opts.no_init,
@@ -549,6 +608,139 @@ async fn attach_session(
     )
     .await;
     Ok(())
+}
+
+/// Direct-connect to `host:port` (ssh-less): load the enrolled client identity
+/// and the pinned server cert for `host`, dial, and run the terminal. Roaming
+/// rides QUIC connection migration on this one connection, exactly as the SSH
+/// path does; a new invocation is a new connection (a fresh server-side shell).
+async fn connect_session(
+    host: &str,
+    port: u16,
+    predict: PredictMode,
+    no_init: bool,
+    local_forwards: Vec<mish::forward::ForwardSpec>,
+    remote_forwards: Vec<mish::forward::ForwardSpec>,
+    session: Option<String>,
+) -> Result<()> {
+    let id = mish::enroll::load_or_generate_client_identity()?;
+    let server_cert = mish::enroll::load_server_cert(host)?;
+    let addr = resolve_hostport(host, port)?;
+
+    let endpoint = transport::authenticated_client_endpoint(
+        client_bind_addr(addr),
+        &server_cert,
+        &id.cert,
+        &id.key,
+    )
+    .context("creating QUIC client endpoint")?;
+    eprintln!("[mish-client] direct-connecting to {addr} …");
+    let t = transport::connect(&endpoint, addr, "localhost")
+        .await
+        .context("connecting to server")?;
+    tracing::info!(target: "mish::client", %addr, "direct-connected to server");
+    run_terminal(
+        t,
+        predict,
+        no_init,
+        local_forwards,
+        remote_forwards,
+        session,
+    )
+    .await;
+    Ok(())
+}
+
+/// Resolve `host:port` to a single socket address (first result wins).
+fn resolve_hostport(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {host}:{port}"))?
+        .next()
+        .with_context(|| format!("no address found for {host}:{port}"))
+}
+
+/// `mish enroll [user@]host [--ssh CMD] [--server CMD] [--name LABEL]`: exchange
+/// certificates with a direct-mode server over SSH. Generates/loads the client
+/// identity, ships its cert to the server (which enrolls it and hands back its
+/// own cert), and pins that server cert for later `--connect`. One-shot: SSHes
+/// once and exits.
+fn run_enroll(args: &[String]) -> Result<()> {
+    let mut host: Option<String> = None;
+    let mut ssh_argv: Vec<String> = vec!["ssh".into()];
+    let mut server_cmd = SERVER_BIN.to_string();
+    let mut name: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--ssh" => {
+                ssh_argv = shell_split(it.next().context("--ssh needs a value")?)?;
+                if ssh_argv.is_empty() {
+                    bail!("--ssh value is empty");
+                }
+            }
+            "--server" => server_cmd = it.next().context("--server needs a value")?.clone(),
+            "--name" => name = Some(it.next().context("--name needs a value")?.clone()),
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: mish enroll [user@]host [--ssh CMD] [--server CMD] [--name LABEL]"
+                );
+                return Ok(());
+            }
+            other if other.starts_with('-') => bail!("unknown enroll option: {other}"),
+            other => host = Some(other.to_string()),
+        }
+    }
+    let host = host.context("enroll needs a [user@]host")?;
+    let label = name.unwrap_or_else(mish::enroll::client_label);
+
+    let id = mish::enroll::load_or_generate_client_identity()?;
+    let cert_hex = bootstrap::to_hex(&id.cert);
+
+    // Remote one-shot; the label is quoted (the server also sanitizes it).
+    let remote = format!(
+        "{server_cmd} --enroll-client {cert_hex} --enroll-name {}",
+        shell_quote(&label)
+    );
+    eprintln!("[mish enroll] {} {host} …", ssh_argv.join(" "));
+    let out = std::process::Command::new(&ssh_argv[0])
+        .args(&ssh_argv[1..])
+        .arg(&host)
+        .arg(&remote)
+        .output()
+        .with_context(|| format!("running ssh ({})", ssh_argv[0]))?;
+    if !out.status.success() {
+        bail!(
+            "enroll ssh failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let server_cert = parse_identity_line(&String::from_utf8_lossy(&out.stdout))?;
+    let path = mish::enroll::store_server_cert(&host, &server_cert)?;
+    eprintln!(
+        "[mish enroll] enrolled as {label:?}; pinned server cert for {} at {}",
+        mish::enroll::host_only(&host),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Extract the server cert DER from the `MISH IDENTITY <hex>` line printed by
+/// `mish-server --enroll-client`.
+fn parse_identity_line(text: &str) -> Result<Vec<u8>> {
+    for line in text.lines() {
+        if let Some(hex) = line.strip_prefix("MISH IDENTITY ") {
+            return bootstrap::from_hex(hex.trim()).context("bad server cert hex");
+        }
+    }
+    bail!("server did not return a `MISH IDENTITY <hex>` line");
+}
+
+/// Single-quote a value for a POSIX remote shell command line.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Put the TTY in raw mode and run the client session until detach or close.

@@ -195,6 +195,24 @@ configured, so a hostile server can't reach arbitrary client-local addresses. Se
 [`docs/port-forwarding.md`](docs/port-forwarding.md) and the threat model in
 [`SECURITY.md`](SECURITY.md#port-forwarding--l---r).
 
+**Direct connect — ssh-less fast path (mosh can't do this either).** The SSH
+round-trip is the slow part of a connect. With `mish enroll host` you pay it
+**once**: it exchanges long-lived certificates over SSH and pins them on disk.
+After that, `mish-client --connect host:PORT` reaches a listening `mish-server
+--listen` in a single mutually-authenticated QUIC handshake — no SSH, no
+per-session handoff. The server keeps a persistent identity plus an **allow-list**
+of enrolled client certs (enroll to admit, delete the cert to revoke); each
+connection is its **own fresh shell** (non-persistent — run tmux inside for
+persistence, QUIC roaming keeps a live connection across IP changes). It's strict
+opt-in: the SSH bootstrap above is untouched and stays the default. See
+[`docs/direct-connect.md`](docs/direct-connect.md).
+
+```sh
+mish enroll user@host                 # one-time: exchange + pin certs over SSH
+mish-server --listen 0.0.0.0:60000    # on the host: long-lived ssh-less listener
+mish-client --connect host:60000      # every connect after: no SSH, straight QUIC
+```
+
 A blue status banner ("mish: Last contact N seconds ago…") appears when the link
 stalls, and the window title is prefixed `[mish]`.
 
@@ -257,6 +275,7 @@ the independent UDP/QUIC path.
 | madsim sim | sans-IO core, and full stack (scripted shell) over madsim's simulated UDP — reproducible by seed | `mish-madsim/tests/` |
 | Miri (UB) | the sans-IO core (frag/codec/diff/SSP) and prediction overlay run clean under Miri — no UB or aliasing violations | CI `miri` job |
 | Security: mutual auth | a client with no / wrong client cert is rejected (config + against the *real* server binary); a client rejects a wrong server cert; 0-RTT early data is off | `mish-quic/tests/auth.rs`, `mosh/tests/auth_e2e.rs`, `config.rs::early_data_is_off` |
+| Direct connect (ssh-less) | an enrolled client reaches a `--listen` server over QUIC with no SSH and each dial is its own fresh shell; an un-enrolled client is closed at the handshake; enrollment slot names can't escape the allow-list dir; identity keys are `0600` | `mish/tests/direct_e2e.rs`, `mish/src/direct.rs` tests |
 | Security: wire attacks | bit-flipped datagram (AEAD-rejected → heals), duplicated datagram (no double-apply), off-path injection, and a pre-handshake junk flood can't disrupt/hijack/exhaust the session | `mish-quic/tests/wire_attacks.rs` |
 | Security: key hygiene | the client private key never appears in the server's log (stderr) output | `mosh/tests/key_hygiene.rs` |
 | Security: builtin bootstrap | host-key change rejected / unknown = TOFU (real keys + temp known_hosts), `shell_quote` can't be shell-injected (real `/bin/sh`), the `MISH CONNECT` scan is memory-bounded, all parsers panic-free under proptest + a `bootstrap_parse` libFuzzer target | `mosh/src/bootstrap.rs` tests, `fuzz/fuzz_targets/bootstrap_parse.rs` |
@@ -378,10 +397,12 @@ mish equivalents.
 
 Several beyond-mosh features are **already done** — server-side **scrollback**,
 **persistent sessions + reattach**, **multi-client attach** (`--shared`), the
-reliable QUIC **side-channel** they ride on, and now **`ssh -L`/`-R`-style port
+reliable QUIC **side-channel** they ride on, **`ssh -L`/`-R`-style port
 forwarding** (TCP tunnels over QUIC streams, which mosh's UDP/OCB transport cannot
-do — see [`docs/port-forwarding.md`](docs/port-forwarding.md)). The remaining
-forward roadmap — large-payload **clipboard** — is laid out in
+do — see [`docs/port-forwarding.md`](docs/port-forwarding.md)), and **ssh-less
+direct connect** (enroll once over SSH, then connect straight over QUIC — see
+[`docs/direct-connect.md`](docs/direct-connect.md)). The remaining forward
+roadmap — large-payload **clipboard** — is laid out in
 **[`NEXT_FEATURES.md`](NEXT_FEATURES.md)**.
 
 > One idea that used to be on this list, app-layer *congestion-aware pacing*, was

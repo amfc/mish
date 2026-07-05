@@ -9,7 +9,18 @@
 //! so the fork happens in a single-threaded process. The child then builds the
 //! runtime and constructs the Quinn endpoint from the inherited socket.
 //!
-//! Usage: `mish-server [--detach] [--persist] [--shared] [--allow-forward] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [bind-port] [-- command]`
+//! Usage: `mish-server [--detach] [--persist] [--shared] [--allow-forward] [-4|-6|--family inet|inet6] [-p PORT|-p LOW:HIGH] [-l KEY=VAL]... [--log-file PATH] [--log-level LEVEL] [--listen [IP:]PORT] [--server-key PATH] [--authorized-certs DIR] [bind-port] [-- command]`
+//!
+//! ## Direct-connect mode (`--listen`)
+//!
+//! `--listen [IP:]PORT` runs a long-lived, **ssh-less** listener instead of the
+//! SSH-bootstrap flow: it loads a **persistent** on-disk server identity
+//! (`--server-key`, cert stored beside it) and a directory of **enrolled** client
+//! certificates (`--authorized-certs`), then serves each authenticated connection
+//! its own fresh, **non-persistent** shell (see [`mish::direct`]). There is no
+//! `MISH CONNECT` handoff — an enrolled client already holds its credentials and
+//! dials the QUIC port directly. The operator owns the listener's lifecycle
+//! (systemd) and the bind IP's reachability (a WireGuard address on hosts).
 //!
 //! `--allow-forward` enables `ssh -L`/`-R`-style port forwarding, which is
 //! **off by default**; the bootstrapping client passes it automatically when the
@@ -29,6 +40,7 @@
 //! `MISH_SERVER_REATTACH_TMOUT` (`--persist`: wait for a reattach, default 24h).
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +80,33 @@ struct Options {
     log_file: Option<std::path::PathBuf>,
     /// Max verbosity for the event log (`--log-level`, default debug).
     log_level: tracing::Level,
+    /// Direct-connect listener (`--listen [IP:]PORT`): run a long-lived,
+    /// ssh-less listener bound to this address, using a **persistent** on-disk
+    /// server identity and a directory of enrolled client certs, instead of the
+    /// SSH-bootstrap flow. `None` = normal SSH-launched server.
+    listen: Option<(String, u16)>,
+    /// Persistent server-identity key path (`--server-key`, direct mode only).
+    /// `None` = `<config>/server.key`.
+    server_key: Option<std::path::PathBuf>,
+    /// Directory of enrolled client certs (`--authorized-certs`, direct mode
+    /// only). `None` = `<config>/authorized/`.
+    authorized_certs: Option<std::path::PathBuf>,
+    /// One-shot enrollment (`--enroll-client HEX`): add this hex-encoded client
+    /// certificate to the allow-list, materialize the server identity, print
+    /// `MISH IDENTITY <server-cert-hex>`, and exit. Run over SSH by `mish enroll`.
+    enroll_client: Option<String>,
+    /// Allow-list filename stem for `--enroll-client` (`--enroll-name NAME`,
+    /// default `mish-client`). Sanitized before use.
+    enroll_name: Option<String>,
 }
+
+/// Default allow-list slot name when `--enroll-name` is omitted.
+const DEFAULT_ENROLL_NAME: &str = "mish-client";
+
+/// Default bind address when `--listen` is given a bare port (no IP). In
+/// containers this is safe (localhost-only without WireGuard); on WG hosts the
+/// caller passes the WG IP explicitly as `IP:PORT`.
+const DEFAULT_BIND_IP: &str = "0.0.0.0";
 
 const USAGE: &str = "\
 mish-server: spawn a shell on a PTY and serve it over QUIC datagrams.
@@ -87,6 +125,19 @@ Options:
                       -L/-R forward is requested.
   --session NAME      Start (or reattach to) a named, reattachable session.
                       Implies --persist.
+  --listen [IP:]PORT  Direct-connect mode: run a long-lived, ssh-less listener
+                      bound to this address, using a persistent on-disk identity
+                      and a directory of enrolled client certs. Bracket IPv6 as
+                      [addr]:port. A bare PORT binds 0.0.0.0.
+  --server-key PATH   Direct mode: persistent server-identity key (default
+                      <config>/server.key; the cert is stored beside it as .crt).
+  --authorized-certs DIR
+                      Direct mode: directory of enrolled client certs, one *.crt
+                      DER file each (default <config>/authorized/).
+  --enroll-client HEX Add a hex-encoded client cert to the allow-list, print the
+                      server cert as `MISH IDENTITY <hex>`, and exit. Invoked over
+                      SSH by `mish enroll`; not for direct use.
+  --enroll-name NAME  Allow-list slot name for --enroll-client (default mish-client).
   -4 | -6             Bind IPv4 (0.0.0.0, default) or IPv6 (::).
   --family inet|inet6 Same as -4 / -6.
   -p PORT | -p LO:HI  Bind a specific port, or the first free port in a range.
@@ -100,7 +151,12 @@ With no `-- command`, the user's $SHELL is started as a login shell.
 
 Env: MOSH_SERVER_NETWORK_TMOUT (mid-session idle, default 300s),
      MOSH_SERVER_SIGNAL_TMOUT (wait for first connection, default 60s),
-     MISH_SERVER_REATTACH_TMOUT (--persist: wait for a reattach, default 24h).
+     MISH_SERVER_REATTACH_TMOUT (--persist: wait for a reattach, default 24h),
+     MISH_CONFIG_DIR / XDG_CONFIG_HOME (direct mode: identity/enrolled-cert dir).
+
+Direct mode (--listen) has no MISH CONNECT handoff and no signal/reattach
+timeout — the listener waits for clients indefinitely and each connection gets
+its own fresh, non-persistent shell (roaming rides QUIC connection migration).
 ";
 
 fn parse_args() -> Result<Options> {
@@ -116,6 +172,11 @@ fn parse_args() -> Result<Options> {
         forward: false,
         log_file: None,
         log_level: tracing::Level::DEBUG,
+        listen: None,
+        server_key: None,
+        authorized_certs: None,
+        enroll_client: None,
+        enroll_name: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -162,6 +223,26 @@ fn parse_args() -> Result<Options> {
                 let (k, v) = kv.split_once('=').context("-l expects KEY=VAL")?;
                 opts.locale.push((k.to_string(), v.to_string()));
             }
+            "--listen" => {
+                let spec = args.next().context("--listen needs [IP:]PORT")?;
+                opts.listen = Some(parse_listen(&spec)?);
+            }
+            "--server-key" => {
+                opts.server_key = Some(args.next().context("--server-key needs a PATH")?.into());
+            }
+            "--authorized-certs" => {
+                opts.authorized_certs = Some(
+                    args.next()
+                        .context("--authorized-certs needs a DIR")?
+                        .into(),
+                );
+            }
+            "--enroll-client" => {
+                opts.enroll_client = Some(args.next().context("--enroll-client needs a HEX cert")?);
+            }
+            "--enroll-name" => {
+                opts.enroll_name = Some(args.next().context("--enroll-name needs a NAME")?);
+            }
             "--log-file" => {
                 opts.log_file = Some(args.next().context("--log-file needs a PATH")?.into());
             }
@@ -199,6 +280,25 @@ fn parse_ports(spec: &str) -> Result<Vec<u16>> {
     } else {
         Ok(vec![spec.parse().context("bad port")?])
     }
+}
+
+/// Parse a `--listen` value into `(bind_ip, port)`. Accepts a bare `PORT`
+/// (binds [`DEFAULT_BIND_IP`]), an IPv4 `IP:PORT`, or a bracketed IPv6
+/// `[ADDR]:PORT` (brackets are required for IPv6 to disambiguate the colons).
+fn parse_listen(spec: &str) -> Result<(String, u16)> {
+    if let Ok(port) = spec.parse::<u16>() {
+        return Ok((DEFAULT_BIND_IP.to_string(), port));
+    }
+    if let Some(rest) = spec.strip_prefix('[') {
+        let (addr, port) = rest
+            .split_once("]:")
+            .context("--listen [IPv6]:PORT needs a closing `]:PORT`")?;
+        return Ok((addr.to_string(), port.parse().context("bad --listen port")?));
+    }
+    let (addr, port) = spec
+        .rsplit_once(':')
+        .context("--listen expects [IP:]PORT (bracket IPv6 as [addr]:port)")?;
+    Ok((addr.to_string(), port.parse().context("bad --listen port")?))
 }
 
 fn bind_in_range(ports: &[u16], bind_ip: &str) -> Result<std::net::UdpSocket> {
@@ -253,7 +353,7 @@ fn suppress_core_dumps() {}
 
 fn main() -> Result<()> {
     suppress_core_dumps();
-    let opts = parse_args()?;
+    let mut opts = parse_args()?;
 
     // Optional event log (--log-file). Installed before the daemonize fork: the
     // file fd and the (thread-free, synchronous) subscriber are inherited by the
@@ -289,6 +389,22 @@ fn main() -> Result<()> {
     }
 
     mish_quic::config::init_crypto();
+
+    // One-shot enrollment (`--enroll-client`): add a client cert to the allow-list
+    // and hand back the server cert, then exit. Run over SSH by `mish enroll`;
+    // it never binds a socket or serves a shell.
+    if let Some(client_cert_hex) = opts.enroll_client.take() {
+        return run_enroll_client(opts, client_cert_hex);
+    }
+
+    // Direct-connect mode (`--listen`): an ssh-less, long-lived listener with a
+    // persistent on-disk identity and an enrolled-client allow-list. It shares
+    // nothing with the SSH-bootstrap flow below — no `MISH CONNECT` handoff, no
+    // per-session credentials, no session registry — so it returns straight from
+    // its own accept loop.
+    if let Some(listen) = opts.listen.take() {
+        return run_direct(opts, listen);
+    }
 
     // Reattach: if a named session is requested and a live one already exists,
     // reprint its connect line and exit — the running daemon keeps serving and
@@ -456,6 +572,126 @@ async fn serve(
     eprintln!("session ended");
     tracing::info!(target: "mish::server", "session ended");
     Ok(())
+}
+
+/// Persistent server-identity key path: `--server-key`, else `<config>/server.key`.
+fn server_key_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match explicit {
+        Some(p) => Ok(p),
+        None => Ok(mish::direct::config_dir()?.join("server.key")),
+    }
+}
+
+/// Enrolled-client cert directory: `--authorized-certs`, else `<config>/authorized`.
+fn authorized_certs_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match explicit {
+        Some(p) => Ok(p),
+        None => Ok(mish::direct::config_dir()?.join("authorized")),
+    }
+}
+
+/// One-shot enrollment side of `mish enroll`: decode the client cert, add it to
+/// the allow-list under the client's chosen name, materialize the persistent
+/// server identity, and print `MISH IDENTITY <server-cert-hex>` for the client to
+/// pin. Runs over SSH — the authenticated channel is what authorizes adding a
+/// client to the allow-list.
+fn run_enroll_client(opts: Options, client_cert_hex: String) -> Result<()> {
+    let key_path = server_key_path(opts.server_key)?;
+    let certs_dir = authorized_certs_dir(opts.authorized_certs)?;
+    let name = opts
+        .enroll_name
+        .unwrap_or_else(|| DEFAULT_ENROLL_NAME.to_string());
+    let client_cert = mish::bootstrap::from_hex(&client_cert_hex)
+        .context("--enroll-client expects a hex-encoded client certificate")?;
+
+    // Materialize (or load) the server identity so we have a cert to hand back.
+    let (server_cert, _key) =
+        mish::direct::load_or_generate_identity(&key_path, mish::direct::SERVER_SUBJECT)
+            .context("loading server identity")?;
+    let path = mish::direct::enroll_client_cert(&certs_dir, &name, &client_cert)
+        .context("enrolling client cert")?;
+    eprintln!("mish: enrolled client {name:?} at {}", path.display());
+
+    use mish::bootstrap::to_hex;
+    println!("MISH IDENTITY {}", to_hex(&server_cert));
+    std::io::stdout().flush().ok();
+    Ok(())
+}
+
+/// Direct-connect mode: bind a long-lived listener with a persistent identity
+/// and an enrolled-client allow-list, then serve each accepted connection its
+/// own non-persistent shell. No `MISH CONNECT` handoff (the client already holds
+/// its enrolled credentials) and no session registry.
+fn run_direct(opts: Options, listen: (String, u16)) -> Result<()> {
+    let (bind_ip, port) = listen;
+    let key_path = server_key_path(opts.server_key)?;
+    let certs_dir = authorized_certs_dir(opts.authorized_certs)?;
+
+    let (server_cert, server_key) =
+        mish::direct::load_or_generate_identity(&key_path, mish::direct::SERVER_SUBJECT)
+            .context("loading server identity")?;
+    let authorized =
+        mish::direct::load_authorized_certs(&certs_dir).context("loading authorized certs")?;
+    if authorized.is_empty() {
+        eprintln!(
+            "mish: warning: no enrolled client certs in {} — enroll a client before it can connect",
+            certs_dir.display()
+        );
+    }
+    let server_config =
+        mish_quic::config::stable_server_config(&server_cert, &server_key, authorized);
+
+    let socket = bind_in_range(&[port], &bind_ip).context("binding direct-mode UDP socket")?;
+    let local = socket.local_addr()?;
+    // Machine-readable bound address (no secret — just where we listen), so a
+    // supervisor/test can discover an OS-assigned port (`--listen …:0`).
+    println!("MISH LISTEN {local}");
+    std::io::stdout().flush().ok();
+    eprintln!("mish direct listener on {local}");
+    tracing::info!(target: "mish::server", %local, "direct listener started");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    // `serve_direct` speaks argv (`Vec<String>`), while this branch models the
+    // optional `-- command` as a single joined string. A bare `--listen` (the
+    // production path) carries no command, so this collects to an empty argv and
+    // each connection gets a login shell.
+    let command: Vec<String> = opts.command.into_iter().collect();
+    runtime.block_on(serve_direct(socket, server_config, command))
+}
+
+/// Direct-mode accept loop: one persistent endpoint multiplexes every connection
+/// by QUIC Connection ID. Each authenticated connection is served its own fresh,
+/// non-persistent shell on a spawned task, so a new invocation is always a new
+/// shell and roaming rides QUIC connection migration on the existing one. The
+/// loop runs until the endpoint is closed; there is deliberately no signal
+/// timeout — a systemd-owned listener waits for clients indefinitely.
+async fn serve_direct(
+    socket: std::net::UdpSocket,
+    server_config: mish_quic::ServerConfig,
+    command: Vec<String>,
+) -> Result<()> {
+    let endpoint = mish_quic::transport::server_from_socket(socket, server_config)
+        .context("building QUIC endpoint")?;
+    let network_timeout = Some(env_secs("MOSH_SERVER_NETWORK_TMOUT", 300));
+    loop {
+        let transport = accept_authenticated(&endpoint)
+            .await
+            .context("accepting direct-mode connection")?;
+        let remote = transport.remote_address();
+        eprintln!("client connected from {remote}");
+        tracing::info!(target: "mish::server", %remote, "direct client connected");
+        let command = command.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                mish::direct::serve_connection(transport, command, network_timeout).await
+            {
+                tracing::warn!(target: "mish::server", error = %e, "direct connection ended with error");
+            }
+        });
+    }
 }
 
 /// Persistent mode (`--persist`): keep the PTY + emulator alive across client
@@ -736,4 +972,38 @@ fn daemonize() -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn daemonize() -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_listen_accepts_bare_port_ipv4_and_bracketed_ipv6() {
+        assert_eq!(
+            parse_listen("6000").unwrap(),
+            (DEFAULT_BIND_IP.to_string(), 6000)
+        );
+        assert_eq!(
+            parse_listen("10.99.1.10:6000").unwrap(),
+            ("10.99.1.10".to_string(), 6000)
+        );
+        assert_eq!(
+            parse_listen("[fd00::1]:6000").unwrap(),
+            ("fd00::1".to_string(), 6000)
+        );
+    }
+
+    #[test]
+    fn parse_listen_rejects_malformed_specs() {
+        // Missing port, non-numeric port, and a bracketed IPv6 without the
+        // closing `]:` all fail at parse time.
+        assert!(parse_listen("10.99.1.10:").is_err());
+        assert!(parse_listen("10.99.1.10:notaport").is_err());
+        assert!(parse_listen("[fd00::1]6000").is_err());
+        // A bare (unbracketed) IPv6 is *not* disambiguated here — its last colon
+        // splits off "1" as the port, leaving a bogus bind IP that fails loudly
+        // at bind time. Brackets are required for IPv6 (documented in USAGE).
+        assert_eq!(parse_listen("fd00::1").unwrap(), ("fd00:".to_string(), 1));
+    }
 }

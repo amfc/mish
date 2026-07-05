@@ -180,3 +180,58 @@ check.
 | Forwarding only when the client requests it | no listener or stream without `-L`/`-R` | (by construction) |
 | Hostile server cannot reach unconfigured client-local addrs via `-R` | client dials only configured `-R` targets | `port_forward.rs::client_refuses_unconfigured_forwarded_connection` |
 | Forwarding control messages are panic-free and bounded | size-capped framing plus `Option`-returning decode | `forward.rs::decode_is_panic_free_on_garbage` |
+
+## Direct-connect mode (`--listen`)
+
+Direct-connect mode (`mish-server --listen`, `mish enroll`, `mish-client
+--connect` — see [`direct-connect.md`](direct-connect.md)) is an ssh-less fast
+path. It does not weaken the QUIC/TLS boundary: the session is still mutual TLS
+with a pinned server cert and 0-RTT off. It **moves the trust anchor** from a
+live SSH login on every connect to a one-time SSH enrollment that pins long-lived
+certificates, and it **replaces the client verifier**.
+
+- **The SSH enrollment is still the anchor.** `mish enroll` runs over the same
+  authenticated, confidential SSH channel the bootstrap uses. It is where a
+  client cert is added to the server's allow-list and where the client pins the
+  server cert. Whoever can complete that SSH login (i.e. already has shell access
+  as that user on the host) is who can enroll. Direct mode adds no new way to
+  join the allow-list; it just makes joining a one-time step instead of a
+  per-connection one.
+- **Client auth is an on-disk allow-list, not a per-session pin.** The bootstrap
+  server pins exactly one minted client cert (`PinnedClientCertVerifier`). The
+  `--listen` server instead accepts any client cert whose full DER matches a
+  `*.crt` in the `--authorized-certs` directory
+  (`DirectoryClientCertVerifier`, full-DER equality, no hashing). Enrolling adds
+  a cert; deleting the `.crt` revokes it; an empty directory accepts nobody. An
+  un-enrolled client is rejected at the TLS handshake — the server closes the
+  connection, so it never reaches a shell (`direct_e2e.rs`,
+  `mish-quic/tests/auth.rs`).
+- **Server identity is persistent and per-host, and the client pins it.** The
+  listener keeps a stable keypair (`--server-key`, `0600`), so a MITM presenting
+  a different cert on the UDP path is rejected exactly as on the bootstrap path.
+  The client trusts only the cert `mish enroll host` pinned for that host.
+- **Certificate keys live at rest, user-only.** Both the server key and the
+  client key are `0600` files under the config dir, a step down from the
+  bootstrap path's memory-only per-session key — the same tradeoff, and bound the
+  same way, as the reattach registry above: anyone who can read them already has
+  shell access as that user. The allow-list `.crt` files are public certs, not
+  secrets.
+- **Path traversal in enrollment is contained.** An enrollment slot name
+  (`--enroll-name`, or a client's self-reported label) is sanitized to a single
+  path component before it becomes a `.crt` filename, so a hostile or careless
+  label cannot write outside the allow-list directory (`direct.rs`
+  `enroll_sanitizes_traversal_names`).
+- **Sessions are non-persistent by construction.** Each accepted connection gets
+  its own fresh shell, killed and reaped when the connection dies; there is no
+  registry, no reattach, no shared key at rest for sessions. tmux is the
+  persistence layer. This removes the reattach/`--shared` credential-at-rest
+  surface entirely for direct mode — the only keys at rest are the two identity
+  keys above.
+
+| Property | Mechanism | Test |
+|---|---|---|
+| Only an enrolled client cert is admitted | `DirectoryClientCertVerifier` full-DER allow-list; un-enrolled handshake closed | `mish/tests/direct_e2e.rs`, `mish-quic/tests/auth.rs` |
+| Server impersonation rejected on the direct path | client pins the per-host server cert from `mish enroll` | `mish/tests/direct_e2e.rs` |
+| Enrollment cannot write outside the allow-list dir | slot name sanitized to one path component | `direct.rs::enroll_sanitizes_traversal_names` |
+| Identity keys are user-only at rest | `server.key` / `client.key` written `0600` | `direct.rs::identity_is_generated_then_loaded_stably` |
+| Each connection is its own reaped shell (no reattach surface) | per-connection PTY, killed on connection close | `mish/tests/direct_e2e.rs` (`each_dial_is_fresh`) |

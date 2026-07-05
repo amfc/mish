@@ -17,6 +17,8 @@
 
 pub mod bootstrap;
 pub mod client;
+pub mod direct;
+pub mod enroll;
 pub mod forward;
 pub mod locale;
 pub mod perf;

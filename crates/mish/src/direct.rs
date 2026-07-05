@@ -1,0 +1,320 @@
+//! Direct-connect mode (`--listen`): an ssh-less fast path to a mish shell.
+//!
+//! The default mish flow bootstraps every session over SSH: the client SSHes in,
+//! launches `mish-server`, and reads a one-shot `MISH CONNECT` line carrying a
+//! freshly-minted, per-session credential triple. That round-trip is the slow
+//! part. Direct mode removes it: a long-lived `mish-server --listen [IP:]PORT`
+//! carries a **stable identity persisted on disk** and a directory of **enrolled
+//! client certificates**, so an enrolled client dials the QUIC port straight away
+//! with no SSH at all (see [`mish_quic::config::stable_server_config`]).
+//!
+//! The operator owns the daemon's lifecycle and reachability (a systemd unit, and
+//! — on WireGuard hosts — a bind IP that only the WG interface exposes). This
+//! module provides the pieces that are independent of that wiring: loading or
+//! generating the persistent server identity, reading the enrolled client certs,
+//! and serving a single accepted connection.
+//!
+//! Sessions here are **non-persistent**: each accepted QUIC connection gets its
+//! own PTY and dies when the connection or the shell goes. Roaming across network
+//! changes is handled entirely at the transport layer (QUIC connection
+//! migration), exactly as in the SSH-bootstrap path — a client that changes IP
+//! keeps the *same* connection, so a brand-new invocation is always a brand-new
+//! shell and never resurrects a previous one. Reattach/persistence is deliberately
+//! absent (use tmux for that); port forwarding is off.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use zeroize::Zeroizing;
+
+use crate::forward::serve_side_channels;
+use crate::pty::PtyProcess;
+use crate::server::run_server;
+use mish_quic::transport::QuicTransport;
+use mish_ssp::clock::SystemClock;
+
+/// File extension for an enrolled client certificate (DER) in the authorized-certs
+/// directory. Only files with this suffix are read, so stray files (READMEs,
+/// editor swap files) never derail the allow-list.
+const CLIENT_CERT_EXT: &str = "crt";
+
+/// The persistent server certificate lives beside its key: `--server-key foo.key`
+/// stores the cert at `foo.crt`. Kept next to the key so one path configures both.
+fn cert_path_for_key(key_path: &Path) -> PathBuf {
+    key_path.with_extension(CLIENT_CERT_EXT)
+}
+
+/// Subject of a persistent **server** identity. The client passes this as the QUIC
+/// `server_name` ([`mish_quic::transport::connect`]), so it must match.
+pub const SERVER_SUBJECT: &str = "localhost";
+
+/// Resolve mish's config dir: `$MISH_CONFIG_DIR`, else `$XDG_CONFIG_HOME/mish`,
+/// else `~/.config/mish`. Holds the persistent server identity + enrolled-client
+/// allow-list (server side) and the client identity + pinned server certs (client
+/// side).
+pub fn config_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("MISH_CONFIG_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(xdg).join("mish"));
+    }
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".config").join("mish"))
+}
+
+/// Load the persistent identity from `key_path` (+ its sibling `.crt`), or — on
+/// first run, when either file is missing — generate a fresh self-signed identity
+/// with `subject` and persist it: the key `0600` (it is the long-term secret) and
+/// the cert world-readable (it is public; the peer pins it).
+pub fn load_or_generate_identity(
+    key_path: &Path,
+    subject: &str,
+) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+    let cert_path = cert_path_for_key(key_path);
+    if key_path.exists() && cert_path.exists() {
+        let key = Zeroizing::new(
+            std::fs::read(key_path).with_context(|| format!("reading {}", key_path.display()))?,
+        );
+        let cert = std::fs::read(&cert_path)
+            .with_context(|| format!("reading {}", cert_path.display()))?;
+        return Ok((cert, key));
+    }
+
+    let (cert, key) = mish_quic::config::generate_identity(subject);
+    if let Some(dir) = key_path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating identity dir {}", dir.display()))?;
+    }
+    write_secret(key_path, &key).with_context(|| format!("writing {}", key_path.display()))?;
+    std::fs::write(&cert_path, &cert)
+        .with_context(|| format!("writing {}", cert_path.display()))?;
+    Ok((cert, key))
+}
+
+/// Write `bytes` to `path` as a `0600` file (create or truncate).
+fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+/// Read every enrolled client certificate (DER) from `dir`, returning their raw
+/// bytes for [`mish_quic::config::stable_server_config`]'s allow-list. Only
+/// `*.crt` files are read. A missing directory is created (`0700`) and treated as
+/// an empty allow-list — a fresh daemon accepts no one until a client is enrolled,
+/// which is the safe default (the verifier rejects every cert against an empty
+/// set).
+pub fn load_authorized_certs(dir: &Path) -> Result<Vec<Vec<u8>>> {
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating authorized-certs dir {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        return Ok(Vec::new());
+    }
+    let mut certs = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry
+            .with_context(|| format!("reading entry in {}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) == Some(CLIENT_CERT_EXT) {
+            certs
+                .push(std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?);
+        }
+    }
+    Ok(certs)
+}
+
+/// Sanitize an untrusted path component (a peer-supplied client name or host) so
+/// it is a safe single filename: keep `[A-Za-z0-9._-]`, map everything else to
+/// `_`, and reject empty / dot-only names (which would escape or alias the dir).
+/// The name flows into a filesystem path on the *other* end of an enrollment, so
+/// this guards against traversal (`../`) and separators.
+pub fn sanitize_component(name: &str) -> Result<String> {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() || clean.chars().all(|c| c == '.') {
+        anyhow::bail!("invalid name {name:?}");
+    }
+    Ok(clean)
+}
+
+/// Enroll a client certificate into the server's allow-list `dir`: write its DER
+/// bytes to `<dir>/<name>.crt` (the directory is created `0700` if missing).
+/// Re-enrolling the same `name` overwrites its entry (a key rotation), so a
+/// machine keeps a single slot. Returns the path written.
+pub fn enroll_client_cert(dir: &Path, name: &str, cert_der: &[u8]) -> Result<PathBuf> {
+    let file = format!("{}.{CLIENT_CERT_EXT}", sanitize_component(name)?);
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating authorized-certs dir {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join(file);
+    std::fs::write(&path, cert_der).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// Serve one accepted, already-authenticated connection to completion: spawn the
+/// PTY (login shell, or the explicit `command`), wire the side-channel server
+/// (scrollback; forwarding stays off), and run the non-persistent session loop.
+/// When the loop returns — client gone or shell exited — the [`PtyProcess`] drops,
+/// which closes its control channel and reaps the child (`kill` + `wait`), so no
+/// process is left behind.
+pub async fn serve_connection(
+    transport: QuicTransport,
+    command: Vec<String>,
+    network_timeout: Option<Duration>,
+) -> Result<()> {
+    let (cols, rows) = (80u16, 24u16);
+    let pty = if command.is_empty() {
+        PtyProcess::spawn_login_shell(cols, rows)
+    } else {
+        PtyProcess::spawn_argv(command, cols, rows)
+    }
+    .context("spawning PTY child")?;
+
+    let clock = Arc::new(SystemClock::new());
+    let emu = mish_terminal::emulator::Emulator::shared(cols, rows);
+    let transport = Arc::new(transport);
+    // Side-channels: scrollback history only. Port forwarding is disabled in
+    // direct mode (`forward = false`), so `-L`/`-R` requests are denied.
+    tokio::spawn(serve_side_channels(transport.clone(), emu.clone(), false));
+    run_server(
+        transport,
+        emu,
+        clock,
+        network_timeout,
+        pty.output,
+        pty.control,
+    )
+    .await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mish-direct-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// First run generates and persists a stable identity; a second run loads the
+    /// *same* bytes back (so enrolled clients keep trusting the server across
+    /// restarts). The key file must be `0600`.
+    #[test]
+    fn identity_is_generated_then_loaded_stably() {
+        let dir = tmp("identity");
+        let key_path = dir.join("server.key");
+        let (cert1, key1) = load_or_generate_identity(&key_path, SERVER_SUBJECT).expect("generate");
+        assert!(!cert1.is_empty() && !key1.is_empty());
+
+        let (cert2, key2) = load_or_generate_identity(&key_path, SERVER_SUBJECT).expect("load");
+        assert_eq!(cert1, cert2, "cert must be stable across restarts");
+        assert_eq!(&*key1, &*key2, "key must be stable across restarts");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "server key must be 0600");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing authorized-certs dir is created and yields an empty allow-list
+    /// (accept no one). Enrolled `*.crt` files are read; other files are ignored.
+    #[test]
+    fn authorized_certs_reads_only_crt_files() {
+        let dir = tmp("authorized");
+        assert!(
+            load_authorized_certs(&dir).expect("empty").is_empty(),
+            "a fresh dir enrolls no clients"
+        );
+        assert!(dir.exists(), "the dir is created on first read");
+
+        std::fs::write(dir.join("phone.crt"), b"DER-A").unwrap();
+        std::fs::write(dir.join("laptop.crt"), b"DER-B").unwrap();
+        std::fs::write(dir.join("README.txt"), b"ignore me").unwrap();
+        std::fs::write(dir.join("notes"), b"no extension").unwrap();
+
+        let mut certs = load_authorized_certs(&dir).expect("read");
+        certs.sort();
+        assert_eq!(
+            certs,
+            vec![b"DER-A".to_vec(), b"DER-B".to_vec()],
+            "only *.crt files are enrolled"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Enrolling writes `<name>.crt` and is picked up by the loader; a second
+    /// enroll of the same name overwrites (rotation), keeping one slot.
+    #[test]
+    fn enroll_writes_and_rotates_a_named_slot() {
+        let dir = tmp("enroll");
+        enroll_client_cert(&dir, "phone", b"DER-1").expect("enroll");
+        assert_eq!(
+            load_authorized_certs(&dir).unwrap(),
+            vec![b"DER-1".to_vec()]
+        );
+        // Same name, new key → overwrite, still one entry.
+        enroll_client_cert(&dir, "phone", b"DER-2").expect("re-enroll");
+        assert_eq!(
+            load_authorized_certs(&dir).unwrap(),
+            vec![b"DER-2".to_vec()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A traversal-laden name is sanitized to a single safe filename, never
+    /// escaping the allow-list dir.
+    #[test]
+    fn enroll_sanitizes_traversal_names() {
+        let dir = tmp("enroll-evil");
+        // Separators are mapped away, so the cert lands as one filename inside the
+        // dir — no `../` escape. (A leftover `..` *substring* is harmless; only a
+        // whole `.`/`..` component would traverse, and that's rejected below.)
+        let path = enroll_client_cert(&dir, "../../etc/evil", b"DER").expect("enroll");
+        assert_eq!(path.parent(), Some(dir.as_path()), "must stay inside dir");
+        let fname = path.file_name().unwrap().to_string_lossy();
+        assert!(!fname.contains('/'), "no separator survives: {fname}");
+        assert_ne!(fname, "..");
+        assert_ne!(fname, ".");
+        // A name that is only dots (would alias the dir / its parent) is rejected.
+        assert!(sanitize_component("..").is_err(), "`..` is rejected");
+        assert!(sanitize_component(".").is_err(), "`.` is rejected");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

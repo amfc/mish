@@ -9,6 +9,7 @@
 //! add no new auth surface. Also provides a self-signed server cert and an
 //! insecure (accept-any-cert) client verifier for local testing.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -198,6 +199,49 @@ pub fn authenticated_client_config(
     client_config
 }
 
+/// Generate a fresh self-signed identity (cert + key) for the given DNS subject.
+/// Returns the certificate DER (public, safe to persist and share) and the
+/// PKCS#8 private key DER wrapped in [`Zeroizing`] so it is wiped from memory on
+/// drop. Direct-connect mode uses this twice: once to mint a **stable server
+/// identity** persisted to disk (so enrolled clients keep trusting the same host
+/// across restarts), and once per `enroll` to mint a **client identity** whose
+/// cert is appended to the server's authorized-certs directory.
+pub fn generate_identity(subject: &str) -> (Vec<u8>, Zeroizing<Vec<u8>>) {
+    let id = rcgen::generate_simple_self_signed(vec![subject.to_string()])
+        .expect("self-signed identity generation");
+    let cert_der = id.cert.der().to_vec();
+    let key_der = Zeroizing::new(id.key_pair.serialize_der());
+    (cert_der, key_der)
+}
+
+/// A QUIC server config for **direct-connect mode**: a *persistent* server
+/// identity (cert+key loaded from disk via [`generate_identity`], stable across
+/// restarts) that requires and pins any client certificate in the enrolled
+/// allow-list. Unlike [`authenticated_server_config`], the identities are not
+/// minted per session and delivered over SSH — they are long-lived and
+/// provisioned out of band by `enroll` (each client cert appended to the
+/// server's authorized-certs directory, then loaded here as `authorized_client_certs`).
+pub fn stable_server_config(
+    server_cert_der: &[u8],
+    server_key_der: &[u8],
+    authorized_client_certs: Vec<Vec<u8>>,
+) -> ServerConfig {
+    init_crypto();
+    let verifier = Arc::new(DirectoryClientCertVerifier::new(authorized_client_certs));
+    let server_key = PrivatePkcs8KeyDer::from(server_key_der.to_vec());
+    let rustls_server = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![CertificateDer::from(server_cert_der.to_vec())],
+            PrivateKeyDer::Pkcs8(server_key),
+        )
+        .expect("valid direct-mode server config");
+    let qsc = QuicServerConfig::try_from(rustls_server).expect("TLS13 quic server config");
+    let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
+    server_config.transport_config(transport_config());
+    server_config
+}
+
 /// A client config that trusts a specific server certificate.
 pub fn client_config_trusting(cert: CertificateDer<'static>) -> ClientConfig {
     init_crypto();
@@ -365,6 +409,95 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
     }
 }
 
+/// A `ClientCertVerifier` that accepts a client certificate **iff its DER is in
+/// an enrolled allow-list** (set membership by exact bytes). This is the
+/// direct-connect analogue of [`PinnedClientCertVerifier`]: instead of one
+/// per-session cert delivered over SSH, it pins a *persistent set* of enrolled
+/// client certs (each appended to the server's authorized-certs directory during
+/// `enroll`). Same guarantees: chain/CA/EKU validation is bypassed (the certs
+/// are self-signed and pinned), but the TLS signature is still verified, so the
+/// client must actually hold the matching private key.
+#[derive(Debug)]
+struct DirectoryClientCertVerifier {
+    authorized: HashSet<Vec<u8>>,
+    provider: Arc<CryptoProvider>,
+    /// We advertise no acceptable-CA hints (the client already knows its cert).
+    no_hints: Vec<DistinguishedName>,
+}
+
+impl DirectoryClientCertVerifier {
+    fn new(authorized: Vec<Vec<u8>>) -> Self {
+        Self {
+            authorized: authorized.into_iter().collect(),
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            no_hints: Vec::new(),
+        }
+    }
+}
+
+impl ClientCertVerifier for DirectoryClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.no_hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        if self.authorized.contains(end_entity.as_ref()) {
+            Ok(ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "client certificate not enrolled".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +578,86 @@ mod tests {
         assert!(v
             .verify_client_cert(&other, std::slice::from_ref(&pinned), now)
             .is_err());
+    }
+
+    /// Direct-connect analogue of seam #0. The directory verifier is the whole
+    /// "only enrolled clients may connect" property for `--listen` mode: accept a
+    /// cert **iff** its DER is byte-identical to one in the enrolled allow-list.
+    /// A false-accept is a total auth bypass, so sweep the equality boundary
+    /// adversarially around an enrolled cert (single-bit flips, truncation,
+    /// extension, prefix, empty), confirm every enrolled cert is accepted and no
+    /// perturbation is, and that an empty allow-list accepts nothing.
+    #[test]
+    fn directory_client_verifier_accepts_only_enrolled_certs() {
+        init_crypto();
+        let mint = || {
+            rcgen::generate_simple_self_signed(vec!["mish-client".to_string()])
+                .unwrap()
+                .cert
+                .der()
+                .clone()
+        };
+        let a = mint();
+        let b = mint();
+        let outsider = mint(); // a valid cert that was never enrolled
+        let v = DirectoryClientCertVerifier::new(vec![a.to_vec(), b.to_vec()]);
+        let now = UnixTime::now();
+
+        // Every enrolled cert is accepted.
+        assert!(v.verify_client_cert(&a, &[], now).is_ok());
+        assert!(v.verify_client_cert(&b, &[], now).is_ok());
+        // A valid but un-enrolled cert (same subject) is rejected.
+        assert!(v.verify_client_cert(&outsider, &[], now).is_err());
+
+        // Adversarial sweep around one enrolled cert's DER.
+        let a_der = a.as_ref();
+        let mut adversarial: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            a_der[..a_der.len() - 1].to_vec(), // truncated
+            [a_der, &[0u8]].concat(),          // extended
+            a_der[..a_der.len() / 2].to_vec(), // prefix
+        ];
+        for i in 0..a_der.len() {
+            let mut flipped = a_der.to_vec();
+            flipped[i] ^= 0x01; // flip one bit at each position
+            adversarial.push(flipped);
+        }
+        for bytes in adversarial {
+            assert_ne!(
+                bytes.as_slice(),
+                a_der,
+                "test bug: perturbation equals enrolled"
+            );
+            let cert = CertificateDer::from(bytes);
+            assert!(
+                v.verify_client_cert(&cert, &[], now).is_err(),
+                "verifier accepted a non-enrolled client certificate"
+            );
+        }
+
+        // Only the end-entity is consulted: attacker-supplied intermediates can't
+        // turn a wrong cert into an accept, nor a right cert into a reject.
+        let bogus = CertificateDer::from(vec![0u8; 48]);
+        assert!(v
+            .verify_client_cert(&a, std::slice::from_ref(&bogus), now)
+            .is_ok());
+        assert!(v
+            .verify_client_cert(&outsider, std::slice::from_ref(&a), now)
+            .is_err());
+
+        // An empty allow-list accepts nothing.
+        let empty = DirectoryClientCertVerifier::new(vec![]);
+        assert!(empty.verify_client_cert(&a, &[], now).is_err());
+    }
+
+    /// A stable server config builds from a freshly generated persistent identity
+    /// and an enrolled client cert — the direct-connect provisioning path.
+    #[test]
+    fn stable_server_config_builds_from_generated_identity() {
+        init_crypto();
+        let (server_cert, server_key) = generate_identity("localhost");
+        let (client_cert, _client_key) = generate_identity("mish-client");
+        let _cfg = stable_server_config(&server_cert, &server_key, vec![client_cert]);
     }
 
     /// Client side of seam #0 — server pinning. The client trusts exactly the one
