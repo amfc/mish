@@ -267,6 +267,11 @@ impl Emulator {
         if mode.contains(TermMode::SGR_MOUSE) {
             mouse_mode |= screen::MOUSE_SGR;
         }
+        // The three tracking modes (1000/1002/1003) are mutually exclusive in the
+        // terminal — setting one clears the others — so at most one of these bits
+        // is ever set here. The Termux augmentation (emitting 1002h alongside
+        // 1003h) lives in `display::emit_modes`, not in this state, precisely so
+        // the state stays a faithful mirror that round-trips through re-parsing.
         let style = self.term.cursor_style();
         let cursor_shape = match style.shape {
             CursorShape::Underline => screen::CURSOR_UNDERLINE,

@@ -539,3 +539,58 @@ fn broken_wide_char_spacer_roundtrips() {
         rebuilt.cells
     );
 }
+
+/// Helper: feed a mode escape into a fresh emulator and snapshot the result.
+fn mouse_screen(seq: &[u8]) -> Screen {
+    let mut emu = Emulator::new(24, 8);
+    emu.feed(seq);
+    emu.snapshot()
+}
+
+fn contains_seq(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Fix #1 (Termux mouse): all-motion tracking (1003) must be emitted as 1002h
+/// *and* 1003h so terminals that ignore 1003 (Termux) keep reporting via 1002.
+/// The three tracking modes are mutually exclusive in the terminal, so the
+/// snapshot itself holds only the single MOUSE_MOTION bit — the augmentation is
+/// a property of the emitted stream, and every transition still round-trips.
+#[test]
+fn all_motion_tracking_emits_button_event_for_termux() {
+    use mish_terminal::screen::{MOUSE_DRAG, MOUSE_MOTION};
+
+    // 1003h yields a faithful, single-bit snapshot (not DRAG|MOTION).
+    let motion = mouse_screen(b"\x1b[?1003h");
+    assert_eq!(motion.mouse_mode, MOUSE_MOTION, "snapshot stays exclusive");
+
+    // A full repaint of that state emits both 1002h and 1003h.
+    let full = new_frame(&Screen::blank(24, 8), &motion, false);
+    assert!(
+        contains_seq(&full, b"\x1b[?1002h") && contains_seq(&full, b"\x1b[?1003h"),
+        "all-motion repaint must emit 1002h alongside 1003h for Termux"
+    );
+    // Re-parsing that stream reconstructs the exact same exclusive state.
+    assert_eq!(paint(&motion).mouse_mode, MOUSE_MOTION);
+
+    // 1003 -> 1002: the diff must re-assert 1002h (a per-bit diff would drop the
+    // shared DRAG bit and leave the terminal tracking nothing).
+    let drag = mouse_screen(b"\x1b[?1002h");
+    assert_eq!(drag.mouse_mode, MOUSE_DRAG);
+    let diff = new_frame(&motion, &drag, true);
+    assert!(
+        contains_seq(&diff, b"\x1b[?1002h"),
+        "1003->1002 must re-emit 1002h so the terminal keeps drag tracking"
+    );
+    assert_eq!(apply(&motion, &drag).mouse_mode, MOUSE_DRAG);
+
+    // 1003 -> off: clears both codes so Termux's retained 1002 is turned off too.
+    let off = mouse_screen(b"\x1b[?1003h\x1b[?1003l");
+    assert_eq!(off.mouse_mode, 0);
+    let diff_off = new_frame(&motion, &off, true);
+    assert!(
+        contains_seq(&diff_off, b"\x1b[?1002l") && contains_seq(&diff_off, b"\x1b[?1003l"),
+        "turning tracking off must also clear the 1002 Termux was left holding"
+    );
+    assert_eq!(apply(&motion, &off).mouse_mode, 0);
+}

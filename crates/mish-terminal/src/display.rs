@@ -404,15 +404,39 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
     if !initialized || old.alternate_scroll != new.alternate_scroll {
         set(frame, 1007, new.alternate_scroll);
     }
-    for (bit, code) in [
-        (MOUSE_CLICK, 1000),
-        (MOUSE_DRAG, 1002),
-        (MOUSE_MOTION, 1003),
-        (MOUSE_SGR, 1006),
-    ] {
-        if !initialized || (old.mouse_mode & bit) != (new.mouse_mode & bit) {
-            set(frame, code, new.mouse_mode & bit != 0);
+    // Mouse tracking modes (1000/1002/1003) are mutually exclusive in the
+    // terminal: setting one resets the others (alacritty clears MOUSE_MODE before
+    // inserting the new bit). A per-bit diff therefore can't express a transition
+    // like 1003→1002 — it would drop the shared DRAG bit and re-parse to nothing —
+    // so we emit the whole tracking mode as a unit whenever it changes.
+    //
+    // Termux augmentation: all-motion tracking (1003) is emitted as 1002h *then*
+    // 1003h. A terminal that honors 1003 ends in all-motion mode (1003h wins the
+    // exclusive reset); Termux ignores 1003 and keeps reporting via the 1002 it
+    // retains. Re-parsing "1002h 1003h" yields all-motion state either way, so the
+    // wire stream still round-trips exactly against the faithful snapshot.
+    let old_track = mouse_track(old.mouse_mode);
+    let new_track = mouse_track(new.mouse_mode);
+    if !initialized || old_track != new_track {
+        match new_track {
+            MOUSE_MOTION => {
+                set(frame, 1002, true);
+                set(frame, 1003, true);
+            }
+            MOUSE_DRAG => set(frame, 1002, true),
+            MOUSE_CLICK => set(frame, 1000, true),
+            // Tracking off: clear every mode, including the 1002 a prior
+            // all-motion state left active on Termux.
+            _ => {
+                set(frame, 1000, false);
+                set(frame, 1002, false);
+                set(frame, 1003, false);
+            }
         }
+    }
+    // SGR mouse encoding (1006) is independent of the tracking mode.
+    if !initialized || (old.mouse_mode & MOUSE_SGR) != (new.mouse_mode & MOUSE_SGR) {
+        set(frame, 1006, new.mouse_mode & MOUSE_SGR != 0);
     }
 
     // OSC 52 clipboard (server→client). Latest-wins: re-emit only when it
@@ -457,6 +481,23 @@ fn emit_modes(frame: &mut FrameState, old: &Screen, new: &Screen, initialized: b
         .min(MAX_BELLS_PER_FRAME);
     for _ in 0..beeps {
         frame.out.push(0x07);
+    }
+}
+
+/// The single active mouse-tracking bit (1000/1002/1003 are mutually exclusive
+/// in the terminal, so a faithful snapshot sets at most one). Returns 0 when
+/// tracking is off. Priority mirrors the terminal's own precedence should a
+/// snapshot ever carry more than one bit.
+fn mouse_track(mode: u8) -> u8 {
+    use crate::screen::{MOUSE_CLICK, MOUSE_DRAG, MOUSE_MOTION};
+    if mode & MOUSE_MOTION != 0 {
+        MOUSE_MOTION
+    } else if mode & MOUSE_DRAG != 0 {
+        MOUSE_DRAG
+    } else if mode & MOUSE_CLICK != 0 {
+        MOUSE_CLICK
+    } else {
+        0
     }
 }
 
