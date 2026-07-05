@@ -159,6 +159,29 @@ async fn enrolled_client_connects_without_ssh_and_each_dial_is_fresh() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enrollment_takes_effect_on_a_running_listener() {
+    let server = env!("CARGO_BIN_EXE_mish-server");
+    let config = config_dir("live-enroll");
+
+    // Our client identity exists up front, but is NOT enrolled yet.
+    let (client_cert, client_key) = generate_identity("mish-client");
+
+    // Start the listener with an empty allow-list (this also materializes the
+    // server identity the later enroll will load and hand back).
+    let (_child, addr) = spawn_listener(server, &config).await;
+
+    // Enroll AFTER the listener is already running.
+    let server_cert = enroll(server, &config, &client_cert);
+
+    // The listener re-reads the allow-list per handshake, so the freshly enrolled
+    // client connects with no restart of the daemon.
+    let t = dial(addr, &server_cert, &client_cert, &client_key)
+        .await
+        .expect("a client enrolled against a running listener connects without a restart");
+    run_and_expect(t, b"echo LIVE_ENROLL_OK\r", b"LIVE_ENROLL_OK").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unenrolled_client_is_rejected() {
     let server = env!("CARGO_BIN_EXE_mish-server");
     let config = config_dir("reject");

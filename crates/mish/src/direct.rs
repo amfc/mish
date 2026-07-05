@@ -66,15 +66,23 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 /// Load the persistent identity from `key_path` (+ its sibling `.crt`), or — on
-/// first run, when either file is missing — generate a fresh self-signed identity
-/// with `subject` and persist it: the key `0600` (it is the long-term secret) and
-/// the cert world-readable (it is public; the peer pins it).
+/// first run, when **both** files are absent — generate a fresh self-signed
+/// identity with `subject` and persist it: the key `0600` (it is the long-term
+/// secret) and the cert world-readable (it is public; the peer pins it).
+///
+/// A half-present identity (exactly one of key/cert on disk) is a corrupted
+/// state, not a "regenerate" trigger: regenerating would silently rotate the
+/// server's pin — breaking every enrolled client — and overwrite a private key
+/// that may still be referenced. So it is refused loudly; the operator removes
+/// both to start over.
 pub fn load_or_generate_identity(
     key_path: &Path,
     subject: &str,
 ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     let cert_path = cert_path_for_key(key_path);
-    if key_path.exists() && cert_path.exists() {
+    let key_exists = key_path.exists();
+    let cert_exists = cert_path.exists();
+    if key_exists && cert_exists {
         let key = Zeroizing::new(
             std::fs::read(key_path).with_context(|| format!("reading {}", key_path.display()))?,
         );
@@ -82,33 +90,51 @@ pub fn load_or_generate_identity(
             .with_context(|| format!("reading {}", cert_path.display()))?;
         return Ok((cert, key));
     }
+    if key_exists != cert_exists {
+        anyhow::bail!(
+            "incomplete server identity: exactly one of {} / {} is present; \
+             refusing to overwrite a live key or rotate the pin — remove both to regenerate",
+            key_path.display(),
+            cert_path.display()
+        );
+    }
 
     let (cert, key) = mish_quic::config::generate_identity(subject);
     if let Some(dir) = key_path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating identity dir {}", dir.display()))?;
     }
-    write_secret(key_path, &key).with_context(|| format!("writing {}", key_path.display()))?;
-    std::fs::write(&cert_path, &cert)
+    write_new(key_path, &key, 0o600).with_context(|| format!("writing {}", key_path.display()))?;
+    write_new(&cert_path, &cert, 0o644)
         .with_context(|| format!("writing {}", cert_path.display()))?;
     Ok((cert, key))
 }
 
-/// Write `bytes` to `path` as a `0600` file (create or truncate).
-fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write `bytes` to a **newly created** `path` with `mode` (`O_EXCL`), never
+/// following a symlink and never truncating an existing file — so a long-term
+/// key or cert can't be silently clobbered or redirected through a planted path.
+/// Only ever called on the fresh-generate path (both files absent), so `O_EXCL`
+/// failing means a concurrent writer or a planted file, either of which we want
+/// to surface loudly rather than write through.
+fn write_new(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write;
     #[cfg(unix)]
     let mut f = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+            .create_new(true)
+            .mode(mode)
             .open(path)?
     };
     #[cfg(not(unix))]
-    let mut f = std::fs::File::create(path)?;
+    let mut f = {
+        let _ = mode;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?
+    };
     f.write_all(bytes)?;
     Ok(())
 }
@@ -250,6 +276,30 @@ mod tests {
             let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "server key must be 0600");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A half-present identity (key without cert, or vice versa) is refused, not
+    /// silently regenerated — regenerating would rotate the pin and clobber a key
+    /// that may still be referenced.
+    #[test]
+    fn partial_identity_state_is_refused() {
+        let dir = tmp("partial-identity");
+        let key_path = dir.join("server.key");
+        load_or_generate_identity(&key_path, SERVER_SUBJECT).expect("generate");
+
+        // Delete the cert but keep the key: an incomplete identity.
+        std::fs::remove_file(cert_path_for_key(&key_path)).unwrap();
+        let before = std::fs::read(&key_path).unwrap();
+        assert!(
+            load_or_generate_identity(&key_path, SERVER_SUBJECT).is_err(),
+            "a half-present identity must be refused, not regenerated"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            before,
+            "the surviving key must be left untouched"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

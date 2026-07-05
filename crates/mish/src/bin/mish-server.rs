@@ -638,8 +638,21 @@ fn run_direct(opts: Options, listen: (String, u16)) -> Result<()> {
             certs_dir.display()
         );
     }
+    // Re-read the allow-list on every handshake so enrolling or revoking a client
+    // (adding/removing a *.crt) takes effect on the running listener without a
+    // restart. A read failure fails closed (empty list ⇒ reject everyone).
+    let loader_dir = certs_dir.clone();
+    let authorized_loader: mish_quic::config::AuthorizedCertsLoader = Box::new(move || {
+        mish::direct::load_authorized_certs(&loader_dir).unwrap_or_else(|e| {
+            eprintln!(
+                "mish: failed to reload authorized certs from {}: {e:#} — rejecting",
+                loader_dir.display()
+            );
+            Vec::new()
+        })
+    });
     let server_config =
-        mish_quic::config::stable_server_config(&server_cert, &server_key, authorized);
+        mish_quic::config::stable_server_config(&server_cert, &server_key, authorized_loader);
 
     let socket = bind_in_range(&[port], &bind_ip).context("binding direct-mode UDP socket")?;
     let local = socket.local_addr()?;

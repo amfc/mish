@@ -9,7 +9,6 @@
 //! add no new auth surface. Also provides a self-signed server cert and an
 //! insecure (accept-any-cert) client verifier for local testing.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -224,7 +223,7 @@ pub fn generate_identity(subject: &str) -> (Vec<u8>, Zeroizing<Vec<u8>>) {
 pub fn stable_server_config(
     server_cert_der: &[u8],
     server_key_der: &[u8],
-    authorized_client_certs: Vec<Vec<u8>>,
+    authorized_client_certs: AuthorizedCertsLoader,
 ) -> ServerConfig {
     init_crypto();
     let verifier = Arc::new(DirectoryClientCertVerifier::new(authorized_client_certs));
@@ -409,26 +408,41 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
     }
 }
 
+/// Supplies the current enrolled-client allow-list (each entry a client cert's
+/// DER). Called on **every** handshake, so enrolling or revoking a client — by
+/// adding or removing a `*.crt` in the authorized-certs directory — takes effect
+/// on a running listener without a restart. The upper layer owns the actual
+/// directory read (and fails closed, i.e. returns an empty list, if it can't
+/// read it), keeping filesystem policy out of this crate.
+pub type AuthorizedCertsLoader = Box<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>;
+
 /// A `ClientCertVerifier` that accepts a client certificate **iff its DER is in
-/// an enrolled allow-list** (set membership by exact bytes). This is the
+/// the enrolled allow-list** (membership by exact bytes). This is the
 /// direct-connect analogue of [`PinnedClientCertVerifier`]: instead of one
-/// per-session cert delivered over SSH, it pins a *persistent set* of enrolled
-/// client certs (each appended to the server's authorized-certs directory during
-/// `enroll`). Same guarantees: chain/CA/EKU validation is bypassed (the certs
-/// are self-signed and pinned), but the TLS signature is still verified, so the
-/// client must actually hold the matching private key.
-#[derive(Debug)]
+/// per-session cert delivered over SSH, it checks a *live* set of enrolled client
+/// certs re-read on each handshake via [`AuthorizedCertsLoader`] (each appended
+/// to the server's authorized-certs directory during `enroll`). Same guarantees:
+/// chain/CA/EKU validation is bypassed (the certs are self-signed and pinned),
+/// but the TLS signature is still verified, so the client must actually hold the
+/// matching private key.
 struct DirectoryClientCertVerifier {
-    authorized: HashSet<Vec<u8>>,
+    authorized: AuthorizedCertsLoader,
     provider: Arc<CryptoProvider>,
     /// We advertise no acceptable-CA hints (the client already knows its cert).
     no_hints: Vec<DistinguishedName>,
 }
 
+impl std::fmt::Debug for DirectoryClientCertVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectoryClientCertVerifier")
+            .finish_non_exhaustive()
+    }
+}
+
 impl DirectoryClientCertVerifier {
-    fn new(authorized: Vec<Vec<u8>>) -> Self {
+    fn new(authorized: AuthorizedCertsLoader) -> Self {
         Self {
-            authorized: authorized.into_iter().collect(),
+            authorized,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             no_hints: Vec::new(),
         }
@@ -454,7 +468,11 @@ impl ClientCertVerifier for DirectoryClientCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        if self.authorized.contains(end_entity.as_ref()) {
+        let presented = end_entity.as_ref();
+        if (self.authorized)()
+            .iter()
+            .any(|c| c.as_slice() == presented)
+        {
             Ok(ClientCertVerified::assertion())
         } else {
             Err(rustls::Error::General(
@@ -600,7 +618,8 @@ mod tests {
         let a = mint();
         let b = mint();
         let outsider = mint(); // a valid cert that was never enrolled
-        let v = DirectoryClientCertVerifier::new(vec![a.to_vec(), b.to_vec()]);
+        let (ca, cb) = (a.to_vec(), b.to_vec());
+        let v = DirectoryClientCertVerifier::new(Box::new(move || vec![ca.clone(), cb.clone()]));
         let now = UnixTime::now();
 
         // Every enrolled cert is accepted.
@@ -646,8 +665,34 @@ mod tests {
             .is_err());
 
         // An empty allow-list accepts nothing.
-        let empty = DirectoryClientCertVerifier::new(vec![]);
+        let empty = DirectoryClientCertVerifier::new(Box::new(Vec::new));
         assert!(empty.verify_client_cert(&a, &[], now).is_err());
+    }
+
+    /// The allow-list is re-read on every handshake: a cert enrolled *after* the
+    /// verifier is built is accepted, and one revoked after is rejected — no
+    /// restart needed (the security-relevant half of live revocation).
+    #[test]
+    fn directory_client_verifier_reads_allow_list_live() {
+        init_crypto();
+        let cert = rcgen::generate_simple_self_signed(vec!["mish-client".to_string()])
+            .unwrap()
+            .cert
+            .der()
+            .clone();
+        let enrolled = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let view = enrolled.clone();
+        let v = DirectoryClientCertVerifier::new(Box::new(move || view.lock().unwrap().clone()));
+        let now = UnixTime::now();
+
+        // Not yet enrolled → rejected.
+        assert!(v.verify_client_cert(&cert, &[], now).is_err());
+        // Enroll it live → accepted on the next handshake.
+        enrolled.lock().unwrap().push(cert.to_vec());
+        assert!(v.verify_client_cert(&cert, &[], now).is_ok());
+        // Revoke it live → rejected again.
+        enrolled.lock().unwrap().clear();
+        assert!(v.verify_client_cert(&cert, &[], now).is_err());
     }
 
     /// A stable server config builds from a freshly generated persistent identity
@@ -657,7 +702,11 @@ mod tests {
         init_crypto();
         let (server_cert, server_key) = generate_identity("localhost");
         let (client_cert, _client_key) = generate_identity("mish-client");
-        let _cfg = stable_server_config(&server_cert, &server_key, vec![client_cert]);
+        let _cfg = stable_server_config(
+            &server_cert,
+            &server_key,
+            Box::new(move || vec![client_cert.clone()]),
+        );
     }
 
     /// Client side of seam #0 — server pinning. The client trusts exactly the one
