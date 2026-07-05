@@ -182,7 +182,7 @@ fn server_args(
     forward: bool,
     session: Option<&str>,
     port: &str,
-    command: Option<&str>,
+    command: &[String],
 ) -> Vec<String> {
     let mut args = Vec::new();
     if detach {
@@ -201,9 +201,15 @@ fn server_args(
         args.push(name.to_string());
     }
     args.push(port.to_string());
-    if let Some(cmd) = command {
+    // Preserve the trailing `-- command` as real argv: one token per element,
+    // never joined. The server re-`spawn_argv`s these verbatim, so `-- htop -d
+    // 10` execs `htop` with `["-d", "10"]` instead of a program literally named
+    // "htop -d 10". Over SSH each element is shell-quoted by the caller, so an
+    // element that itself contains spaces (e.g. `sh -c 'a && b'`) survives the
+    // remote login shell intact.
+    if !command.is_empty() {
         args.push("--".into());
-        args.push(cmd.into());
+        args.extend(command.iter().cloned());
     }
     args
 }
@@ -214,7 +220,7 @@ pub async fn local(
     shared: bool,
     forward: bool,
     session: Option<&str>,
-    command: Option<&str>,
+    command: &[String],
 ) -> Result<Bootstrap> {
     // Local mode: keep the server in the foreground as a managed child (no
     // detach — we kill it when the session ends).
@@ -253,7 +259,7 @@ pub async fn ssh(
     shared: bool,
     forward: bool,
     session: Option<&str>,
-    command: Option<&str>,
+    command: &[String],
 ) -> Result<Bootstrap> {
     let (prog, base) = ssh_argv
         .split_first()
@@ -266,10 +272,16 @@ pub async fn ssh(
     if ssh_pty {
         cmd.arg("-tt");
     }
-    cmd.arg(host)
-        .arg("--")
-        .arg(server_cmd)
-        .args(server_args(true, shared, forward, session, "0", command));
+    // Build one shell-quoted remote command string, exactly like the builtin
+    // transport: the `ssh` binary concatenates the trailing args with spaces
+    // and the remote login shell re-parses them, so each token must be quoted
+    // or a `-- command` element containing spaces would be word-split there.
+    let remote = std::iter::once(server_cmd.to_string())
+        .chain(server_args(true, shared, forward, session, "0", command))
+        .map(|a| shell_quote(&a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    cmd.arg(host).arg("--").arg(remote);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -323,7 +335,7 @@ pub async fn builtin(
     shared: bool,
     forward: bool,
     session: Option<&str>,
-    command: Option<&str>,
+    command: &[String],
 ) -> Result<Bootstrap> {
     let (cli_user, alias) = split_user_host(host);
     let target = resolve_host(&alias, cli_user.as_deref(), port);

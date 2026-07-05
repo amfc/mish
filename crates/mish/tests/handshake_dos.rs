@@ -43,7 +43,7 @@ async fn spawn_shared_server() -> bootstrap::Bootstrap {
         /* shared = */ true,
         /* forward = */ false,
         None,
-        Some("/bin/sh"),
+        &["/bin/sh".to_string()],
     )
     .await
     .expect("bootstrap should start the shared server and print MISH CONNECT")

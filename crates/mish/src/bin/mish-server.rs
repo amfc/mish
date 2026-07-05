@@ -69,7 +69,9 @@ struct Options {
     /// existing live session of this name (reprint its connect line and exit),
     /// else register a new one. Implies `--persist`.
     session: Option<String>,
-    command: Option<String>,
+    /// Explicit `-- command` argv (one program + args per element). Empty means
+    /// no command was given, so the server starts the user's login shell.
+    command: Vec<String>,
     /// Whether to honor client port-forwarding requests (`-L`/`-R`). **Off by
     /// default** (deny); enabled per session with `--allow-forward`. The
     /// SSH-bootstrapping client passes this automatically when the user asks for
@@ -168,7 +170,7 @@ fn parse_args() -> Result<Options> {
         persist: false,
         shared: false,
         session: None,
-        command: None,
+        command: Vec::new(),
         forward: false,
         log_file: None,
         log_level: tracing::Level::DEBUG,
@@ -251,10 +253,10 @@ fn parse_args() -> Result<Options> {
                     mish::trace::parse_level(&args.next().context("--log-level needs a LEVEL")?);
             }
             "--" => {
-                let rest: Vec<String> = args.by_ref().collect();
-                if !rest.is_empty() {
-                    opts.command = Some(rest.join(" "));
-                }
+                // Keep every trailing token as its own argv element; the PTY is
+                // later `spawn_argv`d from these verbatim. Joining them here is
+                // what made `-- htop -d 10` exec a program named "htop -d 10".
+                opts.command = args.by_ref().collect();
             }
             // Legacy positional port.
             other if !other.starts_with('-') => {
@@ -507,7 +509,7 @@ async fn accept_authenticated(
 async fn serve(
     socket: std::net::UdpSocket,
     server_config: mish_quic::ServerConfig,
-    command: Option<String>,
+    command: Vec<String>,
     persist: bool,
     shared: bool,
     forward: bool,
@@ -532,9 +534,10 @@ async fn serve(
 
     // An explicit `-- command` runs as given; with no command we start the
     // user's $SHELL as a login shell (reads the login profile, like `mosh host`).
-    let pty = match command {
-        Some(cmd) => PtyProcess::spawn(&cmd, cols, rows),
-        None => PtyProcess::spawn_login_shell(cols, rows),
+    let pty = if command.is_empty() {
+        PtyProcess::spawn_login_shell(cols, rows)
+    } else {
+        PtyProcess::spawn_argv(command, cols, rows)
     }
     .context("spawning PTY child")?;
     let clock = Arc::new(SystemClock::new());

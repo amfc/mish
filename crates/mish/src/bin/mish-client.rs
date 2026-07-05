@@ -143,7 +143,8 @@ struct Options {
     /// client dials the target. Repeatable.
     remote_forwards: Vec<mish::forward::ForwardSpec>,
     host: Option<String>,
-    command: Option<String>,
+    /// Explicit `-- command` argv, one token per element (empty = login shell).
+    command: Vec<String>,
     /// Write a JSON event log here (`--log-file`); `None` disables logging.
     log_file: Option<std::path::PathBuf>,
     /// Max verbosity for the event log (`--log-level`, default debug).
@@ -196,7 +197,7 @@ fn parse_args() -> Result<Options> {
         local_forwards: Vec::new(),
         remote_forwards: Vec::new(),
         host: None,
-        command: None,
+        command: Vec::new(),
         log_file: None,
         log_level: tracing::Level::DEBUG,
         perf_log: None,
@@ -287,10 +288,10 @@ fn parse_args() -> Result<Options> {
                 std::process::exit(0);
             }
             "--" => {
-                let rest: Vec<String> = args.by_ref().collect();
-                if !rest.is_empty() {
-                    opts.command = Some(rest.join(" "));
-                }
+                // Preserve the trailing argv exactly; the server re-execs it
+                // token-for-token. Joining here is what turned `-- htop -d 10`
+                // into a single unspawnable program name.
+                opts.command = args.by_ref().collect();
             }
             "-h" | "--help" => {
                 print_usage();
@@ -453,7 +454,7 @@ async fn main() -> Result<()> {
             opts.shared,
             want_forward,
             opts.session.as_deref(),
-            opts.command.as_deref(),
+            &opts.command,
         )
         .await
         .context("local bootstrap")?
@@ -471,7 +472,7 @@ async fn main() -> Result<()> {
                 opts.shared,
                 want_forward,
                 opts.session.as_deref(),
-                opts.command.as_deref(),
+                &opts.command,
             )
             .await
             .context("builtin ssh bootstrap")?
@@ -485,7 +486,7 @@ async fn main() -> Result<()> {
                 opts.shared,
                 want_forward,
                 opts.session.as_deref(),
-                opts.command.as_deref(),
+                &opts.command,
             )
             .await
             .context("ssh bootstrap")?
