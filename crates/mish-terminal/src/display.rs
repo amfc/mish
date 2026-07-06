@@ -270,10 +270,13 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
     let resized = old.cols != new.cols || old.rows != new.rows;
     let initialized = initialized && !resized;
 
-    // Title (OSC 0): always on a full repaint, otherwise only when it changed.
+    // Title (OSC 0): only when it changed. A full repaint deliberately does NOT
+    // force emission: an empty title means the remote never set one, and
+    // emitting it would clobber the title the user's terminal already had
+    // (mosh guards the same case with its `title_initialized` flag).
     // Sanitize: a control byte in the title would break out of the OSC frame and
     // inject terminal commands on the client's real TTY.
-    if !initialized || old.title != new.title {
+    if old.title != new.title {
         frame.push("\x1b]0;");
         frame.push(&osc_sanitize(&new.title));
         frame.out.push(0x07);

@@ -252,12 +252,6 @@ pub async fn run_client<T: Transport>(
             if shown.mouse_mode == 0 && !shown.alt_screen {
                 shown.alternate_scroll = false;
             }
-            // Prefix the window title so the user can tell they're in mosh (like
-            // upstream's "[mosh] " prefix). Applied only to the painted frame, not
-            // the synchronized state, so transparency comparisons are unaffected.
-            if !shown.title.starts_with("[mish] ") {
-                shown.title = format!("[mish] {}", shown.title);
-            }
             let frame = new_frame(&painted, &shown, painted_once);
             painted = shown;
             painted_once = true;
