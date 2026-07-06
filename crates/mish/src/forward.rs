@@ -77,6 +77,13 @@ pub enum StreamHello {
     /// configured for that `-R` and dials it. Carries the *requested* bind
     /// identity (so an ephemeral `bind_port == 0` still keys the client's map).
     ForwardedConnection { bind_host: String, bind_port: u16 },
+    /// Direct-connect control stream: the client names the command to run for
+    /// this connection (empty argv = login shell). Always the client's **first**
+    /// stream in direct mode — the server waits for it before spawning the PTY
+    /// (see [`crate::direct::serve_connection`]), which is what lets one
+    /// long-lived listener give each connection its own command the way each
+    /// ssh-bootstrapped `mish-server -- command` process does.
+    Exec { argv: Vec<String> },
 }
 
 impl StreamHello {
@@ -259,6 +266,11 @@ async fn dispatch_server_stream(
         // The server is never the side that accepts a forwarded connection.
         StreamHello::ForwardedConnection { .. } => {
             tracing::warn!(target: "mish::forward", "server received an unexpected ForwardedConnection hello");
+        }
+        // Exec is consumed by `direct::serve_connection` before this loop starts;
+        // one arriving here is a protocol violation from the (authenticated) peer.
+        StreamHello::Exec { .. } => {
+            tracing::warn!(target: "mish::forward", "server received an Exec hello after session start");
         }
     }
 }

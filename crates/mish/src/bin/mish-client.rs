@@ -19,7 +19,7 @@
 //! ```text
 //! mish-client [user@]host [-- command]    # SSH bootstrap (like `mosh host`)
 //! mish-client --local [-- command]        # run the server locally (testing)
-//! mish-client --connect host:port         # ssh-less direct connect (see enroll)
+//! mish-client --connect host:port [-- command]  # ssh-less direct connect (see enroll)
 //! mish-client enroll [user@]host          # exchange certs for direct connect
 //!
 //! Options:
@@ -349,7 +349,8 @@ fn print_usage() {
          \x20 --session <name>     reattachable persistent session (never lose your shell)\n\
          \x20 --shared             shared session: you own it, others can attach read-only\n\
          \x20 --attach IP PORT     attach to a running server ($MISH_CONNECT creds; for testing)\n\
-         \x20 --connect HOST:PORT  ssh-less direct connect to `mish-server --listen` (see enroll)\n\
+         \x20 --connect HOST:PORT  ssh-less direct connect to `mish-server --listen`, running\n\
+         \x20                      the `-- command` if given (see enroll)\n\
          \x20 enroll [user@]host   one-shot: exchange certs with a direct-mode server over SSH\n\
          \x20 --log-file <path>    write a JSON event log (for debugging)\n\
          \x20 --log-level <lvl>    log verbosity: error|warn|info|debug|trace (default debug)\n\
@@ -436,6 +437,7 @@ async fn main() -> Result<()> {
             opts.local_forwards,
             opts.remote_forwards,
             opts.session.clone(),
+            &opts.command,
         )
         .await?;
         exit_now();
@@ -612,9 +614,11 @@ async fn attach_session(
 }
 
 /// Direct-connect to `host:port` (ssh-less): load the enrolled client identity
-/// and the pinned server cert for `host`, dial, and run the terminal. Roaming
-/// rides QUIC connection migration on this one connection, exactly as the SSH
-/// path does; a new invocation is a new connection (a fresh server-side shell).
+/// and the pinned server cert for `host`, dial, send the Exec hello naming the
+/// `-- command` (empty = login shell), and run the terminal. Roaming rides QUIC
+/// connection migration on this one connection, exactly as the SSH path does; a
+/// new invocation is a new connection (a fresh server-side shell).
+#[allow(clippy::too_many_arguments)] // session entry point: discrete wired-in pieces
 async fn connect_session(
     host: &str,
     port: u16,
@@ -623,6 +627,7 @@ async fn connect_session(
     local_forwards: Vec<mish::forward::ForwardSpec>,
     remote_forwards: Vec<mish::forward::ForwardSpec>,
     session: Option<String>,
+    command: &[String],
 ) -> Result<()> {
     let id = mish::enroll::load_or_generate_client_identity()?;
     let server_cert = mish::enroll::load_server_cert(host)?;
@@ -640,6 +645,7 @@ async fn connect_session(
         .await
         .context("connecting to server")?;
     tracing::info!(target: "mish::client", %addr, "direct-connected to server");
+    mish::direct::send_exec_hello(&t, command).await?;
     run_terminal(
         t,
         predict,

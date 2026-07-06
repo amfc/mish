@@ -15,7 +15,10 @@
 //! and serving a single accepted connection.
 //!
 //! Sessions here are **non-persistent**: each accepted QUIC connection gets its
-//! own PTY and dies when the connection or the shell goes. Roaming across network
+//! own PTY and dies when the connection or the shell goes. The connection's
+//! first stream carries a [`StreamHello::Exec`] naming the command to run
+//! (empty = login shell), so one long-lived listener serves per-connection
+//! commands the way each ssh-bootstrapped `mish-server -- command` process does. Roaming across network
 //! changes is handled entirely at the transport layer (QUIC connection
 //! migration), exactly as in the SSH-bootstrap path — a client that changes IP
 //! keeps the *same* connection, so a brand-new invocation is always a brand-new
@@ -29,11 +32,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use zeroize::Zeroizing;
 
-use crate::forward::serve_side_channels;
+use crate::forward::{serve_side_channels, StreamHello};
 use crate::pty::PtyProcess;
 use crate::server::run_server;
 use mish_quic::transport::QuicTransport;
 use mish_ssp::clock::SystemClock;
+use mish_ssp::framing::{read_message, write_message, MAX_MESSAGE_LEN};
 
 /// File extension for an enrolled client certificate (DER) in the authorized-certs
 /// directory. Only files with this suffix are read, so stray files (READMEs,
@@ -209,17 +213,75 @@ pub fn enroll_client_cert(dir: &Path, name: &str, cert_der: &[u8]) -> Result<Pat
     Ok(path)
 }
 
-/// Serve one accepted, already-authenticated connection to completion: spawn the
-/// PTY (login shell, or the explicit `command`), wire the side-channel server
-/// (scrollback; forwarding stays off), and run the non-persistent session loop.
-/// When the loop returns — client gone or shell exited — the [`PtyProcess`] drops,
-/// which closes its control channel and reaps the child (`kill` + `wait`), so no
-/// process is left behind.
+/// An enrolled client sends its [`StreamHello::Exec`] immediately at connect, so
+/// waiting longer only keeps a broken peer's session task alive. Bounded so a
+/// connected-but-silent connection cannot pin the accept task forever.
+const EXEC_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Client side of the direct-connect exec handshake: open the connection's first
+/// stream and send the [`StreamHello::Exec`] naming the command to run (empty
+/// argv = login shell). The server waits for this before spawning the PTY.
+pub async fn send_exec_hello(transport: &QuicTransport, argv: &[String]) -> Result<()> {
+    let (mut send, _recv) = transport
+        .open_side_channel()
+        .await
+        .context("opening the Exec hello stream")?;
+    let hello = StreamHello::Exec {
+        argv: argv.to_vec(),
+    };
+    write_message(&mut send, &hello.encode())
+        .await
+        .context("sending the Exec hello")?;
+    let _ = send.finish();
+    Ok(())
+}
+
+/// Server side of the exec handshake: the connection's first stream must carry
+/// an [`StreamHello::Exec`]. Anything else is a protocol violation from an
+/// authenticated-but-broken peer, refused loudly.
+async fn read_exec_hello(transport: &QuicTransport) -> Result<Vec<String>> {
+    let (_send, mut recv) = transport
+        .accept_side_channel()
+        .await
+        .context("accepting the Exec hello stream")?;
+    let bytes = read_message(&mut recv, MAX_MESSAGE_LEN)
+        .await
+        .context("reading the Exec hello frame")?
+        .context("Exec hello stream closed without a frame")?;
+    match StreamHello::decode(&bytes) {
+        Some(StreamHello::Exec { argv }) => Ok(argv),
+        Some(other) => anyhow::bail!("expected an Exec hello on the first stream, got {other:?}"),
+        None => anyhow::bail!("malformed hello frame on the first stream"),
+    }
+}
+
+/// Serve one accepted, already-authenticated connection to completion: wait for
+/// the client's [`StreamHello::Exec`] naming this connection's command, spawn the
+/// PTY (login shell on an empty argv), wire the side-channel server (scrollback;
+/// forwarding stays off), and run the non-persistent session loop. When the loop
+/// returns — client gone or shell exited — the [`PtyProcess`] drops, which closes
+/// its control channel and reaps the child (`kill` + `wait`), so no process is
+/// left behind.
+///
+/// A listener started with an explicit `--listen -- command` pins that command:
+/// the hello is still required, but a non-empty argv in it is refused (the
+/// operator's pin is the whole point of passing one).
 pub async fn serve_connection(
     transport: QuicTransport,
-    command: Vec<String>,
+    fixed_command: Vec<String>,
     network_timeout: Option<Duration>,
 ) -> Result<()> {
+    let argv = tokio::time::timeout(EXEC_HELLO_TIMEOUT, read_exec_hello(&transport))
+        .await
+        .context("timed out waiting for the client's Exec hello")??;
+    let command = if fixed_command.is_empty() {
+        argv
+    } else if argv.is_empty() {
+        fixed_command
+    } else {
+        anyhow::bail!("client requested a command but the listener pins one");
+    };
+
     let (cols, rows) = (80u16, 24u16);
     let pty = if command.is_empty() {
         PtyProcess::spawn_login_shell(cols, rows)

@@ -672,8 +672,9 @@ fn run_direct(opts: Options, listen: (String, u16)) -> Result<()> {
         .context("building tokio runtime")?;
     // `serve_direct` speaks argv (`Vec<String>`), while this branch models the
     // optional `-- command` as a single joined string. A bare `--listen` (the
-    // production path) carries no command, so this collects to an empty argv and
-    // each connection gets a login shell.
+    // production path) collects to an empty argv, letting each connection's Exec
+    // hello pick its command; an explicit `--listen -- command` pins it for every
+    // connection instead (hellos must then carry an empty argv).
     let command: Vec<String> = opts.command.into_iter().collect();
     runtime.block_on(serve_direct(socket, server_config, command))
 }

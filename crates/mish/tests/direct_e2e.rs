@@ -102,8 +102,13 @@ async fn dial(
     Ok(t)
 }
 
-/// Run one shell command over `t` and assert its marker resyncs back.
-async fn run_and_expect(t: QuicTransport, keys: &[u8], marker: &[u8]) {
+/// Send the Exec hello for `argv`, then run the client and assert `marker`
+/// resyncs back — typed at a shell when `keys` is non-empty, or straight from
+/// the requested command's output when it is empty.
+async fn run_and_expect_with(t: QuicTransport, argv: &[String], keys: &[u8], marker: &[u8]) {
+    mish::direct::send_exec_hello(&t, argv)
+        .await
+        .expect("send Exec hello");
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let (cin_tx, cin_rx) = mpsc::channel::<ClientInput>(64);
     let (cout_tx, mut cout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -118,7 +123,9 @@ async fn run_and_expect(t: QuicTransport, keys: &[u8], marker: &[u8]) {
         cin_rx,
         cout_tx,
     ));
-    cin_tx.send(ClientInput::Keys(keys.to_vec())).await.unwrap();
+    if !keys.is_empty() {
+        cin_tx.send(ClientInput::Keys(keys.to_vec())).await.unwrap();
+    }
 
     let marker = marker.to_vec();
     tokio::time::timeout(Duration::from_secs(20), async move {
@@ -131,6 +138,11 @@ async fn run_and_expect(t: QuicTransport, keys: &[u8], marker: &[u8]) {
     })
     .await
     .expect("marker should traverse the direct session");
+}
+
+/// Login-shell session (empty Exec argv): type `keys`, expect `marker`.
+async fn run_and_expect(t: QuicTransport, keys: &[u8], marker: &[u8]) {
+    run_and_expect_with(t, &[], keys, marker).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -213,4 +225,27 @@ async fn unenrolled_client_is_rejected() {
             "server must close (reject) an un-enrolled client's connection"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_hello_runs_the_requested_command() {
+    let server = env!("CARGO_BIN_EXE_mish-server");
+    let config = config_dir("exec");
+
+    let (client_cert, client_key) = generate_identity("mish-client");
+    let server_cert = enroll(server, &config, &client_cert);
+
+    let (_child, addr) = spawn_listener(server, &config).await;
+
+    // The Exec hello names this connection's command; its output arrives without
+    // typing anything. The trailing sleep keeps the PTY alive while the marker
+    // syncs (the session is torn down when the test drops the connection).
+    let t = dial(addr, &server_cert, &client_cert, &client_key)
+        .await
+        .expect("enrolled client connects");
+    let argv: Vec<String> = ["sh", "-c", "echo EXEC_HELLO_OK && sleep 30"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    run_and_expect_with(t, &argv, b"", b"EXEC_HELLO_OK").await;
 }
