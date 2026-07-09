@@ -53,6 +53,7 @@ fn harness() -> (
         mish_terminal::predict::PredictMode::Never,
         None,
         None, // session name (display-only)
+        None,
         cin_rx,
         cout_tx,
     ));

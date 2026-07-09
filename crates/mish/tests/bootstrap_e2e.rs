@@ -54,6 +54,7 @@ async fn local_bootstrap_starts_server_and_connects() {
         PredictMode::Never,
         None,
         None, // session name (display-only)
+        None,
         cin_rx,
         cout_tx,
     ));
@@ -118,6 +119,7 @@ async fn local_bootstrap_runs_multiword_command() {
         24,
         clock,
         PredictMode::Never,
+        None,
         None,
         None,
         cin_rx,

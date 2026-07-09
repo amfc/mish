@@ -13,7 +13,7 @@ use mish_ssp::core::SspConfig;
 use mish_ssp::session::{Driver, Session};
 use mish_ssp::state::SyncState;
 use mish_ssp::transport::Transport;
-use mish_terminal::display::new_frame;
+use mish_terminal::display::new_frame_with_prefix;
 use mish_terminal::history::HistoryResponse;
 use mish_terminal::predict::{PredictMode, PredictionEngine};
 use mish_terminal::screen::Screen;
@@ -148,6 +148,7 @@ pub async fn run_client<T: Transport>(
     predict: PredictMode,
     history: Option<Arc<dyn HistoryFetcher>>,
     session: Option<String>,
+    title_prefix: Option<String>,
     mut input: mpsc::Receiver<ClientInput>,
     output: mpsc::UnboundedSender<Vec<u8>>,
 ) {
@@ -252,7 +253,8 @@ pub async fn run_client<T: Transport>(
             if shown.mouse_mode == 0 && !shown.alt_screen {
                 shown.alternate_scroll = false;
             }
-            let frame = new_frame(&painted, &shown, painted_once);
+            let frame =
+                new_frame_with_prefix(&painted, &shown, painted_once, title_prefix.as_deref());
             painted = shown;
             painted_once = true;
             if !frame.is_empty() && output.send(frame).is_err() {

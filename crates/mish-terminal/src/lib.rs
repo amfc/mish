@@ -32,7 +32,7 @@ pub mod user;
 #[cfg(kani)]
 mod kani_proofs;
 
-pub use display::new_frame;
+pub use display::{new_frame, new_frame_with_prefix};
 pub use emulator::Emulator;
 pub use predict::{PredictMode, PredictionEngine};
 pub use render::render_full;

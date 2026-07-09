@@ -51,6 +51,7 @@ fn harness() -> (
         mish_terminal::predict::PredictMode::Never,
         None,
         Some("work".to_string()), // named session → appears in the bar
+        None,
         cin_rx,
         cout_tx,
     ));

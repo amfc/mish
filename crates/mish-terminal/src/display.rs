@@ -264,22 +264,53 @@ fn push_color(codes: &mut Vec<String>, color: Color, fg: bool) {
 /// `initialized == false`, the screen is fully repainted (clear + redraw),
 /// matching mosh's first frame.
 pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
+    new_frame_with_prefix(old, new, initialized, None)
+}
+
+/// Like [`new_frame`], but prepend `title_prefix` to the window title on the
+/// **client's real terminal**. When `title_prefix` is `None` or empty the
+/// output is byte-for-byte identical to [`new_frame`] (the server→client wire
+/// diff); when it is non-empty, both OSC 0 (icon+window title) and OSC 2
+/// (window title) are emitted with `{prefix}{title}` so an outer wrapper can
+/// compose its own prefix with the remote application's dynamic title.
+pub fn new_frame_with_prefix(
+    old: &Screen,
+    new: &Screen,
+    initialized: bool,
+    title_prefix: Option<&str>,
+) -> Vec<u8> {
     let mut frame = FrameState::new(old);
 
     // A dimensions mismatch forces a full repaint (the receiver starts blank).
     let resized = old.cols != new.cols || old.rows != new.rows;
     let initialized = initialized && !resized;
 
-    // Title (OSC 0): only when it changed. A full repaint deliberately does NOT
-    // force emission: an empty title means the remote never set one, and
-    // emitting it would clobber the title the user's terminal already had
-    // (mosh guards the same case with its `title_initialized` flag).
-    // Sanitize: a control byte in the title would break out of the OSC frame and
-    // inject terminal commands on the client's real TTY.
+    // Title: only when it changed. A full repaint deliberately does NOT force
+    // emission: an empty title means the remote never set one, and emitting it
+    // would clobber the title the user's terminal already had (mosh guards the
+    // same case with its `title_initialized` flag).
+    // Sanitize: a control byte in the title would break out of the OSC frame
+    // and inject terminal commands on the client's real TTY.
     if old.title != new.title {
+        // With a non-empty prefix we emit both OSC 0 (icon+window title) and
+        // OSC 2 (window title) so the outer wrapper's prefix is visible
+        // everywhere the remote title is shown. Without a prefix the behavior
+        // is byte-for-byte identical to the original fork (OSC 0 only).
+        let prefixed = title_prefix
+            .filter(|p| !p.is_empty())
+            .map(|prefix| format!("{prefix}{}", new.title));
+        let safe = prefixed
+            .as_deref()
+            .map(osc_sanitize)
+            .unwrap_or_else(|| osc_sanitize(&new.title));
         frame.push("\x1b]0;");
-        frame.push(&osc_sanitize(&new.title));
+        frame.push(&safe);
         frame.out.push(0x07);
+        if prefixed.is_some() {
+            frame.push("\x1b]2;");
+            frame.push(&safe);
+            frame.out.push(0x07);
+        }
     }
 
     if !initialized {
@@ -751,4 +782,75 @@ fn apply_scroll(old: &Screen, op: Scroll) -> Screen {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_prefix_emits_osc0_and_osc2() {
+        let old = Screen::blank(10, 5);
+        let mut new = Screen::blank(10, 5);
+        new.title = "foo".to_string();
+        let frame = new_frame_with_prefix(&old, &new, true, Some("host: "));
+        let s = String::from_utf8_lossy(&frame);
+        assert!(
+            s.contains("\x1b]0;host: foo\x07"),
+            "OSC 0 title missing: {s:?}"
+        );
+        assert!(
+            s.contains("\x1b]2;host: foo\x07"),
+            "OSC 2 title missing: {s:?}"
+        );
+    }
+
+    #[test]
+    fn empty_title_prefix_is_passthrough() {
+        let old = Screen::blank(10, 5);
+        let mut new = Screen::blank(10, 5);
+        new.title = "foo".to_string();
+        let with_empty = new_frame_with_prefix(&old, &new, true, Some(""));
+        let no_prefix = new_frame(&old, &new, true);
+        assert_eq!(
+            with_empty, no_prefix,
+            "empty prefix must match no-prefix output"
+        );
+        // Default path emits only OSC 0, not OSC 2, for backward compatibility.
+        let s = String::from_utf8_lossy(&no_prefix);
+        assert!(
+            s.contains("\x1b]0;foo\x07"),
+            "default OSC 0 title missing: {s:?}"
+        );
+        assert!(
+            !s.contains("\x1b]2;"),
+            "default path should not emit OSC 2: {s:?}"
+        );
+    }
+
+    #[test]
+    fn title_prefix_only_emitted_when_title_changes() {
+        let _old = Screen::blank(10, 5);
+        let mut new = Screen::blank(10, 5);
+        new.title = "same".to_string();
+        let with_same = new_frame_with_prefix(&new, &new, true, Some("pre: "));
+        assert!(
+            !String::from_utf8_lossy(&with_same).contains("\x1b]"),
+            "title should not be re-emitted when unchanged"
+        );
+    }
+
+    #[test]
+    fn title_prefix_sanitizes_control_chars() {
+        let old = Screen::blank(10, 5);
+        let mut new = Screen::blank(10, 5);
+        new.title = "bar".to_string();
+        // A control char in the prefix would otherwise break the OSC frame.
+        let frame = new_frame_with_prefix(&old, &new, true, Some("x\x07y: "));
+        let s = String::from_utf8_lossy(&frame);
+        assert!(
+            s.contains("\x1b]0;xy: bar\x07"),
+            "control char in prefix was not stripped: {s:?}"
+        );
+    }
 }

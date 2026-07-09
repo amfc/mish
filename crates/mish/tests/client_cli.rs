@@ -26,6 +26,10 @@ fn help_exits_zero() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--predict"), "help should list --predict");
     assert!(stderr.contains("--no-init"), "help should list --no-init");
+    assert!(
+        stderr.contains("--title-prefix"),
+        "help should list --title-prefix"
+    );
 }
 
 #[test]

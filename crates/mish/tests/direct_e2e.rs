@@ -120,6 +120,7 @@ async fn run_and_expect_with(t: QuicTransport, argv: &[String], keys: &[u8], mar
         PredictMode::Never,
         None,
         None,
+        None,
         cin_rx,
         cout_tx,
     ));

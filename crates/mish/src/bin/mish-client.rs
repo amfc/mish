@@ -153,6 +153,9 @@ struct Options {
     /// (`--perf-log`); `None` disables it. Used to reproduce the Mosh paper's
     /// response-time graph from a real session (see `perf/`).
     perf_log: Option<std::path::PathBuf>,
+    /// Prefix the client's window-title output with this string (`--title-prefix`).
+    /// Empty or unset means pass the remote title through unchanged.
+    title_prefix: Option<String>,
 }
 
 /// Resolve a `--predict` / `MOSH_PREDICTION_DISPLAY` mode name. `experimental`
@@ -201,6 +204,7 @@ fn parse_args() -> Result<Options> {
         log_file: None,
         log_level: tracing::Level::DEBUG,
         perf_log: None,
+        title_prefix: None,
     };
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -283,6 +287,9 @@ fn parse_args() -> Result<Options> {
             "--perf-log" => {
                 opts.perf_log = Some(args.next().context("--perf-log needs a PATH")?.into());
             }
+            "--title-prefix" => {
+                opts.title_prefix = Some(args.next().context("--title-prefix needs a STRING")?);
+            }
             "--version" => {
                 println!("mish-client (mish) {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -355,6 +362,7 @@ fn print_usage() {
          \x20 --log-file <path>    write a JSON event log (for debugging)\n\
          \x20 --log-level <lvl>    log verbosity: error|warn|info|debug|trace (default debug)\n\
          \x20 --perf-log <path>    record per-keystroke keypress->display latency (JSON lines)\n\
+         \x20 --title-prefix <s>   prefix window titles on the host terminal (empty = passthrough)\n\
          \x20 --version            print version and exit\n\
          \x20 -h, --help           show this help\n\n\
          keys: Ctrl-] detach · Ctrl-^ then . quit / Ctrl-Z suspend / u status bar / l repaint\n\
@@ -421,6 +429,7 @@ async fn main() -> Result<()> {
             opts.local_forwards,
             opts.remote_forwards,
             opts.session.clone(),
+            opts.title_prefix.clone(),
         )
         .await?;
         exit_now();
@@ -437,6 +446,7 @@ async fn main() -> Result<()> {
             opts.local_forwards,
             opts.remote_forwards,
             opts.session.clone(),
+            opts.title_prefix.clone(),
             &opts.command,
         )
         .await?;
@@ -518,6 +528,7 @@ async fn main() -> Result<()> {
         opts.local_forwards,
         opts.remote_forwards,
         opts.session,
+        opts.title_prefix,
     )
     .await;
     tracing::info!(target: "mish::client", "client session ended; tearing down");
@@ -563,6 +574,7 @@ fn client_bind_addr(server: std::net::SocketAddr) -> std::net::SocketAddr {
 
 /// Attach directly to a running server at `ip:port`, with the credential triple
 /// (hex `server-cert client-cert client-key`) in `$MISH_CONNECT`. No bootstrap.
+#[allow(clippy::too_many_arguments)] // session entry point: discrete wired-in pieces
 async fn attach_session(
     ip: &str,
     port: u16,
@@ -571,6 +583,7 @@ async fn attach_session(
     local_forwards: Vec<mish::forward::ForwardSpec>,
     remote_forwards: Vec<mish::forward::ForwardSpec>,
     session: Option<String>,
+    title_prefix: Option<String>,
 ) -> Result<()> {
     let creds = std::env::var("MISH_CONNECT").context(
         "--attach requires $MISH_CONNECT = hex `<server-cert> <client-cert> <client-key>`",
@@ -608,6 +621,7 @@ async fn attach_session(
         local_forwards,
         remote_forwards,
         session,
+        title_prefix,
     )
     .await;
     Ok(())
@@ -627,6 +641,7 @@ async fn connect_session(
     local_forwards: Vec<mish::forward::ForwardSpec>,
     remote_forwards: Vec<mish::forward::ForwardSpec>,
     session: Option<String>,
+    title_prefix: Option<String>,
     command: &[String],
 ) -> Result<()> {
     let id = mish::enroll::load_or_generate_client_identity()?;
@@ -653,6 +668,7 @@ async fn connect_session(
         local_forwards,
         remote_forwards,
         session,
+        title_prefix,
     )
     .await;
     Ok(())
@@ -758,6 +774,7 @@ async fn run_terminal(
     local_forwards: Vec<mish::forward::ForwardSpec>,
     remote_forwards: Vec<mish::forward::ForwardSpec>,
     session: Option<String>,
+    title_prefix: Option<String>,
 ) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
@@ -1015,6 +1032,7 @@ async fn run_terminal(
         predict,
         Some(history),
         session,
+        title_prefix,
         in_rx,
         out_tx,
     )
