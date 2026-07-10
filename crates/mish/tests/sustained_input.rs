@@ -56,6 +56,7 @@ async fn sustained_keystrokes_all_arrive() {
         mish_terminal::predict::PredictMode::Never,
         None,
         None, // session name (display-only)
+        String::new(),
         cin_rx,
         cout_tx,
     ));

@@ -51,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
     reconstructed.apply_diff(&diff);
 
     // The client repaints it to the user's real terminal.
-    let frame = new_frame(&Screen::blank(cols, rows), &reconstructed, false);
+    let frame = new_frame(&Screen::blank(cols, rows), &reconstructed, false, "");
     let mut real = Emulator::new(cols, rows);
     real.feed(&frame);
     let seen = real.snapshot();

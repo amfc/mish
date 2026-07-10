@@ -89,6 +89,7 @@ async fn scroll_window_stays_anchored_when_output_arrives() {
         mish_terminal::predict::PredictMode::Never,
         Some(hist),
         None, // session name (display-only)
+        String::new(),
         cin_rx,
         cout_tx,
     ));

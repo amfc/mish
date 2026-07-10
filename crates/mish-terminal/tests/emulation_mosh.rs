@@ -256,7 +256,7 @@ fn osc8_hyperlink_captured_and_diffed() {
     // Round-trip through the diff (alacritty echoes the captured id verbatim).
     let blank = Screen::blank(20, 2);
     let mut e2 = Emulator::new(20, 2);
-    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
+    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false, ""));
     assert_eq!(e2.snapshot(), s, "hyperlinks round-trip exactly");
 }
 
@@ -278,7 +278,7 @@ fn terminal_modes_captured_and_diffed() {
     // Round-trip via the diff.
     let blank = Screen::blank(10, 2);
     let mut e2 = Emulator::new(10, 2);
-    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
+    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false, ""));
     let s2 = e2.snapshot();
     assert_eq!(s2.bracketed_paste, s.bracketed_paste);
     assert_eq!(s2.mouse_mode, s.mouse_mode);
@@ -299,7 +299,7 @@ fn combining_marks_captured_and_diffed() {
     // Round-trip through the minimal diff.
     let blank = Screen::blank(10, 2);
     let mut e2 = Emulator::new(10, 2);
-    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
+    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false, ""));
     assert_eq!(
         e2.snapshot().cell(0, 0).unwrap().combining,
         vec!['\u{0301}']
@@ -320,7 +320,7 @@ fn wide_char_cells_and_diff() {
 
     let blank = Screen::blank(10, 2);
     let mut e2 = Emulator::new(10, 2);
-    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false));
+    e2.feed(&mish_terminal::display::new_frame(&blank, &s, false, ""));
     assert_eq!(e2.snapshot(), s, "wide chars round-trip exactly");
 }
 

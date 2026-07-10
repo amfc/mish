@@ -80,6 +80,7 @@ async fn detach_survives_parent_exit() {
         PredictMode::Never,
         None,
         None, // session name (display-only)
+        String::new(),
         cin_rx,
         cout_tx,
     ));

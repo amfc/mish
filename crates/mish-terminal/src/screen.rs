@@ -297,7 +297,7 @@ impl SyncState for Screen {
     fn diff_from(&self, prev: &Self) -> Vec<u8> {
         // The diff is mosh's minimal escape stream transforming `prev` into
         // `self` (cursor moves, ECH/EL erases, SGR runs) — see `crate::display`.
-        let ansi = crate::display::new_frame(prev, self, true);
+        let ansi = crate::display::new_frame(prev, self, true, "");
         if ansi.is_empty() && self.echo_ack == prev.echo_ack && self.alt_screen == prev.alt_screen {
             return Vec::new();
         }
@@ -341,7 +341,7 @@ impl SyncState for Screen {
         let mut emu = crate::emulator::Emulator::new(cols, rows);
         if cols == self.cols && rows == self.rows {
             let blank = Screen::blank(cols, rows);
-            emu.feed(&crate::display::new_frame(&blank, self, false));
+            emu.feed(&crate::display::new_frame(&blank, self, false, ""));
         }
         emu.feed(ansi);
         let mut next = emu.snapshot();

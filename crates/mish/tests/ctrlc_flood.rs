@@ -44,6 +44,7 @@ async fn ctrl_c_interrupts_yes_flood() {
         mish_terminal::predict::PredictMode::Never,
         None,
         None, // session name (display-only)
+        String::new(),
         cin_rx,
         cout_tx,
     ));

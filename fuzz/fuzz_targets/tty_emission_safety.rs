@@ -62,7 +62,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Emit to the real terminal (full repaint from blank) and re-read it.
-    let frame = mish_terminal::new_frame(&Screen::blank(cols, rows), &screen, false);
+    let frame = mish_terminal::new_frame(&Screen::blank(cols, rows), &screen, false, "");
     let mut real = Emulator::new(cols, rows);
     real.feed(&frame);
     let seen = real.snapshot();

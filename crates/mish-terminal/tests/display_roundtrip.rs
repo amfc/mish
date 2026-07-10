@@ -11,7 +11,7 @@ use proptest::prelude::*;
 fn paint(screen: &Screen) -> Screen {
     let mut emu = Emulator::new(screen.cols, screen.rows);
     let blank = Screen::blank(screen.cols, screen.rows);
-    emu.feed(&new_frame(&blank, screen, false));
+    emu.feed(&new_frame(&blank, screen, false, ""));
     emu.snapshot()
 }
 
@@ -19,8 +19,8 @@ fn paint(screen: &Screen) -> Screen {
 fn apply(old: &Screen, new: &Screen) -> Screen {
     let mut emu = Emulator::new(old.cols, old.rows);
     let blank = Screen::blank(old.cols, old.rows);
-    emu.feed(&new_frame(&blank, old, false));
-    emu.feed(&new_frame(old, new, true));
+    emu.feed(&new_frame(&blank, old, false, ""));
+    emu.feed(&new_frame(old, new, true, ""));
     emu.snapshot()
 }
 
@@ -147,8 +147,8 @@ fn scroll_up_is_minimal_and_correct() {
     // Scrolled up by 2: old rows 2..6 move to the top, two new rows at the bottom.
     let new = mk(["row2", "row3", "row4", "row5", "new6", "new7"]);
 
-    let diff = new_frame(&old, &new, true);
-    let full = new_frame(&Screen::blank(cols, rows), &new, false);
+    let diff = new_frame(&old, &new, true, "");
+    let full = new_frame(&Screen::blank(cols, rows), &new, false, "");
     assert!(
         diff.len() < full.len(),
         "scroll diff ({}) should be smaller than a full repaint ({})",
@@ -220,7 +220,7 @@ fn bell_roundtrips() {
     let after = emu.snapshot();
     assert_eq!(after.bell_count, 2, "emulator counts bells");
     // The diff carries exactly two BELs and reconstructs the count.
-    let diff = new_frame(&before, &after, true);
+    let diff = new_frame(&before, &after, true, "");
     assert_eq!(diff.iter().filter(|&&b| b == 0x07).count(), 2, "delta BELs");
     assert_eq!(
         apply(&before, &after).bell_count,
@@ -304,8 +304,8 @@ fn scroll_down_whole_screen() {
     let old = lines_to_screen(cols, &["r0", "r1", "r2", "r3", "r4", "r5"]);
     // Scrolled down by 2: old rows 0..4 move to the bottom; two new top rows.
     let new = lines_to_screen(cols, &["t0", "t1", "r0", "r1", "r2", "r3"]);
-    let diff = new_frame(&old, &new, true);
-    let full = new_frame(&Screen::blank(cols, 6), &new, false);
+    let diff = new_frame(&old, &new, true, "");
+    let full = new_frame(&Screen::blank(cols, 6), &new, false, "");
     assert!(
         diff.windows(2).any(|w| w == b"\x1bM"),
         "downward scroll should emit reverse-index (RI)"
@@ -328,8 +328,8 @@ fn scroll_region_bottom_status_fixed() {
     let old = lines_to_screen(cols, &["a0", "a1", "a2", "a3", "a4", "STATUS"]);
     // Region [0,4] scrolled up by 1; row 5 (STATUS) unchanged.
     let new = lines_to_screen(cols, &["a1", "a2", "a3", "a4", "NEW", "STATUS"]);
-    let diff = new_frame(&old, &new, true);
-    let full = new_frame(&Screen::blank(cols, 6), &new, false);
+    let diff = new_frame(&old, &new, true, "");
+    let full = new_frame(&Screen::blank(cols, 6), &new, false, "");
     // DECSTBM set region "ESC[1;5r".
     assert!(
         diff.windows(6).any(|w| w == b"\x1b[1;5r"),
@@ -352,7 +352,7 @@ fn scroll_region_down_with_fixed_header_footer() {
     let old = lines_to_screen(cols, &["HDR", "b1", "b2", "b3", "b4", "FTR"]);
     // Region [1,4] scrolled down by 1; rows 0 and 5 unchanged.
     let new = lines_to_screen(cols, &["HDR", "NEW", "b1", "b2", "b3", "FTR"]);
-    let diff = new_frame(&old, &new, true);
+    let diff = new_frame(&old, &new, true, "");
     assert!(
         diff.windows(6).any(|w| w == b"\x1b[2;5r"),
         "region [1,4] scroll should set DECSTBM ESC[2;5r"
@@ -402,7 +402,7 @@ proptest! {
             prop_assert!(false, "incremental mismatch: cur got({},{}) want({},{}); firstdiff {:?} got={:?} want={:?}; diff={:?}",
                 got.cursor_row, got.cursor_col, new.cursor_row, new.cursor_col,
                 fd, fd.map(|i| &got.cells[i]), fd.map(|i| &new.cells[i]),
-                String::from_utf8_lossy(&new_frame(&old, &new, true)));
+                String::from_utf8_lossy(&new_frame(&old, &new, true, "")));
         }
     }
 
@@ -410,7 +410,7 @@ proptest! {
     #[test]
     fn identical_screens_no_change(s in arb_screen()) {
         let painted = paint(&s);
-        let diff = new_frame(&painted, &painted, true);
+        let diff = new_frame(&painted, &painted, true, "");
         prop_assert!(diff.is_empty(), "identical screens produced a non-empty diff: {:?}", String::from_utf8_lossy(&diff));
     }
 }
@@ -435,7 +435,7 @@ fn malicious_osc_fields_cannot_break_out() {
         uri: "x\x1b]52;c;evil\x07y".to_string(),
     });
 
-    let frame = new_frame(&Screen::blank(cols, rows), &screen, false);
+    let frame = new_frame(&Screen::blank(cols, rows), &screen, false, "");
     let mut real = Emulator::new(cols, rows);
     real.feed(&frame);
     let seen = real.snapshot();
@@ -511,6 +511,76 @@ fn edge_whitespace_title_round_trips() {
     );
 }
 
+/// True if `needle` appears as a contiguous byte run in `haystack`.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// A blank grid carrying the given window title (cursor home).
+fn titled(cols: u16, rows: u16, title: &str) -> Screen {
+    let mut s = Screen::blank(cols, rows);
+    s.title = title.to_string();
+    s
+}
+
+/// Empty `title_prefix` ⇒ exactly the historical passthrough: OSC 0 on a title
+/// change, never OSC 2, and no forced emission on a full repaint with an empty
+/// remote title (which must not clobber the title the user's own terminal shows).
+#[test]
+fn empty_title_prefix_is_passthrough() {
+    // Incremental frame with a changed title: OSC 0 only, no OSC 2.
+    let frame = new_frame(&titled(20, 4, ""), &titled(20, 4, "remote"), true, "");
+    assert!(
+        contains_bytes(&frame, b"\x1b]0;remote\x07"),
+        "changed title should be emitted as OSC 0"
+    );
+    assert!(
+        !contains_bytes(&frame, b"\x1b]2;"),
+        "empty prefix must not emit OSC 2"
+    );
+
+    // Full repaint with an empty remote title: emit no title at all.
+    let blank = titled(20, 4, "");
+    let full = new_frame(&blank, &blank, false, "");
+    assert!(
+        !contains_bytes(&full, b"\x1b]0;"),
+        "an empty title must not be force-emitted on a full repaint"
+    );
+}
+
+/// Non-empty `title_prefix` ⇒ the client owns the leading label: the effective
+/// `{prefix}{title}` is emitted as BOTH OSC 0 and OSC 2, and it is force-emitted
+/// on a full repaint even when the remote never set a title (a bare shell shows
+/// just the prefix).
+#[test]
+fn title_prefix_emits_effective_title_in_osc0_and_osc2() {
+    let prefix = "nyx4: ";
+
+    // Title change: the effective title lands in both OSC 0 and OSC 2.
+    let frame = new_frame(&titled(20, 4, ""), &titled(20, 4, "vim"), true, prefix);
+    assert!(
+        contains_bytes(&frame, b"\x1b]0;nyx4: vim\x07"),
+        "effective title missing from OSC 0"
+    );
+    assert!(
+        contains_bytes(&frame, b"\x1b]2;nyx4: vim\x07"),
+        "effective title missing from OSC 2"
+    );
+
+    // Bare shell (empty remote title) on a full repaint: force-emit the bare
+    // prefix, again as both OSC 0 and OSC 2.
+    let blank = titled(20, 4, "");
+    let bare = new_frame(&blank, &blank, false, prefix);
+    assert!(
+        contains_bytes(&bare, b"\x1b]0;nyx4: \x07"),
+        "bare prefix should be force-emitted as OSC 0 on a full repaint"
+    );
+    assert!(
+        contains_bytes(&bare, b"\x1b]2;nyx4: \x07"),
+        "bare prefix should be force-emitted as OSC 2 on a full repaint"
+    );
+}
+
 /// Regression (found by the `diff_roundtrip` fuzzer): a wide (CJK) glyph whose
 /// spacer column gets overwritten by a real glyph — via insert-character (ICH)
 /// shifting into it — leaves the emulator in a "broken wide char" state (wide
@@ -565,7 +635,7 @@ fn all_motion_tracking_emits_button_event_for_termux() {
     assert_eq!(motion.mouse_mode, MOUSE_MOTION, "snapshot stays exclusive");
 
     // A full repaint of that state emits both 1002h and 1003h.
-    let full = new_frame(&Screen::blank(24, 8), &motion, false);
+    let full = new_frame(&Screen::blank(24, 8), &motion, false, "");
     assert!(
         contains_seq(&full, b"\x1b[?1002h") && contains_seq(&full, b"\x1b[?1003h"),
         "all-motion repaint must emit 1002h alongside 1003h for Termux"
@@ -577,7 +647,7 @@ fn all_motion_tracking_emits_button_event_for_termux() {
     // shared DRAG bit and leave the terminal tracking nothing).
     let drag = mouse_screen(b"\x1b[?1002h");
     assert_eq!(drag.mouse_mode, MOUSE_DRAG);
-    let diff = new_frame(&motion, &drag, true);
+    let diff = new_frame(&motion, &drag, true, "");
     assert!(
         contains_seq(&diff, b"\x1b[?1002h"),
         "1003->1002 must re-emit 1002h so the terminal keeps drag tracking"
@@ -587,7 +657,7 @@ fn all_motion_tracking_emits_button_event_for_termux() {
     // 1003 -> off: clears both codes so Termux's retained 1002 is turned off too.
     let off = mouse_screen(b"\x1b[?1003h\x1b[?1003l");
     assert_eq!(off.mouse_mode, 0);
-    let diff_off = new_frame(&motion, &off, true);
+    let diff_off = new_frame(&motion, &off, true, "");
     assert!(
         contains_seq(&diff_off, b"\x1b[?1002l") && contains_seq(&diff_off, b"\x1b[?1003l"),
         "turning tracking off must also clear the 1002 Termux was left holding"

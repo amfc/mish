@@ -44,6 +44,7 @@ async fn real_shell_output_reaches_client() {
         mish_terminal::predict::PredictMode::Never,
         None,
         None, // session name (display-only)
+        String::new(),
         cin_rx,
         cout_tx,
     ));
@@ -95,6 +96,7 @@ async fn flow_control_does_not_deadlock() {
         mish_terminal::predict::PredictMode::Never,
         None,
         None, // session name (display-only)
+        String::new(),
         cin_rx,
         cout_tx,
     ));

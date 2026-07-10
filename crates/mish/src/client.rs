@@ -139,6 +139,8 @@ fn history_screen(resp: &HistoryResponse, cols: u16, rows: u16, offset: u32) -> 
 /// * `input` yields [`ClientInput`] from the user's terminal.
 /// * `output` receives the bytes to write to the user's terminal (a full-frame
 ///   ANSI repaint per remote screen update).
+/// * `title_prefix` is a client-owned label prepended to every emitted window
+///   title (empty = the historical passthrough behavior; see [`new_frame`]).
 #[allow(clippy::too_many_arguments)] // session entry point: discrete wired-in pieces
 pub async fn run_client<T: Transport>(
     transport: Arc<T>,
@@ -148,6 +150,7 @@ pub async fn run_client<T: Transport>(
     predict: PredictMode,
     history: Option<Arc<dyn HistoryFetcher>>,
     session: Option<String>,
+    title_prefix: String,
     mut input: mpsc::Receiver<ClientInput>,
     output: mpsc::UnboundedSender<Vec<u8>>,
 ) {
@@ -252,7 +255,7 @@ pub async fn run_client<T: Transport>(
             if shown.mouse_mode == 0 && !shown.alt_screen {
                 shown.alternate_scroll = false;
             }
-            let frame = new_frame(&painted, &shown, painted_once);
+            let frame = new_frame(&painted, &shown, painted_once, &title_prefix);
             painted = shown;
             painted_once = true;
             if !frame.is_empty() && output.send(frame).is_err() {

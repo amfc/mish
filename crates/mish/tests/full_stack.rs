@@ -49,6 +49,7 @@ async fn quic_pty_full_stack() {
         mish_terminal::predict::PredictMode::Never,
         None,
         None, // session name (display-only)
+        String::new(),
         cin_rx,
         cout_tx,
     ));
@@ -106,6 +107,7 @@ async fn shell_exit_disconnects_client() {
         mish_terminal::predict::PredictMode::Never,
         None,
         None, // session name (display-only)
+        String::new(),
         cin_rx,
         cout_tx,
     ));

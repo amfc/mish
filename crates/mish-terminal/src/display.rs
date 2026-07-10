@@ -263,23 +263,45 @@ fn push_color(codes: &mut Vec<String>, color: Color, fg: bool) {
 /// Produce the escape sequence transforming `old` into `new`. With
 /// `initialized == false`, the screen is fully repainted (clear + redraw),
 /// matching mosh's first frame.
-pub fn new_frame(old: &Screen, new: &Screen, initialized: bool) -> Vec<u8> {
+pub fn new_frame(old: &Screen, new: &Screen, initialized: bool, title_prefix: &str) -> Vec<u8> {
     let mut frame = FrameState::new(old);
 
     // A dimensions mismatch forces a full repaint (the receiver starts blank).
     let resized = old.cols != new.cols || old.rows != new.rows;
     let initialized = initialized && !resized;
 
-    // Title (OSC 0): only when it changed. A full repaint deliberately does NOT
-    // force emission: an empty title means the remote never set one, and
-    // emitting it would clobber the title the user's terminal already had
-    // (mosh guards the same case with its `title_initialized` flag).
-    // Sanitize: a control byte in the title would break out of the OSC frame and
-    // inject terminal commands on the client's real TTY.
-    if old.title != new.title {
-        frame.push("\x1b]0;");
-        frame.push(&osc_sanitize(&new.title));
-        frame.out.push(0x07);
+    // Title emission. `title_prefix` is a client-owned label prepended to the
+    // remote's title (empty = the historical passthrough behavior).
+    //
+    // Empty prefix: byte-for-byte the old behavior — emit only when the title
+    // changed, OSC 0 only, and never force it on a full repaint. An empty remote
+    // title means the remote never set one, and emitting it would clobber the
+    // title the user's terminal already had (mosh guards this with its
+    // `title_initialized` flag).
+    //
+    // Non-empty prefix: the client OWNS the leading label, so it must show even
+    // when the remote never sets a title (a bare shell keeps `new.title == ""`).
+    // Force-emit the effective title on a full repaint (`!initialized`), in
+    // addition to emitting on a title change, and send it as BOTH OSC 0 (icon +
+    // title) and OSC 2 (title) so the window and icon names both carry the label.
+    //
+    // Sanitize the whole effective string: a control byte in the prefix or the
+    // title would break out of the OSC frame and inject commands on the real TTY.
+    let title_changed = old.title != new.title;
+    if title_prefix.is_empty() {
+        if title_changed {
+            frame.push("\x1b]0;");
+            frame.push(&osc_sanitize(&new.title));
+            frame.out.push(0x07);
+        }
+    } else if title_changed || !initialized {
+        let full_title = format!("{title_prefix}{}", new.title);
+        let effective = osc_sanitize(&full_title);
+        for osc in ["\x1b]0;", "\x1b]2;"] {
+            frame.push(osc);
+            frame.push(&effective);
+            frame.out.push(0x07);
+        }
     }
 
     if !initialized {

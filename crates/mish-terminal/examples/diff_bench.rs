@@ -46,7 +46,7 @@ fn bench(name: &str, screens: &[Screen], rounds: usize) {
     let t0 = Instant::now();
     for _ in 0..rounds {
         for w in screens.windows(2) {
-            let diff = new_frame(&w[0], &w[1], true);
+            let diff = new_frame(&w[0], &w[1], true, "");
             total_bytes += diff.len();
             count += 1;
             std::hint::black_box(&diff);

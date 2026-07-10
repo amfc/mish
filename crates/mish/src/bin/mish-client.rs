@@ -145,6 +145,11 @@ struct Options {
     host: Option<String>,
     /// Explicit `-- command` argv, one token per element (empty = login shell).
     command: Vec<String>,
+    /// Per-connection label prepended to the terminal window title the client
+    /// emits to the host TTY (`--title-prefix`, default empty). Empty preserves
+    /// the historical passthrough; a non-empty prefix is client-owned and shows
+    /// even for a bare remote shell that never sets a title.
+    title_prefix: String,
     /// Write a JSON event log here (`--log-file`); `None` disables logging.
     log_file: Option<std::path::PathBuf>,
     /// Max verbosity for the event log (`--log-level`, default debug).
@@ -198,6 +203,7 @@ fn parse_args() -> Result<Options> {
         remote_forwards: Vec::new(),
         host: None,
         command: Vec::new(),
+        title_prefix: String::new(),
         log_file: None,
         log_level: tracing::Level::DEBUG,
         perf_log: None,
@@ -252,6 +258,9 @@ fn parse_args() -> Result<Options> {
             s if s.starts_with("-L") => opts.local_forwards.push(parse_forward(&s[2..])?),
             s if s.starts_with("-R") => opts.remote_forwards.push(parse_forward(&s[2..])?),
             "--session" => opts.session = Some(args.next().context("--session needs a NAME")?),
+            "--title-prefix" => {
+                opts.title_prefix = args.next().context("--title-prefix needs a STRING")?;
+            }
             "--shared" => {
                 #[cfg(feature = "multi-client")]
                 {
@@ -347,6 +356,7 @@ fn print_usage() {
          \x20 -L [bind:]port:host:hostport  forward a local port to host:hostport (repeatable)\n\
          \x20 -R [bind:]port:host:hostport  forward a remote port to host:hostport (repeatable)\n\
          \x20 --session <name>     reattachable persistent session (never lose your shell)\n\
+         \x20 --title-prefix <s>   prepend <s> to the terminal window title (default: none)\n\
          \x20 --shared             shared session: you own it, others can attach read-only\n\
          \x20 --attach IP PORT     attach to a running server ($MISH_CONNECT creds; for testing)\n\
          \x20 --connect HOST:PORT  ssh-less direct connect to `mish-server --listen`, running\n\
@@ -421,6 +431,7 @@ async fn main() -> Result<()> {
             opts.local_forwards,
             opts.remote_forwards,
             opts.session.clone(),
+            opts.title_prefix.clone(),
         )
         .await?;
         exit_now();
@@ -438,6 +449,7 @@ async fn main() -> Result<()> {
             opts.remote_forwards,
             opts.session.clone(),
             &opts.command,
+            opts.title_prefix.clone(),
         )
         .await?;
         exit_now();
@@ -518,6 +530,7 @@ async fn main() -> Result<()> {
         opts.local_forwards,
         opts.remote_forwards,
         opts.session,
+        opts.title_prefix,
     )
     .await;
     tracing::info!(target: "mish::client", "client session ended; tearing down");
@@ -563,6 +576,7 @@ fn client_bind_addr(server: std::net::SocketAddr) -> std::net::SocketAddr {
 
 /// Attach directly to a running server at `ip:port`, with the credential triple
 /// (hex `server-cert client-cert client-key`) in `$MISH_CONNECT`. No bootstrap.
+#[allow(clippy::too_many_arguments)] // session entry point: discrete wired-in pieces
 async fn attach_session(
     ip: &str,
     port: u16,
@@ -571,6 +585,7 @@ async fn attach_session(
     local_forwards: Vec<mish::forward::ForwardSpec>,
     remote_forwards: Vec<mish::forward::ForwardSpec>,
     session: Option<String>,
+    title_prefix: String,
 ) -> Result<()> {
     let creds = std::env::var("MISH_CONNECT").context(
         "--attach requires $MISH_CONNECT = hex `<server-cert> <client-cert> <client-key>`",
@@ -608,6 +623,7 @@ async fn attach_session(
         local_forwards,
         remote_forwards,
         session,
+        title_prefix,
     )
     .await;
     Ok(())
@@ -628,6 +644,7 @@ async fn connect_session(
     remote_forwards: Vec<mish::forward::ForwardSpec>,
     session: Option<String>,
     command: &[String],
+    title_prefix: String,
 ) -> Result<()> {
     let id = mish::enroll::load_or_generate_client_identity()?;
     let server_cert = mish::enroll::load_server_cert(host)?;
@@ -653,6 +670,7 @@ async fn connect_session(
         local_forwards,
         remote_forwards,
         session,
+        title_prefix,
     )
     .await;
     Ok(())
@@ -751,6 +769,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Put the TTY in raw mode and run the client session until detach or close.
+#[allow(clippy::too_many_arguments)] // session entry point: discrete wired-in pieces
 async fn run_terminal(
     t: transport::QuicTransport,
     predict: PredictMode,
@@ -758,6 +777,7 @@ async fn run_terminal(
     local_forwards: Vec<mish::forward::ForwardSpec>,
     remote_forwards: Vec<mish::forward::ForwardSpec>,
     session: Option<String>,
+    title_prefix: String,
 ) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
@@ -1015,6 +1035,7 @@ async fn run_terminal(
         predict,
         Some(history),
         session,
+        title_prefix,
         in_rx,
         out_tx,
     )
