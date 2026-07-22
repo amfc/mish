@@ -162,3 +162,73 @@ async fn wheel_becomes_arrows_on_alt_screen() {
         .unwrap();
     expect_pty_input(&mut pty_in_rx, b"\x1b[A\x1b[A\x1b[A").await;
 }
+
+/// Feed `bytes` to the server emulator and accumulate every client frame until
+/// `marker` has been rendered, returning the concatenated output so a test can
+/// assert on the terminal modes emitted along the way.
+async fn frames_until_marker(
+    pty_out_tx: &mpsc::Sender<Vec<u8>>,
+    cout_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    bytes: &[u8],
+    marker: &[u8],
+) -> Vec<u8> {
+    pty_out_tx.send(bytes.to_vec()).await.unwrap();
+    let mut seen: Vec<u8> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = cout_rx.recv().await {
+            seen.extend_from_slice(&frame);
+            if contains(&seen, marker) {
+                return;
+            }
+        }
+        panic!("client output closed before the marker rendered");
+    })
+    .await
+    .expect("client should render the marker");
+    seen
+}
+
+/// At the shell prompt (primary screen, no mouse tracking) the client forces
+/// SGR button reporting on the local terminal — the client sits on the local
+/// alternate screen, where a terminal has no native scrollback and kitty turns
+/// wheel notches into arrow keys unconditionally — and pins alternate-scroll
+/// off for terminals that do honor 1007.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_forces_wheel_capture_modes() {
+    let (pty_out_tx, _pty_in_rx, _cin_tx, mut cout_rx) = harness();
+
+    let seen = frames_until_marker(&pty_out_tx, &mut cout_rx, b"PROMPT", b"PROMPT").await;
+    assert!(
+        contains(&seen, b"\x1b[?1000h"),
+        "click tracking must be forced at the prompt"
+    );
+    assert!(
+        contains(&seen, b"\x1b[?1006h"),
+        "SGR encoding must be forced at the prompt"
+    );
+    assert!(
+        contains(&seen, b"\x1b[?1007l"),
+        "alternate-scroll must be pinned off at the prompt"
+    );
+}
+
+/// A remote alt-screen app that does not read the mouse keeps native modes:
+/// the wheel capture forced at the prompt is released, so the local terminal's
+/// own alternate-scroll handling (wheel → arrows) reaches the app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alt_screen_releases_wheel_capture() {
+    let (pty_out_tx, _pty_in_rx, _cin_tx, mut cout_rx) = harness();
+
+    let seen =
+        frames_until_marker(&pty_out_tx, &mut cout_rx, b"\x1b[?1049hALTMARK", b"ALTMARK").await;
+    let last_on = seen
+        .windows(b"\x1b[?1000h".len())
+        .rposition(|w| w == b"\x1b[?1000h");
+    let last_off = seen
+        .windows(b"\x1b[?1000l".len())
+        .rposition(|w| w == b"\x1b[?1000l");
+    let off = last_off.expect("click tracking must end released on the alternate screen");
+    if let Some(on) = last_on {
+        assert!(off > on, "the release must come after any prompt-time capture");
+    }
+}

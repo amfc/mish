@@ -16,7 +16,7 @@ use mish_ssp::transport::Transport;
 use mish_terminal::display::new_frame;
 use mish_terminal::history::HistoryResponse;
 use mish_terminal::predict::{PredictMode, PredictionEngine};
-use mish_terminal::screen::Screen;
+use mish_terminal::screen::{Screen, MOUSE_CLICK, MOUSE_SGR};
 use mish_terminal::statusbar::LinkStats;
 use mish_terminal::user::UserStream;
 use tokio::sync::mpsc;
@@ -80,11 +80,11 @@ pub enum ClientInput {
     /// Raw keystroke bytes to forward to the remote shell.
     Keys(Vec<u8>),
     /// A complete SGR mouse report (`ESC [ < … M/m`) read from the local
-    /// terminal. In normal use these only arrive when the remote app is reading
-    /// the mouse (vim, tmux, htop…), and `run_client` forwards them verbatim — the
-    /// wheel at the shell prompt is left to the terminal's native scrolling. (If a
-    /// terminal does still deliver wheel reports at the prompt, `run_client` falls
-    /// back to routing them to scrollback / an alt-screen pager.)
+    /// terminal. `run_client` routes it: when the remote app reads the mouse
+    /// (vim, tmux, htop…) the report forwards verbatim; at the shell prompt —
+    /// where the client forces wheel capture — wheel notches drive mosh's
+    /// scrollback and clicks are swallowed; on a remote alt-screen app that
+    /// does not read the mouse, wheel notches become arrow keys for it.
     Mouse(Vec<u8>),
     /// The local terminal was resized.
     Resize { cols: u16, rows: u16 },
@@ -244,15 +244,27 @@ pub async fn run_client<T: Transport>(
                     None => predicted,
                 }
             };
-            // Let the terminal handle the wheel natively (scroll its own
-            // scrollback) rather than capturing it for ours — native scrolling and
-            // click-drag selection are what users expect, and mosh's server-side
-            // scrollback lives on Shift-Up/Down (and Shift-PageUp/Down). At the
-            // shell prompt we still pin alternate-scroll OFF so a wheel notch can't
-            // be turned into arrow keys (which the shell would read as command-
-            // history navigation). A full-screen app keeps its own modes, so its
-            // wheel/mouse handling round-trips exactly.
+            // Wheel routing depends on where the remote is:
+            //
+            // At the shell prompt (primary screen, no mouse tracking) force SGR
+            // button reporting on the local terminal so wheel notches arrive as
+            // reports we route to mosh's server-side scrollback. Leaving the
+            // wheel "native" doesn't work there: the client itself sits on the
+            // local alternate screen, where the terminal has no scrollback to
+            // scroll — and kitty unconditionally fakes wheel-as-arrow-keys on
+            // the alt screen (it does not implement DECSET 1007), which the
+            // shell reads as command-history navigation. Alternate-scroll is
+            // pinned off for terminals that do honor 1007. The cost is that
+            // click-drag selection at the prompt needs the terminal's override
+            // modifier (usually Shift).
+            //
+            // A remote full-screen app keeps its exact modes: if it reads the
+            // mouse its event encoding round-trips untouched, and if it doesn't
+            // (less, plain vim) the terminal's alternate-scroll — or our
+            // replication of it in the Mouse arm — turns notches into arrow
+            // keys the app itself handles.
             if shown.mouse_mode == 0 && !shown.alt_screen {
+                shown.mouse_mode = MOUSE_CLICK | MOUSE_SGR;
                 shown.alternate_scroll = false;
             }
             let frame = new_frame(&painted, &shown, painted_once, &title_prefix);

@@ -1,30 +1,27 @@
 # Scrollback
 
-`mish` lets you scroll back through terminal history two ways: your
-terminal's **native** scrolling (mouse wheel / trackpad), and **mosh's own**
-server-held history (the Shift-Arrow keys). Upstream mosh has neither — it tells
-you to run `tmux`.
+`mish` scrolls back through **mosh's own server-held history**: the mouse
+wheel at the shell prompt, or the Shift-Arrow keys anywhere. Upstream mosh has
+neither — it tells you to run `tmux`.
 
 ---
 
 ## Using scrollback
 
-### Mouse wheel / trackpad — your terminal's native scrollback
+### Mouse wheel / trackpad — at the shell prompt
 
 At the shell prompt, just **scroll with the wheel or a two-finger swipe** like
-you would in any other program. `mish` does **not** capture the wheel, so your
-terminal scrolls its own buffer, native click-drag text selection works, and you
-don't have to change any terminal settings.
+you would in any other program. `mish` captures the wheel there and drives its
+server-side scrollback, so scrolling works in every terminal — including ones
+(kitty) that would otherwise turn wheel notches into arrow keys on the
+alternate screen the client runs in.
 
-This is the easy, everyday path. It shows whatever your terminal has kept in its
-scrollback — which is the output of the current session as it scrolled past.
+The trade-off: with mouse reporting on, click-drag text selection at the
+prompt needs your terminal's override modifier (usually **Shift-drag**).
 
-> In iTerm2 this works best with a generous (or unlimited) scrollback configured;
-> that's the terminal's setting, not mosh's.
+### Keyboard — the same history without a mouse
 
-### Keyboard — mosh's own server-side history
-
-For history that your terminal *doesn't* have (see [Caveats](#caveats)), use:
+The keyboard path reaches the same server-side history:
 
 | Key | Action |
 |-----|--------|
@@ -55,20 +52,6 @@ handed straight to the app, so its own scrolling and key bindings work normally.
 
 ## Caveats
 
-- **Native (wheel) scrolling shows your *terminal's* buffer**, i.e. the output
-  you've actually seen this session. It will **not** show:
-  - output produced **before you connected**, or
-  - output produced **while you were disconnected** and then re-synced on
-    reattach (`--session NAME`).
-
-  For those, use **Shift-↑/↓** — that reaches mosh's server-side history, which
-  the terminal never rendered.
-
-- **Native scrolling depends on your terminal saving alternate-screen lines.**
-  Terminals with real scrollback (e.g. iTerm2 with a large/unlimited buffer) do;
-  a barebones terminal may not. If wheel scrolling does nothing, fall back to
-  Shift-↑/↓ — that always works.
-
 - **Inside a full-screen app, Shift-Arrow does not scroll mosh history** — it's
   passed to the app on purpose (so it can't clobber the app's bindings). Detach
   from the app first to use mosh scrollback.
@@ -84,22 +67,22 @@ handed straight to the app, so its own scrolling and key bindings work normally.
 
 ## How it works
 
-### Native wheel scrolling
+### Wheel capture at the prompt
 
-`mish-client` runs in the **alternate screen** and repaints it with mosh's
-minimal-diff renderer ([`display.rs`](../crates/mish-terminal/src/display.rs)),
-which emits real terminal **scroll** operations (index / scroll-region) as
-output flows rather than full repaints. A terminal that saves alternate-screen
-lines therefore accumulates a coherent copy of the session in its own scrollback,
-and the wheel scrolls that.
+`mish-client` runs in the local terminal's **alternate screen**, which has no
+native scrollback to offer — and kitty unconditionally converts wheel notches
+into arrow keys there (it does not implement DECSET 1007), which the shell
+reads as command-history navigation. So when the remote is at the shell prompt
+(primary screen, no mouse tracking) the client **forces SGR button reporting**
+on the local terminal: wheel notches arrive as reports it routes to mosh's
+scrollback, and alternate-scroll is pinned off for terminals that honor 1007.
+Clicks and drags at the prompt are swallowed.
 
-Crucially, the client **does not force mouse reporting** when the remote app
-isn't using the mouse. That's what keeps the wheel (and native text selection)
-with the terminal instead of stealing it. The one thing it still pins at the
-shell prompt is **alternate-scroll off**, so a wheel notch can't be turned into
-arrow keys (which the shell would read as command-history navigation). Apps that
-*do* enable mouse reporting keep their exact modes, and their reports are
-forwarded verbatim.
+Apps that *do* enable mouse reporting keep their exact modes, and their reports
+are forwarded verbatim. A remote **alt-screen app without mouse reporting**
+(less, plain vim) keeps native handling: the terminal's alternate-scroll — or
+the client's replication of it — feeds it arrow keys, so the app scrolls its
+own content.
 
 ### mosh's own scrollback (Shift-Arrow)
 

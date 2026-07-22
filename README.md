@@ -146,10 +146,12 @@ scrolled doesn't slide it out from under you. See
 
 The scrollback keys reach mosh's *own* server-side history — including lines the
 terminal never rendered (produced before you connected, or while you were away on
-a reattach). At the shell prompt the **mouse wheel is left to your terminal**, so
-two-finger / wheel scrolling, native click-drag selection, and your terminal's
-own scrollback all work exactly as they do for any other program (no forced mouse
-reporting). Inside a full-screen app (vim, less, htop…) the wheel and Shift-Arrow
+a reattach). At the shell prompt the **mouse wheel scrolls that history
+directly**: the client captures wheel reports there, because it runs on the
+terminal's alternate screen — which has no native scrollback, and which some
+terminals (kitty) turn into wheel-as-arrow-keys unconditionally. Click-drag
+selection at the prompt needs your terminal's override modifier (usually
+Shift). Inside a full-screen app (vim, less, htop…) the wheel and Shift-Arrow
 reach the app as usual, so those keep their own scrolling/bindings. See
 [`docs/scrollback.md`](docs/scrollback.md) for the full guide, caveats, and how
 it works.
