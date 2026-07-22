@@ -229,6 +229,9 @@ async fn alt_screen_releases_wheel_capture() {
         .rposition(|w| w == b"\x1b[?1000l");
     let off = last_off.expect("click tracking must end released on the alternate screen");
     if let Some(on) = last_on {
-        assert!(off > on, "the release must come after any prompt-time capture");
+        assert!(
+            off > on,
+            "the release must come after any prompt-time capture"
+        );
     }
 }

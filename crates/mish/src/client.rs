@@ -307,6 +307,22 @@ pub async fn run_client<T: Transport>(
                         }
                     }};
                 }
+                // A history fetch bounded in time: on a dead or badly congested
+                // side-channel the scroll gives up and stays put instead of
+                // wedging the input loop on an await that may never resolve.
+                macro_rules! fetch_bounded {
+                    ($h:expr, $top:expr) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            $h.fetch($top, rows),
+                        )
+                        .await
+                        {
+                            Ok(resp) => resp,
+                            Err(_) => None,
+                        }
+                    };
+                }
                 // Render the scrollback window whose top row sits `$from_oldest`
                 // lines above the oldest retained line — a *buffer-relative*
                 // position that stays put as new output grows the buffer. We learn
@@ -322,12 +338,12 @@ pub async fn run_client<T: Transport>(
                             // Provisional request from the last known depth; the
                             // response carries the true depth so we can correct.
                             let prov = scroll_hist.saturating_sub(want);
-                            if let Some(resp) = h.fetch(prov, rows).await {
+                            if let Some(resp) = fetch_bounded!(h, prov) {
                                 let hist = resp.history_size;
                                 let anchor = want.min(hist);
                                 let top = hist.saturating_sub(anchor);
                                 let resp = if top != prov {
-                                    h.fetch(top, rows).await.unwrap_or(resp)
+                                    fetch_bounded!(h, top).unwrap_or(resp)
                                 } else {
                                     resp
                                 };
@@ -346,20 +362,24 @@ pub async fn run_client<T: Transport>(
                         }
                     }};
                 }
-                // Scroll one page toward older output. Entering scrollback shows
-                // the page just above the live top and pins it to the buffer;
-                // subsequent moves walk the buffer-relative anchor.
-                macro_rules! scroll_up {
-                    () => {{
-                        let page = rows.max(1) as u32;
-                        if scroll_view.is_none() {
+                // Move the scrollback view a net number of pages (positive =
+                // toward older output) with at most two bounded fetches.
+                // Entering scrollback pins the anchor to the buffer; moving to
+                // (or past) the live edge leaves scrollback via
+                // `scroll_to_anchor`'s `top == 0` branch.
+                macro_rules! scroll_pages {
+                    ($delta:expr) => {{
+                        let delta: i64 = $delta;
+                        let page = rows.max(1) as i64;
+                        if delta > 0 && scroll_view.is_none() {
+                            let lines = (delta * page).min(u32::MAX as i64) as u32;
                             if let Some(h) = &history {
-                                if let Some(resp) = h.fetch(page, rows).await {
+                                if let Some(resp) = fetch_bounded!(h, lines) {
                                     let hist = resp.history_size;
-                                    let top = page.min(hist);
+                                    let top = lines.min(hist);
                                     if top > 0 {
-                                        let resp = if top != page {
-                                            h.fetch(top, rows).await.unwrap_or(resp)
+                                        let resp = if top != lines {
+                                            fetch_bounded!(h, top).unwrap_or(resp)
                                         } else {
                                             resp
                                         };
@@ -372,23 +392,52 @@ pub async fn run_client<T: Transport>(
                                     }
                                 }
                             }
-                        } else {
-                            scroll_to_anchor!(scroll_anchor.saturating_sub(page));
+                        } else if delta != 0 && scroll_view.is_some() {
+                            let target = (scroll_anchor as i64 - delta * page).max(0) as u32;
+                            scroll_to_anchor!(target);
                         }
                     }};
                 }
-                // Scroll one page back toward the live screen; at the bottom,
-                // leave scrollback entirely.
-                macro_rules! scroll_down {
-                    () => {{
-                        if scroll_view.is_some() {
-                            let page = rows.max(1) as u32;
-                            scroll_to_anchor!(scroll_anchor.saturating_add(page));
+                // A trackpad fling delivers hundreds of wheel notches; a history
+                // fetch per notch would serialize hundreds of round-trips and
+                // freeze this loop for minutes on a high-RTT link. Instead, net
+                // every immediately-available scroll step into one anchor move,
+                // processing non-scroll inputs in arrival order around it.
+                let scroll_step = |i: &ClientInput| -> Option<i64> {
+                    let at_prompt =
+                        server_screen.mouse_mode == 0 && !server_screen.alt_screen;
+                    match i {
+                        ClientInput::ScrollUp => Some(1),
+                        ClientInput::ScrollDown => Some(-1),
+                        ClientInput::ScrollKey { up, .. } if at_prompt => {
+                            Some(if *up { 1 } else { -1 })
                         }
-                    }};
+                        ClientInput::Mouse(seq) if at_prompt => {
+                            sgr_wheel(seq).map(|up| if up { 1 } else { -1 })
+                        }
+                        _ => None,
+                    }
+                };
+                let mut queued: std::collections::VecDeque<ClientInput> =
+                    std::collections::VecDeque::new();
+                // A closed channel begins the same clean shutdown as a detach.
+                queued.push_back(inp.unwrap_or(ClientInput::Detach));
+                while let Ok(more) = input.try_recv() {
+                    queued.push_back(more);
                 }
-                match inp {
-                    Some(ClientInput::Keys(b)) => {
+                let mut detach = false;
+                while let Some(cur) = queued.pop_front() {
+                    if let Some(first) = scroll_step(&cur) {
+                        let mut delta = first;
+                        while let Some(step) = queued.front().and_then(&scroll_step) {
+                            queued.pop_front();
+                            delta += step;
+                        }
+                        scroll_pages!(delta);
+                        continue;
+                    }
+                    match cur {
+                    ClientInput::Keys(b) => {
                         // Any keystroke returns to the live screen and is forwarded.
                         exit_scroll!();
                         let press_ms = clock.now_ms();
@@ -407,39 +456,34 @@ pub async fn run_client<T: Transport>(
                             crate::perf::on_keystroke(idx, press_ms, shown, b.len());
                         }
                     }
-                    Some(ClientInput::Resize { cols, rows }) => {
+                    ClientInput::Resize { cols, rows } => {
                         exit_scroll!();
                         stream.push_resize(cols, rows);
                         handle.set_local(stream.clone());
                     }
-                    // Keyboard scroll (Shift-PageUp/Down): one page up/down.
-                    Some(ClientInput::ScrollUp) => scroll_up!(),
-                    Some(ClientInput::ScrollDown) => scroll_down!(),
-                    // Shift-Up / Shift-Down: scroll mosh's history at the shell
-                    // prompt, but hand the key to a full-screen app (which may use
-                    // Shift-Arrow itself) when one is active, so we never swallow
-                    // its input.
-                    Some(ClientInput::ScrollKey { up, passthrough }) => {
-                        if server_screen.alt_screen || server_screen.mouse_mode != 0 {
-                            exit_scroll!();
-                            stream.push_keystroke(passthrough.clone());
-                            handle.set_local(stream.clone());
-                            engine.new_user_bytes(
-                                &passthrough,
-                                &server_screen,
-                                stream.total(),
-                                clock.now_ms(),
-                            );
-                            repaint!();
-                        } else if up {
-                            scroll_up!();
-                        } else {
-                            scroll_down!();
-                        }
+                    // Scroll steps (Shift-PageUp/Down, and wheel / Shift-Arrow at
+                    // the prompt) are consumed by the classifier above; these
+                    // variants only reach the match when they are not scroll
+                    // steps in the current remote state.
+                    ClientInput::ScrollUp | ClientInput::ScrollDown => {}
+                    // Shift-Up / Shift-Down while a full-screen app is active
+                    // (which may bind Shift-Arrow itself): pass through, so we
+                    // never swallow its input.
+                    ClientInput::ScrollKey { passthrough, .. } => {
+                        exit_scroll!();
+                        stream.push_keystroke(passthrough.clone());
+                        handle.set_local(stream.clone());
+                        engine.new_user_bytes(
+                            &passthrough,
+                            &server_screen,
+                            stream.total(),
+                            clock.now_ms(),
+                        );
+                        repaint!();
                     }
-                    // A mouse report from the local terminal. Route by what the
-                    // remote app wants and where it is:
-                    Some(ClientInput::Mouse(seq)) => {
+                    // A mouse report from the local terminal that is not a
+                    // prompt-time wheel notch (the classifier consumed those).
+                    ClientInput::Mouse(seq) => {
                         if server_screen.mouse_mode != 0 {
                             // The app reads the mouse itself (vim, tmux, …):
                             // forward the report verbatim. Not a keystroke, so
@@ -449,27 +493,21 @@ pub async fn run_client<T: Transport>(
                             handle.set_local(stream.clone());
                             repaint!();
                         } else if let Some(up) = sgr_wheel(&seq) {
-                            if server_screen.alt_screen {
-                                // Alt-screen pager (less, man…) with no mouse
-                                // mode: replicate alternate-scroll by feeding it
-                                // arrow keys, so it scrolls its own content
-                                // rather than us hijacking the wheel.
-                                let mut keys = Vec::new();
-                                for _ in 0..WHEEL_STEP_LINES {
-                                    keys.extend_from_slice(arrow_seq(
-                                        up,
-                                        server_screen.app_cursor_keys,
-                                    ));
-                                }
-                                exit_scroll!();
-                                stream.push_keystroke(keys);
-                                handle.set_local(stream.clone());
-                                repaint!();
-                            } else if up {
-                                scroll_up!();
-                            } else {
-                                scroll_down!();
+                            // Alt-screen pager (less, man…) with no mouse mode:
+                            // replicate alternate-scroll by feeding it arrow
+                            // keys, so it scrolls its own content rather than us
+                            // hijacking the wheel.
+                            let mut keys = Vec::new();
+                            for _ in 0..WHEEL_STEP_LINES {
+                                keys.extend_from_slice(arrow_seq(
+                                    up,
+                                    server_screen.app_cursor_keys,
+                                ));
                             }
+                            exit_scroll!();
+                            stream.push_keystroke(keys);
+                            handle.set_local(stream.clone());
+                            repaint!();
                         }
                         // Non-wheel mouse events (clicks/drags) at the prompt
                         // mean nothing to the shell — swallow them.
@@ -477,22 +515,27 @@ pub async fn run_client<T: Transport>(
                     // Force a full repaint from scratch (resume-from-suspend): the
                     // real terminal lost our painted state, so re-emit the whole
                     // screen rather than an incremental diff against `painted`.
-                    Some(ClientInput::Redraw) => {
+                    ClientInput::Redraw => {
                         painted_once = false;
                         repaint!();
                     }
                     // Toggle the status bar. Force a full repaint so the row it
                     // occupies (or vacates) is rewritten cleanly.
-                    Some(ClientInput::ToggleStats) => {
+                    ClientInput::ToggleStats => {
                         stats_on = !stats_on;
                         painted_once = false;
                         repaint!();
                     }
                     // Detach or input closed → begin a clean shutdown.
-                    Some(ClientInput::Detach) | None => {
+                    ClientInput::Detach => {
                         tracing::info!(target: "mish::client", "client: detach or input closed; ending session");
+                        detach = true;
                         break;
                     }
+                    }
+                }
+                if detach {
+                    break;
                 }
             }
             changed = remote.changed() => {

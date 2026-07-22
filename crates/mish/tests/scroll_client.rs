@@ -3,6 +3,7 @@
 //! to the TTY; `ScrollDown` past the bottom returns to the live screen. Uses the
 //! in-memory transport and a fake fetcher, so it needs no QUIC or server.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -169,4 +170,73 @@ async fn wheel_up_at_prompt_renders_history() {
     })
     .await
     .expect("wheel-up should render history rows to the TTY");
+}
+
+/// A slow fetcher (network RTT) that counts fetches, for the coalescing test.
+struct SlowCountingHistory(AtomicU32);
+
+#[async_trait::async_trait]
+impl HistoryFetcher for SlowCountingHistory {
+    async fn fetch(&self, top_above: u32, count: u16) -> Option<HistoryResponse> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        FakeHistory.fetch(top_above, count).await
+    }
+}
+
+/// A trackpad fling delivers a burst of wheel notches. The client must net the
+/// queued notches into a few anchor moves — not one fetch round-trip per notch,
+/// which on a high-RTT link would freeze the input loop for minutes — and keep
+/// answering input afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wheel_burst_coalesces_fetches() {
+    let (ca, _cb) = memory::pair();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let (in_tx, in_rx) = mpsc::channel::<ClientInput>(64);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let fetcher = Arc::new(SlowCountingHistory(AtomicU32::new(0)));
+    let history: Arc<dyn HistoryFetcher> = fetcher.clone();
+
+    tokio::spawn(run_client(
+        Arc::new(ca),
+        COLS,
+        ROWS,
+        clock,
+        PredictMode::Never,
+        Some(history),
+        None, // session name (display-only)
+        String::new(),
+        in_rx,
+        out_tx,
+    ));
+
+    // 50 wheel notches: the first arms a fetch (which sleeps 100ms); the rest
+    // queue behind it and must coalesce when the loop resumes.
+    for _ in 0..50 {
+        in_tx
+            .send(ClientInput::Mouse(b"\x1b[<64;1;1M".to_vec()))
+            .await
+            .unwrap();
+    }
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = out_rx.recv().await.expect("a rendered frame");
+            if contains(&frame, b"HIST") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the burst should still render history");
+
+    // Give the loop time to drain whatever it did not coalesce, then assert it
+    // stayed far below one fetch per notch. Perfect coalescing needs ≤ a few
+    // fetches; per-notch behavior needs 50+ (and 5+ seconds).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let fetches = fetcher.0.load(Ordering::SeqCst);
+    assert!(
+        fetches <= 10,
+        "burst of 50 notches should coalesce into a few fetches, saw {fetches}"
+    );
 }

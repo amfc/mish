@@ -58,6 +58,7 @@ pub async fn fetch_history(
     transport: &QuicTransport,
     req: &HistoryRequest,
 ) -> Option<mish_terminal::history::HistoryResponse> {
+    tracing::info!(top_above = req.top_above, "history fetch: requesting");
     let (mut send, mut recv) = transport.open_side_channel().await.ok()?;
     // Tag the stream as a history request so the server's dispatcher routes it
     // here, then send the request itself.
@@ -67,5 +68,6 @@ pub async fn fetch_history(
     write_message(&mut send, &req.encode()).await.ok()?;
     send.finish().ok()?;
     let bytes = read_message(&mut recv, MAX_MESSAGE_LEN).await.ok()??;
+    tracing::info!(len = bytes.len(), "history fetch: got response");
     mish_terminal::history::HistoryResponse::decode(&bytes)
 }
