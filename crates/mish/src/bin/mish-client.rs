@@ -35,6 +35,9 @@
 //!   --predict <mode>   adaptive|always|never|experimental (default: adaptive);
 //!     -a/-n            also via MOSH_PREDICTION_DISPLAY; -a=always, -n=never
 //!   --no-init          don't enter the alternate screen (MOSH_NO_TERM_INIT)
+//!   --connect-timeout <secs>  give up on a --connect dial after this many
+//!                      seconds (fractions ok); default: the QUIC handshake
+//!                      timeout. Lets probes fail fast before an ssh fallback.
 //!   --perf-log <path>  record per-keystroke keypress→display latency (JSON lines)
 //!   -L [bind:]port:host:hostport  forward a local port to a remote target (ssh -L)
 //!   -R [bind:]port:host:hostport  forward a remote port to a local target (ssh -R)
@@ -136,6 +139,11 @@ struct Options {
     /// with no SSH, using the enrolled client identity and the pinned server cert
     /// for HOST (established by `mish enroll HOST`). The ssh-less fast path.
     connect: Option<(String, u16)>,
+    /// Bound on the `--connect` dial (`--connect-timeout <secs>`): fail with a
+    /// non-zero exit if the QUIC handshake hasn't completed within it. `None`
+    /// keeps the transport's own handshake timeout. Callers that probe direct
+    /// connect before an ssh fallback (e.g. clauc) use this to fail fast.
+    connect_timeout: Option<std::time::Duration>,
     /// `-L [bind:]port:host:hostport` local forwards: listen locally, the server
     /// dials the target. Repeatable.
     local_forwards: Vec<mish::forward::ForwardSpec>,
@@ -199,6 +207,7 @@ fn parse_args() -> Result<Options> {
         shared: false,
         attach: None,
         connect: None,
+        connect_timeout: None,
         local_forwards: Vec::new(),
         remote_forwards: Vec::new(),
         host: None,
@@ -281,6 +290,16 @@ fn parse_args() -> Result<Options> {
             "--connect" => {
                 let spec = args.next().context("--connect needs HOST:PORT")?;
                 opts.connect = Some(parse_hostport(&spec)?);
+            }
+            "--connect-timeout" => {
+                let val = args.next().context("--connect-timeout needs SECONDS")?;
+                let secs: f64 = val
+                    .parse()
+                    .with_context(|| format!("--connect-timeout: bad SECONDS {val:?}"))?;
+                if !secs.is_finite() || secs <= 0.0 {
+                    bail!("--connect-timeout must be a positive number of seconds");
+                }
+                opts.connect_timeout = Some(std::time::Duration::from_secs_f64(secs));
             }
             "--log-file" => {
                 opts.log_file = Some(args.next().context("--log-file needs a PATH")?.into());
@@ -443,6 +462,7 @@ async fn main() -> Result<()> {
         connect_session(
             &host,
             port,
+            opts.connect_timeout,
             opts.predict,
             opts.no_init,
             opts.local_forwards,
@@ -638,6 +658,7 @@ async fn attach_session(
 async fn connect_session(
     host: &str,
     port: u16,
+    connect_timeout: Option<std::time::Duration>,
     predict: PredictMode,
     no_init: bool,
     local_forwards: Vec<mish::forward::ForwardSpec>,
@@ -658,9 +679,14 @@ async fn connect_session(
     )
     .context("creating QUIC client endpoint")?;
     eprintln!("[mish-client] direct-connecting to {addr} …");
-    let t = transport::connect(&endpoint, addr, "localhost")
-        .await
-        .context("connecting to server")?;
+    let dial = transport::connect(&endpoint, addr, "localhost");
+    let t = match connect_timeout {
+        Some(limit) => tokio::time::timeout(limit, dial)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out after {limit:?}"))?,
+        None => dial.await,
+    }
+    .context("connecting to server")?;
     tracing::info!(target: "mish::client", %addr, "direct-connected to server");
     mish::direct::send_exec_hello(&t, command).await?;
     run_terminal(
