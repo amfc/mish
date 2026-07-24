@@ -273,11 +273,16 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool, title_prefix: &s
     // Title emission. `title_prefix` is a client-owned label prepended to the
     // remote's title (empty = the historical passthrough behavior).
     //
-    // Empty prefix: byte-for-byte the old behavior — emit only when the title
-    // changed, OSC 0 only, and never force it on a full repaint. An empty remote
-    // title means the remote never set one, and emitting it would clobber the
-    // title the user's terminal already had (mosh guards this with its
-    // `title_initialized` flag).
+    // Empty prefix: emit on title change (OSC 0 only), and also force a
+    // *non-empty* title on a full repaint. The full-repaint case is what keeps
+    // the title alive across the wire: `Screen::diff_from` encodes states with
+    // this same function, and a resize diff is applied onto a *blank* emulator
+    // (`Screen::apply_diff`), so a repaint that omits the unchanged title
+    // silently drops it from the receiver's state — after which the client
+    // actively clears the real terminal's title. Never force an *empty* title:
+    // an empty remote title means the remote never set one, and emitting it
+    // would clobber the title the user's terminal already had (mosh guards
+    // this with its `title_initialized` flag).
     //
     // Non-empty prefix: the client OWNS the leading label, so it must show even
     // when the remote never sets a title (a bare shell keeps `new.title == ""`).
@@ -289,7 +294,7 @@ pub fn new_frame(old: &Screen, new: &Screen, initialized: bool, title_prefix: &s
     // title would break out of the OSC frame and inject commands on the real TTY.
     let title_changed = old.title != new.title;
     if title_prefix.is_empty() {
-        if title_changed {
+        if title_changed || (!initialized && !new.title.is_empty()) {
             frame.push("\x1b]0;");
             frame.push(&osc_sanitize(&new.title));
             frame.out.push(0x07);

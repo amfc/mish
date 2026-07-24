@@ -510,3 +510,40 @@ mod tests {
         assert_eq!((s.cols, s.rows), (80, 24));
     }
 }
+
+#[cfg(test)]
+mod title_sync {
+    use super::*;
+
+    /// A resize-only diff (same title, new geometry) must not drop the title
+    /// on the receiver. Regression: `apply_diff` replays a resize diff onto a
+    /// blank emulator, and the repaint used to omit an unchanged title — so a
+    /// phone-side resize (every keyboard open/close) silently blanked the
+    /// synced title, and the client then cleared the real terminal's title.
+    #[test]
+    fn title_survives_resize_only_diff() {
+        let mut prev = Screen::blank(80, 24);
+        prev.title = "pal1/matchfin: hello".into();
+        let mut next = Screen::blank(80, 23);
+        next.title = "pal1/matchfin: hello".into();
+
+        let diff = next.diff_from(&prev);
+        let mut receiver = prev.clone();
+        receiver.apply_diff(&diff);
+        assert_eq!(receiver.title, next.title, "title lost across resize diff");
+    }
+
+    /// The mosh guard stays intact: when the remote never set a title, a
+    /// resize diff must not make the receiver (or the real terminal) see an
+    /// emitted empty title.
+    #[test]
+    fn resize_diff_with_no_title_emits_none() {
+        let prev = Screen::blank(80, 24);
+        let next = Screen::blank(80, 23);
+        let diff = next.diff_from(&prev);
+        assert!(
+            !diff.windows(3).any(|w| w == b"\x1b]0"),
+            "empty title must never be force-emitted"
+        );
+    }
+}
